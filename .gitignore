@@ -1,0 +1,66 @@
+# ============================================================
+# 面经 Agent 项目 .gitignore
+# ============================================================
+
+# ━━━ 环境与密钥 ━━━
+.env
+.env.local
+.env.*.local
+*.pem
+CREDENTIALS.md
+
+# ━━━ 后端数据（不提交到仓库）━━━
+backend/data/
+backend/logs/
+backend/*.db
+*.db
+*.db-journal
+*.db-wal
+
+# 根目录遗留数据目录（若存在）
+memory_data/
+neo4j_data/
+xhs_user_data/
+
+# ━━━ 前端构建与依赖 ━━━
+node_modules/
+frontend/dist/
+web/node_modules/
+web/dist/
+
+# ━━━ Python ━━━
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# ━━━ 虚拟环境 ━━━
+.venv/
+venv/
+ENV/
+
+# ━━━ IDE 与编辑器 ━━━
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ━━━ 调试与临时文件 ━━━
+*.log
+*.tmp
+debug_*.txt
+debug_*.html
+*_stderr.log
+*_stdout.log
+uvicorn_*.txt
+xhs_link_cache.txt
+
+# ━━━ 系统文件 ━━━
+.DS_Store
+Thumbs.db

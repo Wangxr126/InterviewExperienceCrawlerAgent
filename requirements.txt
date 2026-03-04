@@ -1,0 +1,53 @@
+# ============================================================
+# 面经 Agent — Python 依赖清单
+# 安装命令（在 NewCoderAgent conda 环境中）：
+#   pip install -r requirements.txt
+#
+# spaCy 语言模型需额外安装：
+#   python -m spacy download zh_core_web_sm
+#   python -m spacy download en_core_web_sm
+# ============================================================
+
+# ── Web 框架 ─────────────────────────────────────────────────
+fastapi==0.133.0
+uvicorn==0.41.0
+pydantic==2.12.5
+pydantic-settings==2.10.1
+python-multipart>=0.0.9
+
+# ── HTTP 客户端 ───────────────────────────────────────────────
+requests==2.32.5
+httpx==0.28.1
+aiohttp==3.13.3
+
+# ── 数据库驱动 ───────────────────────────────────────────────
+neo4j==6.1.0
+qdrant-client==1.17.0
+
+# ── LLM & Embedding ──────────────────────────────────────────
+openai==1.109.1           # 兼容 Volcengine / DashScope OpenAI 接口
+dashscope>=1.14.0         # 阿里云 DashScope SDK（text-embedding-v4）
+hello-agents==0.2.8       # hello_agents 框架（ReActAgent / MemoryManager）
+
+# ── 向量 & NLP ───────────────────────────────────────────────
+sentence-transformers==5.2.3
+transformers==4.57.6
+torch==2.10.0             # CPU 版；如有 GPU 可替换为对应 cuda 版本
+accelerate==1.12.0
+huggingface_hub==0.36.2
+scikit-learn==1.8.0
+numpy==2.4.2
+spacy==3.8.11
+spacy-pkuseg==1.0.1       # 中文分词
+
+# ── 爬虫 & 解析 ──────────────────────────────────────────────
+beautifulsoup4==4.14.0
+lxml==6.0.2
+fake-useragent==1.5.1
+
+# ── 图像处理（OCR 可选）─────────────────────────────────────
+pillow==10.4.0
+# pytesseract>=0.3.10     # OCR 需同时安装 Tesseract-OCR 可执行文件
+
+# ── 环境配置 ─────────────────────────────────────────────────
+python-dotenv==1.2.1

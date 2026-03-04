@@ -1,0 +1,492 @@
+"""
+小红书面经发现爬虫
+两步走：
+  1. Playwright 浏览器模拟搜索，获取帖子链接
+  2. xhs-crawl 库 API 方式获取帖子详细内容
+
+登录状态说明：
+  - headless=False（首次 / 手动触发）：弹出浏览器，自动倒计时等待扫码，无需按回车
+  - headless=True （定时任务）：依赖已保存的登录状态，未登录则静默跳过，不阻塞后台
+
+登录状态持久化：
+  - 第一次 headless=False 扫码后，状态保存到 XHS_USER_DATA_DIR（默认 backend/data/xhs_user_data）
+  - 后续定时任务无需再次扫码，直接复用
+
+相关 .env 配置：
+  XHS_USER_DATA_DIR       浏览器数据目录（保存登录状态），默认 backend/data/xhs_user_data
+  XHS_LINK_CACHE          已获取链接缓存文件，默认 ./xhs_link_cache.txt
+  XHS_LOGIN_WAIT_SECONDS  headless=False 时等待扫码的最长秒数，默认 120
+"""
+import asyncio
+import logging
+import os
+import random
+import time
+from typing import List, Dict
+from urllib.parse import quote as _urlquote
+
+logger = logging.getLogger(__name__)
+
+
+def _cfg():
+    """懒读配置，避免模块级循环依赖"""
+    from backend.config.config import settings
+    return settings
+
+
+def _user_data_dir() -> str:
+    return _cfg().xhs_user_data_dir
+
+
+def _link_cache() -> str:
+    return os.environ.get("XHS_LINK_CACHE", "./backend/data/xhs_link_cache.txt")
+
+
+def _login_wait_seconds() -> int:
+    try:
+        return int(os.environ.get("XHS_LOGIN_WAIT_SECONDS", "120"))
+    except ValueError:
+        return 120
+
+
+# ── 登录状态检测 ──────────────────────────────────────────────
+
+def _is_logged_in(page) -> bool:
+    """检测当前页面是否已登录小红书"""
+    try:
+        # 方式1：存在用户头像 / 昵称元素
+        if page.locator(".user-avatar, .nickname, .user-name, [class*='userInfo']").count() > 0:
+            return True
+        # 方式2：URL 不在登录页
+        if "login" in page.url.lower() or "signin" in page.url.lower():
+            return False
+        # 方式3：搜索结果卡片出现，说明已登录
+        if page.locator("section.note-item, div[class*='note-item']").count() > 0:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _wait_for_login(page, wait_seconds: int = 120) -> bool:
+    """
+    headless=False 模式：在弹出浏览器中等待用户扫码登录。
+    每 5 秒检测一次登录状态，超时后返回 False（不阻塞后台）。
+    不使用 input()，完全非交互式。
+    """
+    print(f"\n{'='*60}")
+    print("⚠️  未检测到小红书登录状态！")
+    print("👉 请在弹出的浏览器中完成扫码登录...")
+    print(f"   将每 5 秒自动检测，最多等待 {wait_seconds} 秒后自动继续")
+    print(f"{'='*60}\n")
+    logger.warning(
+        f"⚠️  未检测到小红书登录状态，请在弹出的浏览器窗口中扫码登录。"
+        f"将等待最多 {wait_seconds} 秒后自动继续..."
+    )
+    deadline = time.time() + wait_seconds
+    check_interval = 5
+
+    while time.time() < deadline:
+        remaining = int(deadline - time.time())
+        try:
+            page.wait_for_timeout(check_interval * 1000)
+            if _is_logged_in(page):
+                logger.info("✅ 检测到登录成功，继续爬取...")
+                print("✅ 检测到登录成功，继续爬取...")
+                return True
+            logger.info(f"   等待扫码中... 剩余 {remaining} 秒")
+        except Exception:
+            break
+
+    logger.warning(f"⏰ 等待 {wait_seconds} 秒后仍未登录，本次跳过 XHS 爬取。")
+    return False
+
+
+# ── Playwright 获取帖子链接 ─────────────────────────────────────
+
+def get_xhs_links_with_playwright(
+    keyword: str = "面经",
+    max_notes: int = 20,
+    headless: bool = False,   # 默认 False：弹出浏览器，允许扫码
+    login_wait_seconds: int = None,
+) -> List[Dict]:
+    """
+    使用 Playwright 在小红书搜索页发现帖子链接。
+
+    Args:
+        keyword:            搜索关键词
+        max_notes:          最多获取链接数
+        headless:           True=无头模式（定时任务用）；False=弹出浏览器（首次登录用）
+        login_wait_seconds: 未登录时最长等待秒数，None 则从 .env XHS_LOGIN_WAIT_SECONDS 读取
+
+    Returns:
+        [{"title": str, "link": str}]
+    """
+    user_data = _user_data_dir()
+    os.makedirs(user_data, exist_ok=True)
+
+    # 清理 Chrome 遗留的 Profile 锁文件（进程异常退出时留下，会导致新实例立即崩溃）
+    for lock_name in ("SingletonLock", "SingletonCookie", "lockfile", ".com.google.Chrome.LOCK"):
+        lock_path = os.path.join(user_data, lock_name)
+        if os.path.exists(lock_path):
+            try:
+                os.remove(lock_path)
+                logger.info(f"已清理 Chrome 锁文件: {lock_path}")
+            except Exception:
+                pass
+
+    if login_wait_seconds is None:
+        login_wait_seconds = _login_wait_seconds()
+
+    # ── Windows: 强制使用 ProactorEventLoop ──────────────────────────
+    # sync_playwright() 内部用 asyncio.create_subprocess_exec 启动 Playwright 服务进程，
+    # Windows 的 SelectorEventLoop 不支持此调用 → NotImplementedError。
+    # APScheduler / uvicorn 会在运行期间修改或关闭线程的 event loop，
+    # 必须在每次调用前强制重置为 ProactorEventLoop。
+    import sys as _sys
+    if _sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        try:
+            asyncio.get_running_loop()
+            # 如果能拿到 running loop，说明当前在 async 协程里，不能改 loop
+        except RuntimeError:
+            # 不在 async 上下文（线程/subprocess），安全地替换为新的 ProactorEventLoop
+            asyncio.set_event_loop(asyncio.ProactorEventLoop())
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.error("Playwright 未安装: pip install playwright && playwright install chromium")
+        return []
+
+    results: List[Dict] = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch_persistent_context(
+            user_data_dir=user_data,
+            headless=headless,
+            viewport={"width": 1920, "height": 1080},
+            # 不传 --no-sandbox：Windows headless=False 加此参数可能导致 Chrome 立即退出(exit 21)
+            args=["--disable-blink-features=AutomationControlled"],
+            ignore_default_args=["--enable-automation"],
+        )
+        page = browser.pages[0] if browser.pages else browser.new_page()
+        page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+
+        # keyword 必须 URL 编码，否则中文搜索词会带空格导致搜索失败
+        search_url = (
+            f"https://www.xiaohongshu.com/search_result"
+            f"?keyword={_urlquote(keyword)}&source=web_search_result_notes"
+        )
+        logger.info(f"XHS 访问搜索页: {search_url}")
+        try:
+            # 使用 domcontentloaded 而非 networkidle，XHS 是重 JS SPA，networkidle 经常超时
+            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            logger.warning(f"XHS 页面加载超时，尝试继续: {e}")
+        page.wait_for_timeout(4000)  # 额外等待 JS 渲染
+
+        # ── 登录状态处理（无 input()）────────────────────────
+        logged_in = _is_logged_in(page)
+        if not logged_in:
+            if headless:
+                # 无头模式：直接放弃，不弹窗、不阻塞
+                logger.warning(
+                    "XHS 未登录（headless 模式）。"
+                    "请先以 headless=False 运行一次完成扫码，"
+                    "登录状态将保存到 backend/data/xhs_user_data 供后续复用。"
+                )
+                browser.close()
+                return []
+            else:
+                # 有头模式：等待用户扫码（倒计时，非阻塞）
+                print("\n" + "="*60)
+                print("👉 浏览器已打开，请在浏览器中扫码登录小红书...")
+                print("="*60 + "\n")
+                if not _wait_for_login(page, wait_seconds=login_wait_seconds):
+                    browser.close()
+                    return []
+                # 登录后重新加载搜索页
+                try:
+                    page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(4000)
+
+        # ── 等待搜索结果 ──────────────────────────────────────
+        try:
+            page.wait_for_selector(
+                "section.note-item, div[class*='note-item'], "
+                "div.note-item, a[href*='/explore/']",
+                timeout=20000
+            )
+        except Exception:
+            logger.warning("XHS 未找到搜索结果（可能登录状态已过期或页面结构变化）")
+            # 不立即关闭，先尝试用 href 方式采集
+            pass
+
+        # 同时匹配多种卡片选择器，适配小红书页面结构变化
+        cards = page.locator(
+            "section.note-item, div[class*='note-item'], div.note-item"
+        ).all()
+        logger.info(f"XHS 找到 {len(cards)} 个结果卡片")
+
+        if not cards:
+            logger.warning("XHS 未找到任何卡片，检查选择器或登录状态")
+            browser.close()
+            return []
+
+        processed_ids: set = set()
+
+        for card in cards:
+            if len(results) >= max_notes:
+                break
+            try:
+                title_elem = card.locator(".title span, h3, [class*='title']").first
+                title = title_elem.inner_text().strip() if title_elem.count() > 0 else "无标题"
+
+                card.click(button="left", timeout=5000)
+                try:
+                    page.wait_for_url("**/explore/*", wait_until="domcontentloaded", timeout=10000)
+                except Exception:
+                    page.wait_for_timeout(2000)
+
+                current_url = page.url
+                note_id = current_url.split("/")[-1].split("?")[0]
+
+                if note_id not in processed_ids and note_id:
+                    processed_ids.add(note_id)
+                    results.append({"title": title, "link": current_url})
+                    logger.info(f"XHS 获取链接 [{len(results)}/{max_notes}]: {title[:25]}...")
+
+                try:
+                    page.go_back(wait_until="domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(random.uniform(1500, 3000))
+
+            except Exception as e:
+                logger.debug(f"XHS 单卡片获取失败，跳过: {e}")
+                if "explore" in page.url:
+                    try:
+                        page.go_back(wait_until="domcontentloaded", timeout=10000)
+                        page.wait_for_timeout(2000)
+                    except Exception:
+                        pass
+
+        browser.close()
+
+    # 缓存链接（方便调试 / 断点续爬）
+    if results:
+        cache_file = _link_cache()
+        with open(cache_file, "a", encoding="utf-8") as f:
+            for r in results:
+                f.write(r["link"] + "\n")
+
+    logger.info(f"XHS keyword={keyword!r} 共获取 {len(results)} 条链接")
+    return results
+
+
+# ── 登录工具函数（供 API 单独调用）──────────────────────────
+
+def xhs_do_login(wait_seconds: int = None) -> bool:
+    """
+    专门用于首次登录的函数：弹出浏览器，等待扫码，保存登录状态。
+    后续的定时任务无需再调用，直接使用 headless=True 即可。
+    返回 True 表示登录成功。
+    """
+    wait_seconds = wait_seconds or _login_wait_seconds()
+    logger.info(f"打开小红书登录窗口，请扫码... 最多等待 {wait_seconds} 秒")
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.error("Playwright 未安装")
+        return False
+
+    user_data = _user_data_dir()
+    os.makedirs(user_data, exist_ok=True)
+    for lock_name in ("SingletonLock", "SingletonCookie", "lockfile"):
+        lock_path = os.path.join(user_data, lock_name)
+        if os.path.exists(lock_path):
+            try: os.remove(lock_path)
+            except Exception: pass
+    success = False
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch_persistent_context(
+            user_data_dir=user_data,
+            headless=False,
+            viewport={"width": 1280, "height": 800},
+            args=["--disable-blink-features=AutomationControlled"],
+            ignore_default_args=["--enable-automation"],
+        )
+        page = browser.pages[0] if browser.pages else browser.new_page()
+        page.goto("https://www.xiaohongshu.com", wait_until="networkidle", timeout=15000)
+        page.wait_for_timeout(2000)
+
+        if _is_logged_in(page):
+            logger.info("✅ 已处于登录状态，无需重复扫码")
+            browser.close()
+            return True
+
+        success = _wait_for_login(page, wait_seconds=wait_seconds)
+        browser.close()
+
+    return success
+
+
+# ── xhs-crawl 获取帖子详情 ────────────────────────────────────
+
+async def _async_fetch_details(links: List[str]) -> List[Dict]:
+    """异步批量获取小红书帖子详情"""
+    try:
+        from xhs_crawl import XHSSpider
+    except ImportError:
+        logger.error("xhs_crawl 未安装: pip install xhs-crawl")
+        return []
+
+    spider = XHSSpider()
+    posts: List[Dict] = []
+
+    for idx, url in enumerate(links, 1):
+        try:
+            post = await spider.get_post_data(url)
+            if not post:
+                continue
+
+            title = getattr(post, "title", "") or ""
+            content = getattr(post, "content", "") or ""
+            author = ""
+            if hasattr(post, "user") and post.user:
+                author = getattr(post.user, "nickname", "") or ""
+
+            images: List[str] = []
+            if hasattr(post, "images") and post.images:
+                images = list(post.images)
+
+            posts.append({
+                "title": title,
+                "content": content,
+                "author": author,
+                "image_urls": images,
+                "image_count": len(images),
+                "source_url": url,
+                "source_platform": "xiaohongshu",
+            })
+            logger.info(f"XHS [{idx}/{len(links)}] 详情: {title[:20]}... ({len(content)}字)")
+            await asyncio.sleep(random.uniform(3, 6))
+
+        except Exception as e:
+            logger.error(f"XHS 获取详情异常 {url}: {e}")
+
+    await spider.close()
+    return posts
+
+
+def fetch_xhs_details(links: List[str]) -> List[Dict]:
+    """同步封装，适配 Windows asyncio"""
+    if not links:
+        return []
+    if os.name == "nt":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(_async_fetch_details(links))
+    finally:
+        loop.close()
+
+
+# ── 一体化接口 ────────────────────────────────────────────────
+
+class XHSCrawler:
+    """
+    小红书面经爬虫一体化接口。
+
+    使用流程：
+      1. 首次：crawler.login()  → 弹出浏览器扫码，状态保存
+      2. 后续：crawler.discover()  → 无头运行，复用登录状态
+
+    discover() 返回 [{source_url, title, content, source_platform, ...}]
+    """
+
+    def __init__(self, headless: bool = False):
+        """
+        headless=False（默认）：弹出浏览器，支持扫码登录，适合手动触发
+        headless=True：无头模式，依赖已保存登录状态，适合自动定时任务
+        """
+        self.headless = headless
+
+    def login(self, wait_seconds: int = None) -> bool:
+        """手动触发登录（弹出浏览器扫码），登录后状态持久化"""
+        return xhs_do_login(wait_seconds=wait_seconds)
+
+    def is_logged_in(self) -> bool:
+        """快速检查当前保存的 session 是否仍然有效"""
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return False
+        result = False
+        with sync_playwright() as p:
+            browser = p.chromium.launch_persistent_context(
+                user_data_dir=_user_data_dir(),
+                headless=True,
+            )
+            page = browser.pages[0] if browser.pages else browser.new_page()
+            try:
+                page.goto(
+                    "https://www.xiaohongshu.com",
+                    wait_until="networkidle", timeout=12000
+                )
+                page.wait_for_timeout(2000)
+                result = _is_logged_in(page)
+            except Exception:
+                pass
+            browser.close()
+        return result
+
+    def discover(
+        self,
+        keywords: List[str] = None,
+        max_notes_per_keyword: int = None,
+    ) -> List[Dict]:
+        """
+        搜索多个关键词，返回帖子（含详情内容）。
+        keywords/max_notes_per_keyword 未传时从 .env 读取默认值。
+        """
+        cfg = _cfg()
+        keywords = keywords or cfg.xhs_keywords
+        max_notes = max_notes_per_keyword or cfg.xhs_max_notes_per_keyword
+
+        all_posts: List[Dict] = []
+        seen_urls: set = set()
+
+        for kw in keywords:
+            logger.info(f"XHS 开始搜索关键词: {kw!r}")
+            link_list = get_xhs_links_with_playwright(
+                keyword=kw,
+                max_notes=max_notes,
+                headless=self.headless,
+            )
+            new_links = [item["link"] for item in link_list if item["link"] not in seen_urls]
+            seen_urls.update(new_links)
+
+            if not new_links:
+                continue
+
+            posts = fetch_xhs_details(new_links)
+            for p in posts:
+                p["post_type"] = (
+                    "面经"
+                    if any(k in (p.get("title", "") + p.get("content", ""))
+                           for k in ["面经", "面试"])
+                    else "其他"
+                )
+                all_posts.append(p)
+
+        logger.info(f"XHS 共获取 {len(all_posts)} 条帖子详情")
+        return all_posts

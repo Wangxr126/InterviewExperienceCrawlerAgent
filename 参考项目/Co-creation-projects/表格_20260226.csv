@@ -1,0 +1,20 @@
+﻿项目名称,主要描述,核心功能,涉及 Agent / 智能体设计
+1zrj-DataAnalysisAgent,智能数据分析助手，支持多格式数据处理与可视化,自动数据清洗、统计分析、可视化图表生成、自然语言问答,基于 HelloAgents 框架的数据分析 Agent，集成 NL2SQL、NL2Python 工具
+Apricity-InnocoreAI,学术研究全流程智能辅助系统,文献检索监控、深度论文分析、写作辅助、引用校验,Hunter Agent（文献搜索）、Miner Agent（内容分析）、Coach Agent（写作优化）、Validator Agent（引用校验）
+EXAMPLE-ProjectTemplate,项目模板，提供标准结构与规范,标准化目录结构、技术栈说明、文档编写规范,无具体业务 Agent，提供通用开发范式
+YYHDBL-HelloCodeAgentCli,命令行式代码助手，提升开发效率,代码生成、调试、执行、上下文交互,基于 CLI 的代码 Agent，支持本地环境交互与命令执行
+Yixiang-Wu-LearningAgent,个性化学习辅导智能体,学习路径规划、知识点讲解、习题解答,学习辅导 Agent，适配不同学科与学习阶段
+alexrunner-DataAnalysisAgent,购物数据分析智能体,销售数据清洗、用户行为分析、趋势预测、可视化报告,数据分析 Agent，针对电商场景优化
+allen2000-FashionDailyDress,时尚穿搭推荐智能体,风格分析、场景化穿搭建议、流行趋势预测,时尚推荐 Agent，结合用户画像与场景需求
+bichchibui5-hub-EmailSmartAssistant,智能邮箱助手,邮件分类、优先级排序、自动回复、附件解析,邮件管理 Agent，支持多邮箱协议与上下文理解
+chen070808-ProgrammingTutor,智能编程导师,编程问题解答、代码调试、学习路径规划,编程辅导 Agent，覆盖多语言与算法教学
+jack6249-GiftGeniusAgent,个性化礼物推荐智能体,兴趣分析、预算匹配、礼物推荐、购物链接生成,礼物推荐 Agent，结合用户画像与场景需求
+jjyaoao-CodeReviewAgent,智能代码审查助手,代码语法检查、规范校验、问题定位、审查报告生成,代码审查 Agent，基于静态分析与 LLM 反馈
+kkkano-FinReportAgent,金融财报分析智能体,财报解析、指标计算、风险评估、投资建议,金融分析 Agent，支持多维度财报解读
+laoyouf-aistory,AI 故事创作智能体,故事生成、角色塑造、情节编排,故事创作 Agent，支持多风格与互动式创作
+lgs-only-NovelGenerator,长篇小说生成智能体,世界观构建、角色设定、章节生成、剧情一致性维护,小说创作 Agent，包含状态追踪与语义检索系统
+lh2021739-pixel-Personal_Information_Signaling_System,个人信息信令系统,信息采集、隐私保护、数据流转管理,信息管理 Agent，保障数据安全与合规
+lll0807-CodeTutorAgent/programmer,编程辅导智能体,代码生成、错误诊断、优化建议,编程辅导 Agent，支持多语言与框架
+megg-ops-roleplay_agent,角色扮演智能体,角色塑造、场景交互、剧情推进,角色扮演 Agent，支持多角色与多场景
+melxy1997-ColumnWriter,专栏写作智能体,选题策划、内容生成、编辑优化,多智能体协作：策划专家、写作专家、评审专家
+pamdla-MindEchoAgent,心智交互智能体,情感分析、对话理解、个性化响应,心智交互 Agent，结合情感计算与上下文记忆

@@ -1,0 +1,39 @@
+# 使用方法：
+#   启动：docker compose up -d
+#   停止：docker compose stop
+#   彻底删除：docker compose down -v
+#
+# 启动后访问：
+#   浏览器管理界面：http://localhost:7474  （用户名: neo4j  密码: wxragent2024）
+#   Bolt 连接地址：bolt://localhost:7687
+
+services:
+  neo4j:
+    # 使用已手动拉取的镜像 tag（docker pull docker.m.daocloud.io/library/neo4j:5.26.0）
+    image: docker.m.daocloud.io/library/neo4j:5.26.0
+    container_name: neo4j-local
+    restart: unless-stopped
+    ports:
+      - "7474:7474"   # HTTP 管理界面
+      - "7687:7687"   # Bolt 协议（Python 驱动连接）
+    environment:
+      - NEO4J_AUTH=neo4j/wxragent2024
+      # 开启向量索引插件（GenAI Plugin）
+      - NEO4J_PLUGINS=["apoc"]
+      # 允许本地文件导入
+      - NEO4J_dbms_security_allow__csv__import__from__file__urls=true
+      # 内存配置（本地开发用，按需调整）
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=1G
+      - NEO4J_server_memory_pagecache_size=512m
+    volumes:
+      - ./neo4j_data/data:/data
+      - ./neo4j_data/logs:/logs
+      - ./neo4j_data/import:/var/lib/neo4j/import
+      - ./neo4j_data/plugins:/plugins
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
