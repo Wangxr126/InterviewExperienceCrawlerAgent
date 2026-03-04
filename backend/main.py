@@ -124,6 +124,31 @@ async def serve_frontend():
     return {"message": "前端未构建，请在 web/ 目录执行 npm run build，或用 npm run dev 开发模式访问 http://localhost:5173"}
 
 
+@app.get("/api/config")
+def get_config():
+    """前端配置：默认用户 ID、Agent 最大步数等（来自 .env）"""
+    from backend.config.config import settings as _s
+    return {
+        "default_user_id": _s.default_user_id,
+        "interviewer_max_steps": _s.interviewer_max_steps,
+    }
+
+
+@app.get("/api/user/{user_id}/chat/history")
+def get_chat_history(user_id: str):
+    """获取用户最近一次对话历史，用于前端打开时自动加载"""
+    session = sqlite_service.get_latest_session_for_user(user_id)
+    if not session:
+        return {"session_id": None, "messages": []}
+    history = session.get("conversation_history") or []
+    # 转为前端格式 [{role, content}]
+    messages = [
+        {"role": m.get("role", "user"), "content": m.get("content", "")}
+        for m in history if m.get("content")
+    ]
+    return {"session_id": session["session_id"], "messages": messages}
+
+
 # ══════════════════════════════════════════════════════
 # 请求 / 响应模型
 # ══════════════════════════════════════════════════════
@@ -624,7 +649,8 @@ async def trigger_crawler(req: CrawlTriggerRequest):
 
 @app.post("/api/crawler/process")
 async def process_crawler_queue(batch_size: int = Query(10, ge=1, le=50)):
-    """手动触发任务处理队列（将 pending/fetched 状态任务提取为题目）"""
+    """手动触发任务处理队列（同步处理队列，阻塞等待）"""
+    logger.info(f"[API] 同步处理队列 被调用 batch_size={batch_size}")
     import asyncio
     loop = asyncio.get_event_loop()
     count = await loop.run_in_executor(
@@ -632,6 +658,7 @@ async def process_crawler_queue(batch_size: int = Query(10, ge=1, le=50)):
         lambda: crawl_scheduler.trigger_process_tasks(batch_size=batch_size)
     )
     stats = sqlite_service.get_crawl_stats()
+    logger.info(f"[API] 同步处理队列 完成 questions_added={count}")
     return {"status": "ok", "questions_added": count, "queue_stats": stats}
 
 
@@ -641,6 +668,7 @@ async def extract_pending_posts(batch_size: int = Query(20, ge=1, le=100)):
     异步提取所有 fetched 状态（已爬取正文但尚未提取题目）的帖子。
     立即返回启动确认，LLM 提取在后台线程执行。
     """
+    logger.info(f"[API] 提取未处理帖子 被调用 batch_size={batch_size}")
     import threading
     import sqlite3
 
@@ -652,12 +680,14 @@ async def extract_pending_posts(batch_size: int = Query(20, ge=1, le=100)):
     pending_count = row[0] if row else 0
 
     if pending_count == 0:
+        logger.info("[API] 提取未处理帖子 无待处理，直接返回")
         return {"status": "ok", "message": "没有待提取的帖子（状态为 fetched 的记录为 0）", "pending": 0}
 
+    logger.info(f"[API] 提取未处理帖子 启动后台线程，待处理 {pending_count} 条")
     def _bg():
         try:
             cnt = crawl_scheduler.trigger_process_tasks(batch_size=batch_size)
-            logger.info(f"后台提取完成：{cnt} 道题目入库")
+            logger.info(f"[API] 提取未处理帖子 后台完成：{cnt} 道题目入库")
         except Exception as e:
             logger.error(f"后台提取失败: {e}")
 
@@ -675,6 +705,7 @@ async def retry_error_posts(batch_size: int = Query(30, ge=1, le=200)):
     将 error 状态且有正文的帖子重置为 fetched，后台异步 LLM 提取。
     将 error 状态且无正文的帖子重置为 pending，等待重新抓取。
     """
+    logger.info(f"[API] 重试失败帖子 被调用 batch_size={batch_size}")
     import threading, sqlite3
 
     with sqlite3.connect(sqlite_service.db_path) as conn:
@@ -694,12 +725,14 @@ async def retry_error_posts(batch_size: int = Query(30, ge=1, le=200)):
 
     total = to_extract + to_fetch
     if total == 0:
+        logger.info("[API] 重试失败帖子 无可重试，直接返回")
         return {"status": "ok", "message": "没有可重试的帖子（error 记录为 0）", "reset": 0}
 
+    logger.info(f"[API] 重试失败帖子 重置 {total} 条，启动后台线程")
     def _bg():
         try:
             cnt = crawl_scheduler.trigger_process_tasks(batch_size=batch_size)
-            logger.info(f"重试完成：{cnt} 道题目入库")
+            logger.info(f"[API] 重试失败帖子 后台完成：{cnt} 道题目入库")
         except Exception as e:
             logger.error(f"重试失败: {e}")
 
@@ -785,6 +818,28 @@ def get_crawl_tasks(
         ).fetchall()
 
     return {"total": len(rows), "tasks": [dict(r) for r in rows]}
+
+
+@app.get("/api/crawler/tasks/{task_id}/questions")
+def get_task_questions(task_id: str):
+    """获取指定任务关联的已提取题目列表"""
+    import sqlite3
+    import json as _json
+    with sqlite3.connect(sqlite_service.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT source_url FROM crawl_tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    source_url = row["source_url"]
+    questions = sqlite_service.get_questions_by_source_url(source_url)
+    for q in questions:
+        try:
+            q["topic_tags"] = _json.loads(q.get("topic_tags") or "[]")
+        except Exception:
+            q["topic_tags"] = []
+    return {"questions": questions}
 
 
 @app.get("/api/crawler/tasks/{task_id}")

@@ -99,9 +99,21 @@ class InterviewerAgent(PlanAndSolveAgent):
         # 注意：ProgressTracker / InterviewEvaluator 已移除
         # 这些操作现在由 Orchestrator.submit_answer() / end_session() 确定性执行
 
-        super().__init__(
-            name="Interviewer",
-            llm=llm,
-            tool_registry=registry,
-            system_prompt=interviewer_prompt,
-        )
+        max_steps = getattr(settings, "interviewer_max_steps", 8)
+        try:
+            super().__init__(
+                name="Interviewer",
+                llm=llm,
+                tool_registry=registry,
+                system_prompt=interviewer_prompt,
+                max_steps=max_steps,
+            )
+        except TypeError:
+            # 部分 hello_agents 版本可能不支持 max_steps
+            super().__init__(
+                name="Interviewer",
+                llm=llm,
+                tool_registry=registry,
+                system_prompt=interviewer_prompt,
+            )
+            logger.info(f"Interviewer max_steps={max_steps}（父类未支持，使用默认）")

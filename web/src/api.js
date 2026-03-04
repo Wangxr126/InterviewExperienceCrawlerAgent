@@ -4,6 +4,18 @@
 const BASE = import.meta.env.DEV ? '' : ''
 
 export const api = {
+  // ── 配置 ──────────────────────────────────────────────
+  async getConfig() {
+    const r = await fetch(`${BASE}/api/config`)
+    return r.json()
+  },
+
+  // ── 对话历史 ───────────────────────────────────────────
+  async getChatHistory(userId) {
+    const r = await fetch(`${BASE}/api/user/${userId}/chat/history`)
+    return r.json()
+  },
+
   // ── 题库 ──────────────────────────────────────────────
   async getMeta() {
     const r = await fetch(`${BASE}/api/questions/meta`)
@@ -113,6 +125,16 @@ export const api = {
     if (params.platform) p.set('platform', params.platform)
     p.set('limit', params.limit ?? '50')
     const r = await fetch(`${BASE}/api/crawler/tasks?${p}`)
+    return r.json()
+  },
+
+  async getTaskQuestions(taskId) {
+    const r = await fetch(`${BASE}/api/crawler/tasks/${taskId}/questions`)
+    return r.json()
+  },
+
+  async getCrawlerTaskDetail(taskId) {
+    const r = await fetch(`${BASE}/api/crawler/tasks/${taskId}`)
     return r.json()
   },
 

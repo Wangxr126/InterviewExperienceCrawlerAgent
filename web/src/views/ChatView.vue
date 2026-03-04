@@ -62,7 +62,7 @@
 </template>
 
 <script setup>
-import { ref, nextTick, watch, onUnmounted } from 'vue'
+import { ref, nextTick, watch, onUnmounted, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Delete } from '@element-plus/icons-vue'
 import { marked } from 'marked'
@@ -97,6 +97,7 @@ const streamingMsg = ref(null)   // 当前流式写入中的消息对象
 const msgBox       = ref(null)
 const sessionId    = ref(`sess_${Date.now()}`)
 let   abortCtrl    = null
+let   lastLoadedUserId = ''
 
 const quickQuestions = [
   '出一道 Redis 面试题',
@@ -112,9 +113,23 @@ const scrollToBottom = () => {
   })
 }
 
+const loadHistory = async () => {
+  if (!props.userId || lastLoadedUserId === props.userId) return
+  try {
+    const d = await api.getChatHistory(props.userId)
+    lastLoadedUserId = props.userId
+    if (d.messages?.length) {
+      messages.value = d.messages
+      if (d.session_id) sessionId.value = d.session_id
+      scrollToBottom()
+    }
+  } catch (e) { console.warn('加载对话历史失败', e) }
+}
+
 const clearChat = () => {
   messages.value = []
   sessionId.value = `sess_${Date.now()}`
+  lastLoadedUserId = props.userId  // 防止立即重新加载历史
 }
 
 // 对外暴露：从「发送到对话」或「快捷推荐」调用
@@ -226,6 +241,10 @@ const send = async () => {
     scrollToBottom()
   }
 }
+
+watch([() => props.isActive, () => props.userId], ([active, uid]) => {
+  if (active && uid) loadHistory()
+}, { immediate: true })
 
 onUnmounted(() => abortCtrl?.abort())
 </script>

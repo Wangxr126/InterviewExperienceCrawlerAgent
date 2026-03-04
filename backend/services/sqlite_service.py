@@ -285,6 +285,15 @@ class SqliteService:
             )
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_questions_by_source_url(self, source_url: str) -> List[Dict]:
+        """按帖子 source_url 查询已提取的题目列表"""
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM questions WHERE source_url = ? ORDER BY created_at",
+                (source_url,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
     # ===========================================================
     # user_profiles 表操作
     # ===========================================================
@@ -535,8 +544,9 @@ class SqliteService:
             conn.commit()
         return session_id
 
-    def update_session_history(self, session_id: str, role: str, content: str, max_turns: int = 20):
-        """追加对话记录（Working Memory）"""
+    def update_session_history(self, session_id: str, role: str, content: str,
+                               reasoning: str = None, max_turns: int = 50):
+        """追加对话记录（含可选 reasoning，用于 LLM 思考过程）"""
         with self._get_conn() as conn:
             row = conn.execute(
                 "SELECT conversation_history FROM interview_sessions WHERE session_id = ?",
@@ -546,8 +556,10 @@ class SqliteService:
                 return
 
             history = json.loads(row["conversation_history"] or "[]")
-            history.append({"role": role, "content": content, "ts": datetime.now().isoformat()})
-            # 超出 max_turns 时保留最新的
+            msg = {"role": role, "content": content, "ts": datetime.now().isoformat()}
+            if reasoning:
+                msg["reasoning"] = reasoning
+            history.append(msg)
             if len(history) > max_turns:
                 history = history[-max_turns:]
 
@@ -556,6 +568,35 @@ class SqliteService:
                 (json.dumps(history, ensure_ascii=False), session_id)
             )
             conn.commit()
+
+    def ensure_session_exists(self, session_id: str, user_id: str) -> bool:
+        """确保 session 存在，不存在则创建。返回是否为新创建"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM interview_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if row:
+                return False
+            conn.execute("""
+                INSERT INTO interview_sessions (session_id, user_id, session_type)
+                VALUES (?, ?, 'practice')
+            """, (session_id, user_id))
+            conn.commit()
+            return True
+
+    def get_latest_session_for_user(self, user_id: str) -> Optional[Dict]:
+        """获取用户最近一次会话（含对话历史）"""
+        with self._get_conn() as conn:
+            row = conn.execute("""
+                SELECT * FROM interview_sessions
+                WHERE user_id = ? ORDER BY start_time DESC LIMIT 1
+            """, (user_id,)).fetchone()
+            if not row:
+                return None
+            s = dict(row)
+            s["conversation_history"] = json.loads(s.get("conversation_history") or "[]")
+            s["weak_tags"] = json.loads(s.get("weak_tags") or "[]")
+            return s
 
     def close_session(self, session_id: str, ai_summary: str = "", weak_tags: List[str] = None):
         """关闭 session，计算统计数据"""

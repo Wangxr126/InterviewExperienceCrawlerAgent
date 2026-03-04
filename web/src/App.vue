@@ -58,7 +58,7 @@ import CollectView  from './views/CollectView.vue'
 import ReportView   from './views/ReportView.vue'
 import MasteryDialog from './components/MasteryDialog.vue'
 
-const userId      = ref('user_001')
+const userId      = ref('')
 const currentView = ref('browse')
 const showMastery = ref(false)
 const chatViewRef = ref(null)
@@ -79,6 +79,16 @@ const loadMeta = async () => {
   } catch (e) { console.warn('加载元数据失败', e) }
 }
 
+const loadConfig = async () => {
+  try {
+    const d = await api.getConfig()
+    if (d.default_user_id && !userId.value) {
+      userId.value = d.default_user_id
+    }
+  } catch (e) { console.warn('加载配置失败', e) }
+  if (!userId.value) userId.value = 'user_001'
+}
+
 // 发送到对话：切换视图并预填消息
 const onSendToChat = ({ question }) => {
   currentView.value = 'chat'
@@ -96,7 +106,10 @@ const onQuickRecommend = (tags) => {
   )
 }
 
-onMounted(() => loadMeta())
+onMounted(async () => {
+  await loadConfig()
+  await loadMeta()
+})
 </script>
 
 <style>

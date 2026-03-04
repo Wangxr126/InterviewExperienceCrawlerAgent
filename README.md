@@ -187,6 +187,11 @@ wxr_agent/
 
 ## 常见问题
 
+### Q: 如何配置默认用户和 Agent 步数？
+在 `.env` 中添加：
+- `DEFAULT_USER_ID=user_001`：前端默认用户 ID（未填写时使用）
+- `INTERVIEWER_MAX_STEPS=8`：Interviewer Agent 最大思考步数（默认 8）
+
 ### Q: `MemoryTool 初始化失败`
 `.env` 文件没有被 `hello_agents` 读取。确认项目根目录存在 `.env` 文件，且 `backend/main.py` 开头有 `load_dotenv(override=True)`。
 

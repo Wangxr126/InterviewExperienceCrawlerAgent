@@ -150,9 +150,13 @@ def _process_pending_tasks(batch_size: int = None):
 
     # ── Step 1: pending → 抓取详情（仅牛客）──────────────────
     pending = sqlite_service.get_pending_tasks(platform="nowcoder", limit=batch_size)
+    if pending:
+        logger.info(f"📥 开始抓取详情，本批 {len(pending)} 条 pending 任务")
     for task in pending:
         task_id = task["task_id"]
         url = task["source_url"]
+        title = (task.get("post_title") or "").strip() or "(无标题)"
+        logger.info(f"  📄 正在抓取: {title[:50]}... | {url[:50]}")
         try:
             from backend.services.crawler.nowcoder_crawler import NowcoderCrawler
             from backend.services.crawler.image_utils import download_images
@@ -165,12 +169,12 @@ def _process_pending_tasks(batch_size: int = None):
                     raw_content=content,
                     image_paths=image_paths,
                 )
-                logger.info(f"  ✅ 抓取详情成功: {url[:60]} (正文{len(content)}字, 图片{len(image_paths)}张)")
+                logger.info(f"  ✅ 抓取详情成功 [{title[:40]}]: 正文{len(content)}字, 图片{len(image_paths)}张")
             else:
                 sqlite_service.update_task_status(task_id, "error", error_msg="正文内容为空或太短")
         except Exception as e:
             sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200])
-            logger.error(f"  ❌ 抓取详情失败 {url}: {e}")
+            logger.error(f"  ❌ 抓取详情失败 [{title[:40]}]: {e}")
 
     # ── Step 2: fetched → LLM 提取 → 写库 ────────────────────
     # 同时处理牛客和小红书（XHS 在 discover 时就已经 fetched）
@@ -180,11 +184,17 @@ def _process_pending_tasks(batch_size: int = None):
             (batch_size,)
         ).fetchall()
 
+    if fetched_rows:
+        logger.info(f"📋 开始 LLM 提取，本批 {len(fetched_rows)} 条 fetched 帖子")
+
     for row in fetched_rows:
         task_id = row["task_id"]
         raw_content = row["raw_content"] or ""
         url = row["source_url"]
         platform = row["source_platform"]
+        post_title = (row["post_title"] or "").strip() or "(无标题)"
+
+        logger.info(f"  📄 正在处理帖子: {post_title[:60]}... | URL: {url[:60]}")
 
         if not raw_content or len(raw_content) < 50:
             sqlite_service.update_task_status(task_id, "error", error_msg="raw_content 为空", raw_content=raw_content)
@@ -208,12 +218,12 @@ def _process_pending_tasks(batch_size: int = None):
 
             count = _save_questions(questions)
             sqlite_service.update_task_status(task_id, "done", questions_count=count)
-            logger.info(f"  ✅ 提取完成 {url[:50]}: {count} 道题目入库")
+            logger.info(f"  ✅ 提取完成 [{post_title[:40]}]: {count} 道题目入库")
             processed += count
 
         except Exception as e:
             sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200], raw_content=raw_content)
-            logger.error(f"  ❌ LLM 提取失败 {url}: {e}")
+            logger.error(f"  ❌ LLM 提取失败 [{post_title[:40]}]: {e}")
 
     logger.info(f"⚙️  本轮处理完成，入库题目 {processed} 道")
     return processed

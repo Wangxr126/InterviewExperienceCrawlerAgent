@@ -511,25 +511,24 @@ class InterviewSystemOrchestrator:
                    session_id: Optional[str] = None) -> str:
         """
         自由对话接口：出题推荐、概念解释、笔记管理、掌握度查询等。
-        InterviewerAgent 只做"需要 LLM 理解和推理"的事。
-        具体的答题评估请走 submit_answer()。
+        对话记录与 LLM 回复均入库，支持前端加载历史。
         """
         if not session_id:
             session_id = f"sess_{uuid.uuid4().hex[:8]}"
 
-        # 构建记忆上下文注入（代码负责检索，不让 Agent 自己决定）
-        memory_context = self._build_memory_context(user_id, message)
+        # 确保 session 存在并入库用户消息
+        sqlite_service.ensure_session_exists(session_id, user_id)
+        sqlite_service.update_session_history(session_id, "user", message)
 
-        # 写用户输入到工作记忆（确定性，总是执行）
+        # 构建记忆上下文注入
+        memory_context = self._build_memory_context(user_id, message)
         self._write_working(user_id, f"用户：{message}", session_id=session_id)
 
-        # 简历写入感知记忆（确定性）
         if resume:
             self._write_perceptual(user_id, f"简历内容（{len(resume)}字）",
                                     modality="text", importance=0.8,
                                     session_id=session_id)
 
-        # 组装注入上下文（记忆 + 用户信息）
         context_prefix = "\n".join(filter(None, [
             f"[系统] user_id={user_id}, session_id={session_id}",
             memory_context,
@@ -538,7 +537,6 @@ class InterviewSystemOrchestrator:
         full_input = f"{context_prefix}\n\n[用户消息]\n{message}" if context_prefix.strip() else message
 
         logger.info(f"💬 [InterviewerAgent] 处理用户 {user_id} 的对话，消息: {message[:80]}")
-        # ReActAgent.run() 是同步函数，在线程池中运行
         loop = asyncio.get_event_loop()
         try:
             response = await loop.run_in_executor(None, self.interviewer.run, full_input)
@@ -547,11 +545,11 @@ class InterviewSystemOrchestrator:
             raise
         logger.info(f"✅ [InterviewerAgent] 回复完成 ({len(response)}字): {response[:200]}")
 
-        # 写 AI 回复到工作记忆（确定性）
+        # 入库 AI 回复（reasoning 需 agent 暴露时再补充）
+        sqlite_service.update_session_history(session_id, "assistant", response)
+
         self._write_working(user_id, f"AI：{response[:200]}", importance=0.4,
                              session_id=session_id)
-
-        # 写对话事件到情景记忆（确定性）
         self._write_episodic(
             user_id=user_id,
             content=f"对话：「{message[:60]}」→「{response[:60]}」",

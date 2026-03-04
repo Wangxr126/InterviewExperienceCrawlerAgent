@@ -278,6 +278,17 @@ class _Settings:
     def crawler_process_batch_size(self) -> int:
         return _get_int("CRAWLER_PROCESS_BATCH_SIZE", 5)
 
+    # ── 12. 对话与 Agent ───────────────────────────────────────────
+    @property
+    def default_user_id(self) -> str:
+        """默认用户 ID，前端未指定时使用"""
+        return _get("DEFAULT_USER_ID", "user_001")
+
+    @property
+    def interviewer_max_steps(self) -> int:
+        """Interviewer Agent 最大思考步数"""
+        return _get_int("INTERVIEWER_MAX_STEPS", 8)
+
 
 # 全局单例（懒加载，main.py 中 load_dotenv 先于任何 import settings 执行）
 settings = _Settings()
