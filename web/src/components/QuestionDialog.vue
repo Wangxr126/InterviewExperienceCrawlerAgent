@@ -14,9 +14,9 @@
 
       <div class="q-full-text">{{ question.question_text }}</div>
 
-      <div v-if="question.reference_answer" class="section">
-        <div class="section-title">参考答案</div>
-        <div class="ref-answer">{{ question.reference_answer }}</div>
+      <div v-if="showAnswer && standardAnswer" class="section">
+        <div class="section-title">📋 标准答案</div>
+        <div class="ref-answer" v-html="formattedAnswerHtml"></div>
       </div>
 
       <div class="section">
@@ -27,7 +27,7 @@
 
       <div v-if="evalResult" class="eval-result" :class="evalResult.score >= 3 ? 'good' : 'bad'">
         <div class="eval-score">得分：{{ evalResult.score }}/5 {{ scoreEmoji }}</div>
-        <div class="eval-feedback">{{ evalResult.feedback }}</div>
+        <div class="eval-feedback" v-html="formattedFeedbackHtml"></div>
         <div v-if="evalResult.missing_points?.length" class="eval-missing">
           <strong>遗漏点：</strong>{{ evalResult.missing_points.join('、') }}
         </div>
@@ -36,6 +36,11 @@
 
     <template #footer>
       <el-button @click="visible = false">关闭</el-button>
+      <el-tooltip :content="standardAnswer ? '' : '该题暂无标准答案'" placement="top">
+        <el-button type="success" :disabled="!standardAnswer" @click="showAnswer = !showAnswer">
+          {{ showAnswer ? '隐藏答案' : '📋 标准答案' }}
+        </el-button>
+      </el-tooltip>
       <el-button type="info" @click="$emit('send-to-chat', { question })">💬 去对话练习</el-button>
       <el-button type="primary" :loading="submitting" @click="submit">提交作答</el-button>
     </template>
@@ -46,6 +51,7 @@
 import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api.js'
+import { formatAnswerToHtml } from '../utils/formatAnswer.js'
 
 const props  = defineProps({ modelValue: Boolean, question: Object })
 const emit   = defineEmits(['update:modelValue', 'send-to-chat'])
@@ -57,6 +63,14 @@ const visible = computed({
 const myAnswer   = ref('')
 const submitting = ref(false)
 const evalResult = ref(null)
+const showAnswer = ref(false)
+const standardAnswer = computed(() =>
+  props.question?.answer_text || props.question?.reference_answer || ''
+)
+
+// 分点答案：1. 2. 或 一、二、 或 （1）（2）等每条占一行，格式清晰
+const formattedAnswerHtml = computed(() => formatAnswerToHtml(standardAnswer.value))
+const formattedFeedbackHtml = computed(() => formatAnswerToHtml(evalResult.value?.feedback || ''))
 
 const scoreEmoji = computed(() => {
   const s = evalResult.value?.score
@@ -68,7 +82,7 @@ const scoreEmoji = computed(() => {
 })
 
 watch(visible, (v) => {
-  if (!v) { myAnswer.value = ''; evalResult.value = null }
+  if (!v) { myAnswer.value = ''; evalResult.value = null; showAnswer.value = false }
 })
 
 const submit = async () => {
@@ -101,10 +115,14 @@ const submit = async () => {
                  margin-bottom: 8px; text-transform: uppercase; letter-spacing: .05em; }
 .ref-answer { font-size: 14px; line-height: 1.6; color: var(--text-sub);
               padding: 10px 12px; background: var(--bg); border-radius: 8px; }
+.ref-answer :deep(.answer-line) { margin-bottom: 8px; }
+.ref-answer :deep(.answer-line:last-child) { margin-bottom: 0; }
 .eval-result { margin-top: 14px; padding: 14px; border-radius: 10px; }
 .eval-result.good { background: #f0fdf4; border: 1px solid #86efac; }
 .eval-result.bad  { background: #fef2f2; border: 1px solid #fca5a5; }
 .eval-score    { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
 .eval-feedback { font-size: 14px; line-height: 1.6; }
+.eval-feedback :deep(.answer-line) { margin-bottom: 6px; }
+.eval-feedback :deep(.answer-line:last-child) { margin-bottom: 0; }
 .eval-missing  { margin-top: 8px; font-size: 13px; color: #dc2626; }
 </style>

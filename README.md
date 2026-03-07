@@ -24,8 +24,8 @@
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                   前端 (Vue 3 + Element Plus CDN)    │
-│                   frontend/index.html                │
+│                   前端 (Vue 3 + Vite + Element Plus)  │
+│                   web/ → backend/static/dist          │
 └──────────────────────┬──────────────────────────────┘
                        │ HTTP (localhost:8000)
 ┌──────────────────────▼──────────────────────────────┐
@@ -116,15 +116,15 @@ python run.py
 ╚══════════════════════════════════════════════════════╝
 ```
 
-### 第五步：打开前端
+### 第五步：构建并打开前端
 
-用浏览器直接打开文件：
-
+```powershell
+cd web
+npm install
+npm run build
 ```
-E:\Agent\AgentProject\wxr_agent\frontend\index.html
-```
 
-或在 VS Code / PyCharm 中用 Live Server 插件打开。
+构建完成后，访问 http://localhost:8000 即可使用。开发模式可运行 `npm run dev`，访问 http://localhost:5173。
 
 ---
 
@@ -143,6 +143,8 @@ wxr_agent/
 ├── backend/
 │   ├── main.py             # FastAPI 入口
 │   ├── config/config.py    # 统一配置
+│   ├── data/               # 后端数据（SQLite、memory、neo4j、qdrant 等）
+│   ├── static/dist/        # 前端构建产物（由 web 构建生成）
 │   ├── agents/
 │   │   ├── orchestrator.py      # 系统编排器（主控）
 │   │   ├── interviewer_agent.py # 面试官 Agent（ReAct）
@@ -157,10 +159,7 @@ wxr_agent/
 │       ├── interviewer_tools.py # 面试工具集
 │       └── architect_tools.py   # 知识结构化工具集
 │
-├── frontend/
-│   └── index.html          # 单页前端（Vue 3 + Element Plus CDN）
-│
-└── neo4j_data/             # Neo4j 数据持久化目录（Docker 挂载）
+└── web/                    # Vue 3 + Vite 前端工程（npm run build → backend/static/dist）
 ```
 
 ---

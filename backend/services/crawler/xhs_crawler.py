@@ -39,7 +39,7 @@ def _user_data_dir() -> str:
 
 
 def _link_cache() -> str:
-    return os.environ.get("XHS_LINK_CACHE", "./backend/data/xhs_link_cache.txt")
+    return _cfg().xhs_link_cache_path
 
 
 def _login_wait_seconds() -> int:
@@ -74,11 +74,6 @@ def _wait_for_login(page, wait_seconds: int = 120) -> bool:
     每 5 秒检测一次登录状态，超时后返回 False（不阻塞后台）。
     不使用 input()，完全非交互式。
     """
-    print(f"\n{'='*60}")
-    print("⚠️  未检测到小红书登录状态！")
-    print("👉 请在弹出的浏览器中完成扫码登录...")
-    print(f"   将每 5 秒自动检测，最多等待 {wait_seconds} 秒后自动继续")
-    print(f"{'='*60}\n")
     logger.warning(
         f"⚠️  未检测到小红书登录状态，请在弹出的浏览器窗口中扫码登录。"
         f"将等待最多 {wait_seconds} 秒后自动继续..."
@@ -92,7 +87,6 @@ def _wait_for_login(page, wait_seconds: int = 120) -> bool:
             page.wait_for_timeout(check_interval * 1000)
             if _is_logged_in(page):
                 logger.info("✅ 检测到登录成功，继续爬取...")
-                print("✅ 检测到登录成功，继续爬取...")
                 return True
             logger.info(f"   等待扫码中... 剩余 {remaining} 秒")
         except Exception:
@@ -202,9 +196,7 @@ def get_xhs_links_with_playwright(
                 return []
             else:
                 # 有头模式：等待用户扫码（倒计时，非阻塞）
-                print("\n" + "="*60)
-                print("👉 浏览器已打开，请在浏览器中扫码登录小红书...")
-                print("="*60 + "\n")
+                logger.info("浏览器已打开，请在浏览器中扫码登录小红书...")
                 if not _wait_for_login(page, wait_seconds=login_wait_seconds):
                     browser.close()
                     return []
@@ -338,6 +330,103 @@ def xhs_do_login(wait_seconds: int = None) -> bool:
     return success
 
 
+# 「你访问的页面不见了」：xhs-crawl 遇 302/404 时 meta 回退得到的标题，通常为防爬/限流
+# 此时用 Playwright 浏览器（带登录态）可正常获取正文
+_PAGE_NOT_FOUND_TITLES = ("你访问的页面不见了", "页面不见了", "页面不存在")
+
+
+def _is_page_not_found_result(title: str, content: str) -> bool:
+    """判断是否为 xhs-crawl 遇防爬时返回的占位结果（标题含占位文案且正文为空或极短）"""
+    if not title:
+        return False
+    content = (content or "").strip()
+    return any(t in title for t in _PAGE_NOT_FOUND_TITLES) and len(content) < 100
+
+
+async def _fetch_xhs_with_playwright(url: str, headless: bool = True) -> Dict | None:
+    """
+    用 Playwright 浏览器（带登录态）抓取小红书详情页，绕过 xhs-crawl 遇防爬时的 302/404。
+    返回 {title, content, image_urls} 或 None。
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.warning("Playwright 未安装，无法使用浏览器兜底抓取")
+        return None
+
+    user_data = _user_data_dir()
+    os.makedirs(user_data, exist_ok=True)
+    for lock_name in ("SingletonLock", "SingletonCookie", "lockfile"):
+        lock_path = os.path.join(user_data, lock_name)
+        if os.path.exists(lock_path):
+            try:
+                os.remove(lock_path)
+            except Exception:
+                pass
+
+    if os.name == "nt":
+        import sys
+        if sys.platform == "win32":
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch_persistent_context(
+            user_data_dir=user_data,
+            headless=headless,
+            viewport={"width": 1920, "height": 1080},
+            args=["--disable-blink-features=AutomationControlled"],
+            ignore_default_args=["--enable-automation"],
+        )
+        page = browser.pages[0] if browser.pages else await browser.new_page()
+        await page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(2000)
+
+            # 尝试从 __INITIAL_STATE__ 提取
+            data = await page.evaluate("""() => {
+                try {
+                    const s = window.__INITIAL_STATE__ || {};
+                    const noteId = (window.__INITIAL_STATE__?.note?.noteId || location.pathname.split('/').pop()?.split('?')[0]) || '';
+                    const noteMap = s.note?.noteDetailMap || {};
+                    const note = noteMap[noteId]?.note || Object.values(noteMap)[0]?.note;
+                    if (note) {
+                        const title = note.title || '';
+                        const desc = note.desc || '';
+                        const images = (note.imageList || []).map(i => i.urlDefault || i.url || '').filter(Boolean);
+                        return { title, content: desc, image_urls: images };
+                    }
+                } catch {}
+                return null;
+            }""")
+            if data and (data.get("content") or "").strip():
+                await browser.close()
+                return data
+
+            # DOM 兜底：正文区域
+            desc_el = await page.query_selector(".desc, [class*='desc'], .note-content, [class*='note-content']")
+            if desc_el:
+                content = await desc_el.inner_text()
+                title_el = await page.query_selector("h1, .title, [class*='title']")
+                title = await title_el.inner_text() if title_el else ""
+                img_urls = []
+                for img in await page.query_selector_all(".note-content img[src], [class*='content'] img[src]"):
+                    src = await img.get_attribute("src")
+                    if src and "http" in src:
+                        img_urls.append(src)
+                await browser.close()
+                return {"title": (title or "").strip(), "content": (content or "").strip(), "image_urls": img_urls}
+        except Exception as e:
+            logger.debug(f"Playwright 抓取失败 {url}: {e}")
+        await browser.close()
+    return None
+
+
 # ── xhs-crawl 获取帖子详情 ────────────────────────────────────
 
 async def _async_fetch_details(links: List[str]) -> List[Dict]:
@@ -367,8 +456,26 @@ async def _async_fetch_details(links: List[str]) -> List[Dict]:
             if hasattr(post, "images") and post.images:
                 images = list(post.images)
 
+            # 「页面不见了」类：xhs-crawl 遇防爬返回占位页，用 Playwright 兜底
+            if _is_page_not_found_result(title, content):
+                logger.info(f"xhs-crawl 返回「页面不见了」，尝试 Playwright 兜底: {url[:60]}...")
+                pw_data = await _fetch_xhs_with_playwright(url)
+                if pw_data and (pw_data.get("content") or "").strip():
+                    title = pw_data.get("title") or title
+                    content = pw_data.get("content") or content
+                    images = pw_data.get("image_urls") or images
+                    logger.info(f"Playwright 兜底成功: {title[:30]}... ({len(content)} 字)")
+                else:
+                    logger.warning(f"Playwright 兜底失败，保留空正文: {url[:60]}...")
+
+            # 去掉 meta 回退时常见的「 - 小红书」后缀
+            clean_title = title.strip()
+            for suffix in (" - 小红书", "- 小红书"):
+                if clean_title.endswith(suffix):
+                    clean_title = clean_title[:-len(suffix)].strip()
+                    break
             posts.append({
-                "title": title,
+                "title": clean_title,
                 "content": content,
                 "author": author,
                 "image_urls": images,
@@ -376,7 +483,7 @@ async def _async_fetch_details(links: List[str]) -> List[Dict]:
                 "source_url": url,
                 "source_platform": "xiaohongshu",
             })
-            logger.info(f"XHS [{idx}/{len(links)}] 详情: {title[:20]}... ({len(content)}字)")
+            logger.info(f"XHS [{idx}/{len(links)}] 详情: {clean_title[:20]}... ({len(content)}字)")
             await asyncio.sleep(random.uniform(3, 6))
 
         except Exception as e:
@@ -486,6 +593,7 @@ class XHSCrawler:
                            for k in ["面经", "面试"])
                     else "其他"
                 )
+                p["discover_keyword"] = kw
                 all_posts.append(p)
 
         logger.info(f"XHS 共获取 {len(all_posts)} 条帖子详情")

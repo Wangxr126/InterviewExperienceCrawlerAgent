@@ -5,6 +5,9 @@
 
       <!-- 筛选行 -->
       <div class="filter-row">
+        <el-select v-model="filters.question_type" placeholder="题目类型" clearable>
+          <el-option v-for="t in (props.meta.question_types || ['技术题','算法题','系统设计','行为题','HR问题'])" :key="t" :label="t" :value="t" />
+        </el-select>
         <el-select v-model="filters.company" placeholder="公司" clearable filterable>
           <el-option v-for="c in props.meta.companies" :key="c" :label="c" :value="c" />
         </el-select>
@@ -38,9 +41,14 @@
         <div v-for="q in questions" :key="q.q_id" class="q-card" @click="openDialog(q)">
           <div class="q-card-header">
             <div class="q-text">{{ q.question_text }}</div>
-            <span class="difficulty-badge" :class="`diff-${q.difficulty || 'medium'}`">
-              {{ diffLabel(q.difficulty) }}
-            </span>
+            <div class="q-card-badges">
+              <span class="type-badge" :class="questionTypeClass(q.question_type)">
+                {{ q.question_type || '技术题' }}
+              </span>
+              <span class="difficulty-badge" :class="`diff-${q.difficulty || 'medium'}`">
+                {{ diffLabel(q.difficulty) }}
+              </span>
+            </div>
           </div>
           <div class="q-meta">
             <span v-if="q.company" class="meta-chip">🏢 {{ q.company }}</span>
@@ -76,7 +84,7 @@ const props = defineProps({
 })
 const emit = defineEmits(['send-to-chat'])
 
-const filters = reactive({ company: '', difficulty: '', tag: '', keyword: '', source_platform: '' })
+const filters = reactive({ question_type: '', company: '', difficulty: '', tag: '', keyword: '', source_platform: '' })
 const questions = ref([])
 const loading   = ref(false)
 const dialogVisible = ref(false)
@@ -84,6 +92,10 @@ const selectedQ     = ref(null)
 
 const diffLabel     = (d) => ({ easy: '简单', medium: '中等', hard: '困难' }[d] || '中等')
 const platformLabel = (p) => ({ nowcoder: '牛客', xiaohongshu: '小红书' }[p] || p)
+const questionTypeClass = (t) => {
+  const m = { '技术题': 'type-tech', '算法题': 'type-algo', '系统设计': 'type-design', '行为题': 'type-behavior', 'HR问题': 'type-hr' }
+  return m[t] || 'type-tech'
+}
 
 const loadQuestions = async () => {
   loading.value = true
@@ -111,7 +123,7 @@ const loadRandom = async () => {
 }
 
 const resetFilters = () => {
-  Object.assign(filters, { company: '', difficulty: '', tag: '', keyword: '', source_platform: '' })
+  Object.assign(filters, { question_type: '', company: '', difficulty: '', tag: '', keyword: '', source_platform: '' })
   loadQuestions()
 }
 
@@ -143,9 +155,16 @@ onMounted(loadQuestions)
 }
 .q-card:hover { box-shadow: 0 4px 16px rgba(91,110,245,.12); border-color: var(--primary); }
 .q-card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
-.q-text { font-size: 14px; line-height: 1.5; flex: 1; display: -webkit-box;
+.q-text { font-size: 14px; line-height: 1.5; flex: 1; min-width: 0; display: -webkit-box;
           -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.difficulty-badge { font-size: 11px; padding: 2px 8px; border-radius: 12px; white-space: nowrap; flex-shrink: 0; }
+.q-card-badges { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
+.type-badge { font-size: 10px; padding: 2px 6px; border-radius: 8px; white-space: nowrap; font-weight: 600; }
+.type-tech    { background: #dbeafe; color: #1d4ed8; }      /* 技术题-蓝 */
+.type-algo    { background: #e9d5ff; color: #6b21a8; }      /* 算法题-紫 */
+.type-design  { background: #ccfbf1; color: #0f766e; }      /* 系统设计-青 */
+.type-behavior{ background: #fed7aa; color: #c2410c; }      /* 行为题-橙 */
+.type-hr      { background: #e5e7eb; color: #4b5563; }      /* HR问题-灰 */
+.difficulty-badge { font-size: 11px; padding: 2px 8px; border-radius: 12px; white-space: nowrap; }
 .diff-easy   { background: #d1fae5; color: #065f46; }
 .diff-medium { background: #fef3c7; color: #92400e; }
 .diff-hard   { background: #fee2e2; color: #991b1b; }

@@ -26,6 +26,7 @@ export const api = {
     const p = new URLSearchParams()
     if (params.company) p.set('company', params.company)
     if (params.difficulty) p.set('difficulty', params.difficulty)
+    if (params.question_type) p.set('question_type', params.question_type)
     if (params.tag) p.set('tag', params.tag)
     if (params.keyword) p.set('keyword', params.keyword)
     if (params.source_platform) p.set('source_platform', params.source_platform)
@@ -119,12 +120,43 @@ export const api = {
     return r.json()
   },
 
+  async reExtractAll(batchSize = 50) {
+    const r = await fetch(`${BASE}/api/crawler/re-extract-all?batch_size=${batchSize}`, {
+      method: 'POST',
+    })
+    return r.json()
+  },
+
+  async cleanData(batchSize = 50) {
+    const r = await fetch(`${BASE}/api/crawler/clean-data?batch_size=${batchSize}`, {
+      method: 'POST',
+    })
+    return r.json()
+  },
+
+  async getExtractionStatus() {
+    const r = await fetch(`${BASE}/api/crawler/extraction-status`)
+    return r.json()
+  },
+
+  async getCrawlerKeywords() {
+    const r = await fetch(`${BASE}/api/crawler/keywords`)
+    return r.json()
+  },
+
   async getCrawlerTasks(params = {}) {
     const p = new URLSearchParams()
     if (params.status) p.set('status', params.status)
     if (params.platform) p.set('platform', params.platform)
-    p.set('limit', params.limit ?? '50')
+    if (params.keyword) p.set('keyword', params.keyword)
+    p.set('limit', params.limit ?? '20')
+    if (params.offset != null) p.set('offset', String(params.offset))
     const r = await fetch(`${BASE}/api/crawler/tasks?${p}`)
+    return r.json()
+  },
+
+  async clearAllCrawlData() {
+    const r = await fetch(`${BASE}/api/crawler/clear-all`, { method: 'POST' })
     return r.json()
   },
 
@@ -140,6 +172,13 @@ export const api = {
 
   async checkXhsLogin() {
     const r = await fetch(`${BASE}/api/crawler/xhs/login-status`)
+    return r.json()
+  },
+
+  async refetchXhsBody(taskId) {
+    const r = await fetch(`${BASE}/api/crawler/refetch-xhs-body?task_id=${encodeURIComponent(taskId)}`, {
+      method: 'POST',
+    })
     return r.json()
   },
 }

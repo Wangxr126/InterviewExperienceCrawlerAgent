@@ -17,16 +17,23 @@ backend/*.db
 *.db-journal
 *.db-wal
 
-# 根目录遗留数据目录（若存在）
+# 根目录遗留数据目录（已迁移至 backend/data，若存在可删除）
 memory_data/
 neo4j_data/
 xhs_user_data/
+qdrant_storage/
+test_nowcoder_output/
+
+# 本地参考与思路（不上传）
+参考项目/
+思路/
 
 # ━━━ 前端构建与依赖 ━━━
 node_modules/
 frontend/dist/
 web/node_modules/
 web/dist/
+backend/static/dist/
 
 # ━━━ Python ━━━
 __pycache__/

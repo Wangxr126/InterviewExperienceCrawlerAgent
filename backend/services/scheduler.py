@@ -81,8 +81,8 @@ cfg = _CrawlerConfig()
 # 核心处理函数（供 Scheduler Job 调用）
 # ══════════════════════════════════════════════════════════════
 
-def _run_nowcoder_discovery(keywords: List[str] = None, max_pages: int = None):
-    """牛客面经发现任务（keywords/max_pages 不传时从 .env 读取）"""
+def _run_nowcoder_discovery(keywords: List[str] = None, max_pages: int = None) -> tuple:
+    """牛客面经发现任务（keywords/max_pages 不传时从 .env 读取）。返回 (新增数, 发现列表)"""
     _keywords = keywords or cfg.NOWCODER_KEYWORDS
     _max_pages = max_pages if max_pages is not None else cfg.NOWCODER_MAX_PAGES
     logger.info(f"🔍 牛客发现任务开始（关键词={_keywords}, 最大页数={_max_pages}）...")
@@ -92,6 +92,7 @@ def _run_nowcoder_discovery(keywords: List[str] = None, max_pages: int = None):
         posts = crawler.discover(keywords=_keywords, max_pages=_max_pages)
 
         added = 0
+        discovered = []
         for p in posts:
             task_id = sqlite_service.add_crawl_task(
                 source_url=p["source_url"],
@@ -102,15 +103,17 @@ def _run_nowcoder_discovery(keywords: List[str] = None, max_pages: int = None):
                 business_line=p.get("business_line", ""),
                 difficulty=p.get("difficulty", ""),
                 post_type=p.get("post_type", ""),
+                discover_keyword=p.get("discover_keyword", ""),
             )
             if task_id:
                 added += 1
+            discovered.append({"title": p.get("title", "")[:50], "url": p.get("source_url", "")})
 
         logger.info(f"✅ 牛客发现任务完成：发现 {len(posts)} 条，新增队列 {added} 条")
-        return added
+        return added, discovered
     except Exception as e:
         logger.error(f"❌ 牛客发现任务失败: {e}", exc_info=True)
-        return 0
+        return 0, []
 
 
 def _run_xhs_discovery(headless: bool = True):
@@ -194,14 +197,21 @@ def _process_pending_tasks(batch_size: int = None):
         platform = row["source_platform"]
         post_title = (row["post_title"] or "").strip() or "(无标题)"
 
-        logger.info(f"  📄 正在处理帖子: {post_title[:60]}... | URL: {url[:60]}")
+        logger.info(f"  📄 正在处理帖子: {post_title[:60]}...")
 
         if not raw_content or len(raw_content) < 50:
             sqlite_service.update_task_status(task_id, "error", error_msg="raw_content 为空", raw_content=raw_content)
+            logger.error(f"  ❌ 提取失败(正文为空) task_id={task_id} url={url[:60]} title={post_title[:40]}")
             continue
 
+        image_paths_raw = row["image_paths"] or "[]"
         try:
-            questions = extract_questions_from_post(
+            image_paths = json.loads(image_paths_raw) if isinstance(image_paths_raw, str) else image_paths_raw or []
+        except Exception:
+            image_paths = []
+
+        try:
+            questions, status = extract_questions_from_post(
                 content=raw_content,
                 platform=platform,
                 company=row["company"] or "",
@@ -210,20 +220,69 @@ def _process_pending_tasks(batch_size: int = None):
                 difficulty=row["difficulty"] or "",
                 source_url=url,
                 post_title=row["post_title"] or "",
+                extraction_source="content",
             )
 
-            if not questions:
-                sqlite_service.update_task_status(task_id, "error", error_msg="LLM 未提取到题目", raw_content=raw_content)
+            # 帖子与面经无关 → 暂不删除（LLM 判断不准确），仅标记为 error 保留记录
+            if status == "unrelated":
+                # cnt = sqlite_service.delete_by_source_url(url)
+                # logger.warning(f"  🗑️ 内容与面经无关，已删除记录: {post_title[:40]} | url={url[:80]} | 删除 {cnt} 题")
+                sqlite_service.update_task_status(task_id, "error", error_msg="LLM 判断与面经无关（暂不删除）", raw_content=raw_content)
+                logger.warning(f"  ⚠️ LLM 判断与面经无关，已标记 error 保留记录: {post_title[:40]} | url={url[:80]}")
                 continue
 
-            count = _save_questions(questions)
-            sqlite_service.update_task_status(task_id, "done", questions_count=count)
-            logger.info(f"  ✅ 提取完成 [{post_title[:40]}]: {count} 道题目入库")
-            processed += count
+            # LLM 解析失败 → 标记 error 并打印后台
+            if status == "parse_error":
+                sqlite_service.update_task_status(task_id, "error", error_msg="LLM 返回无法解析为 JSON", raw_content=raw_content)
+                logger.error(f"  ❌ 提取失败(解析错误) task_id={task_id} url={url[:60]} title={post_title[:40]}")
+                continue
+
+            # 正文提取到题目 → 入库（必须传 raw_content 保留原文，否则会被覆盖为空）
+            if questions:
+                count = _save_questions(questions)
+                sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source="content", raw_content=raw_content)
+                logger.info(f"  ✅ 提取完成(正文) [{post_title[:40]}]: {count} 道题目入库")
+                processed += count
+                continue
+
+            # 正文无题目，有图片 → 尝试 OCR 后再提取
+            if image_paths:
+                from backend.services.crawler.ocr_service import ocr_images_to_text
+                logger.warning(f"  📷 正文无题目，尝试 OCR {len(image_paths)} 张图片...")
+                ocr_text = ocr_images_to_text(image_paths, task_id)
+                if ocr_text:
+                    content_with_ocr = raw_content + "\n\n【图片 OCR 识别补充】\n" + ocr_text
+                    questions2, status2 = extract_questions_from_post(
+                        content=content_with_ocr,
+                        platform=platform,
+                        company=row["company"] or "",
+                        position=row["position"] or "",
+                        business_line=row["business_line"] or "",
+                        difficulty=row["difficulty"] or "",
+                        source_url=url,
+                        post_title=row["post_title"] or "",
+                        extraction_source="image",
+                    )
+                    if questions2:
+                        count = _save_questions(questions2)
+                        sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source="image", raw_content=raw_content)
+                        logger.info(f"  ✅ 提取完成(图片) [{post_title[:40]}]: {count} 道题目入库")
+                        processed += count
+                        continue
+
+            # 正文无题目，OCR 也无 → 暂不删除（LLM 判断不准确），仅标记为 error 保留记录
+            # cnt = sqlite_service.delete_by_source_url(url)
+            # logger.warning(f"  🗑️ 正文+OCR 均无题目（与面经无关），已删除记录: {post_title[:40]} | url={url[:80]} | 删除 {cnt} 题")
+            sqlite_service.update_task_status(task_id, "error", error_msg="正文+OCR 均无题目（暂不删除）", raw_content=raw_content)
+            logger.warning(f"  ⚠️ 正文+OCR 均无题目，已标记 error 保留记录: {post_title[:40]} | url={url[:80]}")
 
         except Exception as e:
+            import traceback
             sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200], raw_content=raw_content)
-            logger.error(f"  ❌ LLM 提取失败 [{post_title[:40]}]: {e}")
+            logger.error(
+                f"  ❌ LLM 提取失败 task_id={task_id} url={url[:60]} title={post_title[:40]}\n"
+                f"      error={e}\n{traceback.format_exc()}"
+            )
 
     logger.info(f"⚙️  本轮处理完成，入库题目 {processed} 道")
     return processed
@@ -259,19 +318,21 @@ def _save_questions(questions: List[Dict]) -> int:
             )
 
             # ── SQLite（主存储，必须成功）───────────────────
+            extraction_source = q.get("extraction_source", "content")
             with sqlite_service._get_conn() as conn:
                 conn.execute("""
                     INSERT OR IGNORE INTO questions
                         (q_id, question_text, answer_text, difficulty, question_type,
                          source_platform, source_url, company, position, business_line,
-                         topic_tags, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                         topic_tags, extraction_source, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """, (
                     q["q_id"], q["question_text"], q.get("answer_text", ""),
                     q.get("difficulty", "medium"), q.get("question_type", "技术题"),
                     q.get("source_platform", ""), q.get("source_url", ""),
                     q.get("company", ""), q.get("position", ""), q.get("business_line", ""),
                     json.dumps(tags, ensure_ascii=False),
+                    extraction_source,
                 ))
                 conn.commit()
 
@@ -347,7 +408,7 @@ class CrawlScheduler:
         logger.info("✅ 面经爬取调度器已启动")
         logger.info(f"   - 牛客发现：{'每天 ' + nowcoder_hours.replace(',', '/') + ':00' if cfg.ENABLE_NOWCODER else '已关闭（SCHEDULER_ENABLE_NOWCODER=false）'}")
         logger.info(f"   - XHS 发现：{'已开启（每天 03:00）' if cfg.ENABLE_XHS else '手动触发（SCHEDULER_ENABLE_XHS=false）'}")
-        logger.info(f"   - 任务处理：每小时第 {process_minute} 分钟")
+        logger.info(f"   - 任务处理：每小时第 {process_minute} 分钟，每批最多 {cfg.PROCESS_BATCH_SIZE} 条（CRAWLER_PROCESS_BATCH_SIZE）")
 
     def stop(self):
         if self._running:
@@ -357,8 +418,8 @@ class CrawlScheduler:
 
     # ── 手动触发接口（供 API 调用）───────────────────────────
 
-    def trigger_nowcoder_discovery(self, keywords: List[str] = None, max_pages: int = 2) -> int:
-        """手动触发牛客发现（立即执行，返回新增任务数）"""
+    def trigger_nowcoder_discovery(self, keywords: List[str] = None, max_pages: int = 2) -> tuple:
+        """手动触发牛客发现（立即执行，返回 (新增任务数, 发现列表)）"""
         logger.info("手动触发牛客发现任务...")
         return _run_nowcoder_discovery(keywords=keywords, max_pages=max_pages)
 
@@ -371,14 +432,16 @@ class CrawlScheduler:
         logger.info(f"手动触发 XHS 发现任务 headless={headless}...")
         return _run_xhs_discovery(headless=headless)
 
-    def trigger_process_tasks(self, batch_size: int = 10) -> int:
-        """手动触发任务处理（立即提取题目）"""
-        logger.info(f"手动触发任务处理 batch_size={batch_size}...")
-        return _process_pending_tasks(batch_size=batch_size)
+    def trigger_process_tasks(self, batch_size: int = None) -> int:
+        """手动触发任务处理（立即提取题目），batch_size 不传时从 env CRAWLER_PROCESS_BATCH_SIZE 读取"""
+        _batch = batch_size if batch_size is not None else cfg.PROCESS_BATCH_SIZE
+        logger.info(f"手动触发任务处理 batch_size={_batch}...")
+        return _process_pending_tasks(batch_size=_batch)
 
     def get_stats(self) -> Dict:
-        """获取调度器统计信息"""
+        """获取调度器统计信息（含 keywords 用于筛选下拉）"""
         crawl_stats = sqlite_service.get_crawl_stats()
+        keywords = sqlite_service.get_crawl_keywords()
         jobs = []
         for job in self._scheduler.get_jobs():
             next_run = job.next_run_time
@@ -391,6 +454,7 @@ class CrawlScheduler:
             "running": self._running,
             "scheduled_jobs": jobs,
             "crawl_stats": crawl_stats,
+            "keywords": keywords,
         }
 
 

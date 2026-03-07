@@ -169,8 +169,23 @@ class SqliteService:
                 created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """,
+            # ── 微调样本表 ──
+            """
+            CREATE TABLE IF NOT EXISTS finetune_samples (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                content         TEXT NOT NULL,
+                llm_raw         TEXT,
+                assist_output   TEXT,
+                final_output    TEXT,
+                is_modified     INTEGER DEFAULT 0,
+                status          TEXT DEFAULT 'pending',
+                created_at      TEXT NOT NULL,
+                labeled_at      TEXT
+            )
+            """,
             # ── 爬虫任务队列（去重 + 状态追踪）──
             # 含：原始链接、标题、正文、图片相对路径（JSON 数组）
+            # raw_content 使用 TEXT，SQLite 无长度限制（理论约 1GB），完整保存原文不截断
             """
             CREATE TABLE IF NOT EXISTS crawl_tasks (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,6 +217,17 @@ class SqliteService:
             cols = [r[1] for r in conn.execute("PRAGMA table_info(crawl_tasks)").fetchall()]
             if "image_paths" not in cols:
                 conn.execute("ALTER TABLE crawl_tasks ADD COLUMN image_paths TEXT")
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(crawl_tasks)").fetchall()]
+            # 迁移：为 crawl_tasks 添加 discover_keyword 列（发现该帖子时使用的搜索关键词）
+            if "discover_keyword" not in cols:
+                conn.execute("ALTER TABLE crawl_tasks ADD COLUMN discover_keyword TEXT")
+            # 迁移：为 crawl_tasks 添加 extraction_source 列（content/image，帖子维度）
+            if "extraction_source" not in cols:
+                conn.execute("ALTER TABLE crawl_tasks ADD COLUMN extraction_source TEXT")
+            # 迁移：为 questions 表添加 extraction_source 列（content/image）
+            qcols = [r[1] for r in conn.execute("PRAGMA table_info(questions)").fetchall()]
+            if "extraction_source" not in qcols:
+                conn.execute("ALTER TABLE questions ADD COLUMN extraction_source TEXT DEFAULT 'content'")
             conn.commit()
         logger.info("✅ SQLite 所有表初始化完成")
         self._seed_knowledge_resources()
@@ -239,8 +265,8 @@ class SqliteService:
             conn.commit()
 
     def filter_questions(self, company: str = None, position: str = None,
-                         difficulty: str = None, tags: List[str] = None,
-                         source_platform: str = None,
+                         difficulty: str = None, question_type: str = None,
+                         tags: List[str] = None, source_platform: str = None,
                          date_from: str = None, date_to: str = None,
                          keyword: str = None, limit: int = 20) -> List[Dict]:
         """
@@ -258,6 +284,9 @@ class SqliteService:
         if difficulty:
             conditions.append("difficulty = ?")
             params.append(difficulty)
+        if question_type:
+            conditions.append("question_type = ?")
+            params.append(question_type)
         if source_platform:
             conditions.append("source_platform = ?")
             params.append(source_platform)
@@ -977,7 +1006,8 @@ class SqliteService:
 
     def add_crawl_task(self, source_url: str, source_platform: str,
                        post_title: str = "", company: str = "", position: str = "",
-                       business_line: str = "", difficulty: str = "", post_type: str = "") -> Optional[str]:
+                       business_line: str = "", difficulty: str = "", post_type: str = "",
+                       discover_keyword: str = "") -> Optional[str]:
         """添加爬虫任务（URL已存在则忽略，返回 task_id；重复时返回 None）"""
         task_id = f"TASK-{uuid.uuid4().hex[:10].upper()}"
         try:
@@ -985,10 +1015,10 @@ class SqliteService:
                 conn.execute("""
                     INSERT INTO crawl_tasks
                         (task_id, source_url, source_platform, post_title,
-                         company, position, business_line, difficulty, post_type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         company, position, business_line, difficulty, post_type, discover_keyword)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (task_id, source_url, source_platform, post_title,
-                      company, position, business_line, difficulty, post_type))
+                      company, position, business_line, difficulty, post_type, discover_keyword or ""))
                 conn.commit()
             return task_id
         except Exception:
@@ -1010,17 +1040,36 @@ class SqliteService:
 
     def update_task_status(self, task_id: str, status: str,
                            questions_count: int = 0, error_msg: str = "",
-                           raw_content: str = "", image_paths: List[str] = None):
-        """更新任务状态。raw_content 完整保存（不截断），image_paths 为相对路径 JSON 数组"""
+                           raw_content: Optional[str] = None, image_paths: Optional[List[str]] = None,
+                           extraction_source: str = ""):
+        """更新任务状态。raw_content/image_paths 为 None 时不更新该列（保留原文），避免误覆盖。
+        extraction_source: content=正文提取, image=图片OCR提取（帖子维度）"""
         import json as _json
-        raw_val = raw_content or ""
+        sets = ["status=?", "questions_count=?", "error_msg=?", "extraction_source=?", "processed_at=CURRENT_TIMESTAMP"]
+        params: list = [status, questions_count, error_msg, extraction_source or None]
+        if raw_content is not None:
+            sets.append("raw_content=?")
+            params.append(raw_content or "")
+        if image_paths is not None:
+            sets.append("image_paths=?")
+            params.append(_json.dumps(image_paths or [], ensure_ascii=False))
+        params.append(task_id)
+        with self._get_conn() as conn:
+            conn.execute("UPDATE crawl_tasks SET " + ", ".join(sets) + " WHERE task_id=?", params)
+            conn.commit()
+
+    def update_task_content(self, task_id: str, post_title: str, raw_content: str,
+                            image_paths: List[str] = None):
+        """重抓正文后更新任务：标题、正文、图片路径，并重置为 fetched 待提取"""
+        import json as _json
         img_val = _json.dumps(image_paths or [], ensure_ascii=False) if image_paths else ""
         with self._get_conn() as conn:
             conn.execute("""
-                UPDATE crawl_tasks SET status=?, questions_count=?, error_msg=?,
-                    raw_content=?, image_paths=?, processed_at=CURRENT_TIMESTAMP
+                UPDATE crawl_tasks SET post_title=?, raw_content=?, image_paths=?,
+                    status='fetched', error_msg=NULL, questions_count=0,
+                    extraction_source=NULL, processed_at=CURRENT_TIMESTAMP
                 WHERE task_id=?
-            """, (status, questions_count, error_msg, raw_val, img_val, task_id))
+            """, (post_title or "", raw_content or "", img_val, task_id))
             conn.commit()
 
     def is_url_crawled(self, url: str) -> bool:
@@ -1031,6 +1080,52 @@ class SqliteService:
             ).fetchone()
             return row is not None
 
+    def delete_by_source_url(self, source_url: str) -> int:
+        """
+        删除该链接关联的所有数据（帖子与面经无关或提取失败时调用）。
+        删除：questions、ingestion_logs、crawl_tasks、crawl_logs、Neo4j 题库节点，以及 post_images 目录。
+        返回删除的题目数量。
+        """
+        import shutil
+        from pathlib import Path
+        from backend.config.config import settings
+
+        # 同步删除 Neo4j 题库中的题目节点
+        try:
+            from backend.services.neo4j_service import neo4j_service
+            neo4j_service.delete_questions_by_source_url(source_url)
+        except Exception as e:
+            logger.warning("Neo4j 删除题目失败（SQLite 已删除）: %s", e)
+
+        with self._get_conn() as conn:
+            # 获取 task_id 用于删除图片目录
+            row = conn.execute(
+                "SELECT task_id FROM crawl_tasks WHERE source_url=?", (source_url,)
+            ).fetchone()
+            task_id = row["task_id"] if row else None
+
+            # 删除题目
+            cur = conn.execute("DELETE FROM questions WHERE source_url=?", (source_url,))
+            deleted_questions = cur.rowcount
+
+            conn.execute("DELETE FROM ingestion_logs WHERE source_url=?", (source_url,))
+            conn.execute("DELETE FROM crawl_tasks WHERE source_url=?", (source_url,))
+            conn.execute("DELETE FROM crawl_logs WHERE url=?", (source_url,))
+            conn.commit()
+
+        # 删除 post_images 目录
+        if task_id:
+            img_dir = settings.post_images_dir / task_id
+            if img_dir.exists():
+                try:
+                    shutil.rmtree(img_dir)
+                    logger.info(f"已删除图片目录: {img_dir}")
+                except Exception as e:
+                    logger.warning(f"删除图片目录失败 {img_dir}: {e}")
+
+        logger.info(f"已删除 source_url 关联数据: {source_url[:60]}..., 题目 {deleted_questions} 道")
+        return deleted_questions
+
     def get_crawl_stats(self) -> Dict:
         """获取爬取统计"""
         with self._get_conn() as conn:
@@ -1038,8 +1133,26 @@ class SqliteService:
                 SELECT status, COUNT(*) as cnt, SUM(questions_count) as total_questions
                 FROM crawl_tasks GROUP BY status
             """).fetchall()
-            return {r["status"]: {"count": r["cnt"], "questions": r["total_questions"] or 0}
-                    for r in stats}
+            result = {r["status"]: {"count": r["cnt"], "questions": r["total_questions"] or 0}
+                      for r in stats}
+            # 按平台的 fetched 数量（用于提取进度分平台显示）
+            by_platform = conn.execute("""
+                SELECT source_platform, COUNT(*) as cnt
+                FROM crawl_tasks WHERE status = 'fetched'
+                GROUP BY source_platform
+            """).fetchall()
+            result["fetched_by_platform"] = {r["source_platform"]: r["cnt"] for r in by_platform}
+            return result
+
+    def get_crawl_keywords(self) -> List[str]:
+        """获取帖子记录中已有关键词列表（用于筛选下拉）"""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT discover_keyword FROM crawl_tasks "
+                "WHERE discover_keyword IS NOT NULL AND trim(discover_keyword) != '' "
+                "ORDER BY discover_keyword"
+            ).fetchall()
+            return [r["discover_keyword"] for r in rows]
 
 
 # 单例

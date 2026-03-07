@@ -86,6 +86,54 @@ class Neo4jService:
     # ===========================================================
     # 写入：添加题目节点及关联
     # ===========================================================
+    def delete_questions_by_source_url(self, source_url: str) -> int:
+        """按 source_url 删除 Neo4j 中的题目节点及关联边。返回删除的节点数。"""
+        if not self._check_available("delete_questions_by_source_url"):
+            return 0
+        if not source_url:
+            return 0
+        query = """
+        MATCH (q:Question) WHERE q.source = $source_url
+        WITH collect(q) AS to_delete
+        FOREACH (n IN to_delete | DETACH DELETE n)
+        RETURN size(to_delete) AS cnt
+        """
+        try:
+            with self.driver.session(database=self.db_name) as session:
+                result = session.run(query, source_url=source_url)
+                record = result.single()
+                cnt = record["cnt"] if record else 0
+                if cnt > 0:
+                    logger.info("Neo4j 已删除 source_url 关联题目: %d 道", cnt)
+                return cnt
+        except Exception as e:
+            logger.warning("Neo4j 删除题目失败 %s: %s", source_url[:50], e)
+            return 0
+
+    def delete_questions_by_source_platform(self, platforms: List[str]) -> int:
+        """按 source_platform 删除 Neo4j 中的题目节点。用于清除所有时的兜底。"""
+        if not self._check_available("delete_questions_by_source_platform"):
+            return 0
+        if not platforms:
+            return 0
+        query = """
+        MATCH (q:Question) WHERE q.source_platform IN $platforms
+        WITH collect(q) AS to_delete
+        FOREACH (n IN to_delete | DETACH DELETE n)
+        RETURN size(to_delete) AS cnt
+        """
+        try:
+            with self.driver.session(database=self.db_name) as session:
+                result = session.run(query, platforms=platforms)
+                record = result.single()
+                cnt = record["cnt"] if record else 0
+                if cnt > 0:
+                    logger.info("Neo4j 已删除 source_platform 关联题目: %d 道", cnt)
+                return cnt
+        except Exception as e:
+            logger.warning("Neo4j 按平台删除题目失败: %s", e)
+            return 0
+
     def add_question(self, q_id: str, text: str, answer: str,
                      tags: List[str], embedding: List[float],
                      metadata: Dict = None) -> bool:

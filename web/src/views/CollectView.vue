@@ -1,48 +1,98 @@
 <template>
   <div class="collect-page">
-    <!-- 顶部：统计 + 采集入口 -->
-    <div class="card top-section">
+    <!-- 1. 统计卡片（单独一行） -->
+    <div class="card stats-section">
       <div class="section-header">
         <h2 class="section-title">数据采集</h2>
-        <el-button size="small" :loading="statsLoading" @click="loadStats">刷新</el-button>
+        <el-button size="small" :loading="statsLoading" @click="async () => { await loadStats(); taskPage.value=1; await loadTasks() }">刷新</el-button>
       </div>
-      <div class="top-grid">
-        <!-- 统计 -->
-        <div class="stats-block">
-          <div v-if="statsList.length" class="stats-grid">
-            <div v-for="item in statsList" :key="item.status" class="stat-item">
-              <div class="stat-val" :style="{ color: item.color }">{{ item.count }}</div>
-              <div class="stat-key">{{ item.label }}</div>
-              <div v-if="item.questions > 0" class="stat-sub">已提取 {{ item.questions }} 题</div>
-            </div>
-          </div>
-          <div v-else class="stats-empty">暂无数据</div>
+      <div v-if="statsList.length" class="stats-row">
+        <div v-for="item in statsList" :key="item.status" class="stat-card" :style="{ borderLeftColor: item.color }">
+          <div class="stat-val" :style="{ color: item.color }">{{ item.count }}</div>
+          <div class="stat-key">{{ item.label }}</div>
+          <div v-if="item.questions > 0" class="stat-sub">已提取 {{ item.questions }} 题</div>
         </div>
-        <!-- 牛客 + 小红书 -->
-        <div class="crawl-block">
-          <div class="crawl-row">
-            <div class="crawl-card">
-              <div class="crawl-label">🐮 牛客网</div>
-              <el-input v-model="form.keywords" placeholder="关键词，逗号分隔" size="small" />
-              <div class="crawl-meta"><span>页数</span><el-input-number v-model="form.maxPages" :min="1" :max="10" size="small" controls-position="right" /></div>
-              <el-button type="primary" size="small" :loading="ncLoading" @click.prevent="crawl('nowcoder')">获取帖子</el-button>
+      </div>
+      <div v-else class="stats-empty">暂无数据</div>
+    </div>
+
+    <!-- 2. 数据源采集 -->
+    <div class="card crawl-section">
+      <div class="crawl-section-header">
+        <h3 class="subsection-title">数据源</h3>
+        <div class="crawl-keywords-row">
+          <span class="keywords-label">🔍 关键词</span>
+          <el-input v-model="form.keywords" placeholder="如：面经、Java、算法（逗号分隔，两平台共用）" size="default"
+                    class="crawl-keywords-input" clearable />
+        </div>
+      </div>
+      <div class="crawl-cards">
+        <div class="crawl-card nowcoder">
+          <div class="crawl-card-inner">
+            <div class="crawl-header">
+              <img src="https://www.nowcoder.com/favicon.ico" alt="牛客" class="platform-icon" onerror="this.style.display='none';this.nextElementSibling.style.display='inline-flex'">
+              <span class="platform-fallback">牛</span>
+              <span class="crawl-label">牛客网</span>
             </div>
-            <div class="crawl-card">
-              <div class="crawl-label">📕 小红书</div>
-              <el-input v-model="form.keywords" placeholder="关键词，逗号分隔" size="small" />
-              <div class="crawl-meta"><span>条数</span><el-input-number v-model="form.xhsCount" :min="5" :max="50" size="small" controls-position="right" /></div>
-              <el-button type="primary" size="small" :loading="xhsLoading" @click.prevent="crawl('xiaohongshu')">获取帖子</el-button>
-              <div class="crawl-hint">需扫码登录</div>
+            <div class="crawl-meta">
+              <span class="meta-label">爬取页数</span>
+              <el-input-number v-model="form.maxPages" :min="1" :max="50" size="default" controls-position="right" />
+            </div>
+            <div class="crawl-actions">
+              <el-button type="primary" size="default" :loading="ncLoading" @click.prevent="crawl('nowcoder')" class="crawl-btn">
+                获取帖子
+              </el-button>
+              <span class="crawl-hint crawl-hint-spacer"></span>
             </div>
           </div>
-          <div v-if="ncResult || xhsMsg" class="result-msg" :class="(ncResult || xhsMsg)?.ok ? 'ok' : 'err'">
-            {{ ncResult?.msg || xhsMsg?.msg }}
+        </div>
+        <div class="crawl-card xiaohongshu">
+          <div class="crawl-card-inner">
+            <div class="crawl-header">
+              <img src="https://www.xiaohongshu.com/favicon.ico" alt="小红书" class="platform-icon" onerror="this.style.display='none';this.nextElementSibling.style.display='inline-flex'">
+              <span class="platform-fallback">红</span>
+              <span class="crawl-label">小红书</span>
+            </div>
+            <div class="crawl-meta">
+              <span class="meta-label">获取条数</span>
+              <el-input-number v-model="form.xhsCount" :min="1" :max="100" size="default" controls-position="right" />
+            </div>
+            <div class="crawl-actions">
+              <el-button type="primary" size="default" :loading="xhsLoading" @click.prevent="crawl('xiaohongshu')" class="crawl-btn">
+                获取帖子
+              </el-button>
+              <span class="crawl-hint">需扫码登录</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="crawl-both-wrap">
+        <el-button type="success" size="default" :loading="bothLoading" @click.prevent="crawlBoth" class="crawl-both-btn">
+          🚀 同时获取牛客 + 小红书
+        </el-button>
+      </div>
+      <!-- 抓取进度：牛客/小红书获取帖子后轮询显示 -->
+      <div v-if="crawlPolling" class="progress-bar-wrap">
+        <el-progress v-if="crawlDiscovered < 999" :percentage="crawlProgressPct" :status="crawlProgressPct >= 100 ? 'success' : undefined" />
+        <el-icon v-else class="is-loading" style="font-size:24px;color:var(--primary)"><Loading /></el-icon>
+        <span class="progress-text">{{ crawlProgressText }}</span>
+      </div>
+      <div v-else-if="ncResult || xhsMsg" class="result-msg" :class="(ncResult || xhsMsg)?.ok ? 'ok' : 'err'">
+        {{ ncResult?.msg || xhsMsg?.msg }}
+      </div>
+      <!-- 牛客发现链接日志 -->
+      <div v-if="ncCrawlLog.length" class="crawl-log-wrap">
+        <div class="crawl-log-title">牛客发现 {{ ncCrawlLog.length }} 条链接：</div>
+        <div class="crawl-log-list">
+          <div v-for="(item, i) in ncCrawlLog" :key="i" class="crawl-log-item">
+            <span class="crawl-log-num">{{ i + 1 }}.</span>
+            <a :href="item.url" target="_blank" class="crawl-log-link">{{ item.title }}{{ item.title.length >= 50 ? '...' : '' }}</a>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- LLM 提取 -->
+    <!-- 3. LLM 提取 -->
     <div class="card extract-section">
       <div class="section-header">
         <h3 class="section-title">🤖 LLM 题目提取</h3>
@@ -51,15 +101,42 @@
           <span v-if="errorCount > 0" class="badge badge-err">{{ errorCount }} 失败</span>
         </div>
       </div>
-      <p class="extract-desc">对已爬取正文的帖子调用 LLM 提取面试题入库，后台执行</p>
+      <p class="extract-desc">对已爬取正文的帖子调用 LLM 提取面试题入库，后台执行（与练习对话互不阻塞）</p>
       <div class="extract-actions">
-        <el-button type="primary" :loading="extractLoading" @click.prevent="extractPending">
-          提取未处理
-        </el-button>
-        <el-button type="warning" :loading="retryLoading" @click.prevent="retryErrors">重试失败</el-button>
-        <el-button type="success" :loading="processLoading" @click.prevent="processQueue">同步处理</el-button>
+        <el-tooltip content="对「待提取」状态的帖子（已有正文）调用 LLM 提取面试题，后台异步执行" placement="top">
+          <el-button type="primary" :loading="extractLoading" @click.prevent="extractPending">
+            提取面试题
+          </el-button>
+        </el-tooltip>
+        <el-tooltip content="将「失败」状态的帖子重置后重新处理：有正文的重新提取，无正文的重新抓取" placement="top">
+          <el-button type="warning" :loading="retryLoading" @click.prevent="retryErrors">重试失败项</el-button>
+        </el-tooltip>
+        <el-tooltip content="将「已完成」或「失败」且有正文的帖子全部重新提取（删除旧题目后用 LLM 重新提取）" placement="top">
+          <el-button type="info" :loading="reExtractLoading" @click.prevent="reExtractAll">重新提取所有</el-button>
+        </el-tooltip>
+        <el-tooltip content="先抓取「待抓取」帖子的正文，再对「待提取」的做 LLM 提取，同步等待完成" placement="top">
+          <el-button type="success" :loading="processLoading" @click.prevent="processQueue">抓取正文并提取</el-button>
+        </el-tooltip>
+        <el-tooltip content="用 LLM 判断「已完成」帖子是否与面经相关，无关则删除帖子及题目" placement="top">
+          <el-button type="danger" :loading="cleanLoading" @click.prevent="cleanData">清洗无关帖</el-button>
+        </el-tooltip>
       </div>
-      <div v-if="extractMsg" class="result-msg" :class="extractMsg.ok ? 'ok' : 'err'">
+      <!-- 处理进度：提取进行中时轮询显示，牛客和小红书分开 -->
+      <div v-if="extractPolling" class="extract-progress-wrap">
+        <div v-for="item in extractProgressByPlatform" :key="item.platform" class="extract-progress-item">
+          <span class="extract-platform-label">{{ item.label }}</span>
+          <div class="extract-progress-bar">
+            <div class="extract-progress-track">
+              <div class="extract-progress-fill" :style="{ width: item.pct + '%' }"></div>
+            </div>
+          </div>
+          <span class="extract-progress-text">{{ item.pct }}% · {{ item.text }}</span>
+        </div>
+        <div v-if="extractProgressByPlatform.length === 0" class="extract-progress-item">
+          <span class="extract-progress-text">处理中...</span>
+        </div>
+      </div>
+      <div v-else-if="extractMsg" class="result-msg" :class="extractMsg.ok ? 'ok' : 'err'">
         {{ extractMsg.text }}
       </div>
     </div>
@@ -69,21 +146,36 @@
       <div class="section-header">
         <h3 class="section-title">📋 帖子记录</h3>
         <div class="table-toolbar">
-          <el-select v-model="taskFilter" placeholder="状态" clearable size="small" style="width:100px">
-            <el-option label="待抓取" value="pending" />
-            <el-option label="待提取" value="fetched" />
-            <el-option label="已完成" value="done" />
-            <el-option label="失败" value="error" />
+          <el-select v-model="taskFilter" placeholder="状态" clearable size="small" style="width:140px">
+            <el-option v-for="opt in STATUS_OPTIONS" :key="opt.value" :label="`${opt.label}（${opt.desc}）`" :value="opt.value" />
           </el-select>
+          <el-tooltip placement="bottom" effect="light">
+            <template #content>
+              <div class="status-help">
+                <div><strong>待抓取</strong>：已发现链接，尚未获取正文</div>
+                <div><strong>待提取</strong>：正文已获取，待 LLM 提取面试题</div>
+                <div><strong>已完成</strong>：题目已提取并入库</div>
+                <div><strong>失败</strong>：抓取正文或 LLM 提取时出错</div>
+              </div>
+            </template>
+            <el-icon class="status-help-icon"><QuestionFilled /></el-icon>
+          </el-tooltip>
           <el-select v-model="taskPlatform" placeholder="平台" clearable size="small" style="width:90px">
             <el-option label="牛客" value="nowcoder" />
             <el-option label="小红书" value="xiaohongshu" />
           </el-select>
-          <el-button size="small" @click="loadTasks">查询</el-button>
-          <el-button size="small" @click="loadStats();loadTasks()">刷新</el-button>
+          <el-select v-model="taskKeyword" placeholder="关键词" clearable size="small" style="width:100px">
+            <el-option v-for="kw in keywordOptions" :key="kw" :label="kw" :value="kw" />
+          </el-select>
+          <el-button size="small" @click="taskPage=1;loadTasks()">查询</el-button>
+          <el-button size="small" @click="taskPage=1;loadStats();loadTasks()">刷新</el-button>
+          <el-button size="small" type="danger" plain @click="showClearAllDialog = true">清除所有</el-button>
         </div>
       </div>
-      <el-table :data="tasks" size="small" class="post-table" max-height="420" stripe>
+      <el-table :data="tasks" size="small" class="post-table" stripe>
+        <el-table-column label="关键词" prop="discover_keyword" width="88" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.discover_keyword || '—' }}</template>
+        </el-table-column>
         <el-table-column label="平台" width="76">
           <template #default="{ row }">
             <el-tag :type="row.source_platform === 'xiaohongshu' ? 'danger' : 'warning'" size="small">
@@ -122,10 +214,58 @@
             <span v-else style="color:#c0c4cc">—</span>
           </template>
         </el-table-column>
+        <el-table-column label="提取来源" width="88" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.extraction_source === 'image'" type="warning" size="small">📷 图片</el-tag>
+            <el-tag v-else-if="row.extraction_source === 'content'" type="primary" size="small">📄 正文</el-tag>
+            <span v-else style="color:#c0c4cc">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="发现时间" prop="discovered_at" width="148" />
       </el-table>
       <div v-if="tasks.length === 0" class="table-empty">暂无记录，点击「查询」加载</div>
+      <div v-else class="pagination-wrap">
+        <el-pagination
+          v-model:current-page="taskPage"
+          :page-size="taskPageSize"
+          :total="taskTotal"
+          layout="total, prev, pager, next"
+          small
+          @current-change="onTaskPageChange"
+        />
+      </div>
     </div>
+
+    <!-- 清除所有确认弹窗 -->
+    <el-dialog v-model="showClearAllDialog" width="440px" align-center class="clear-all-dialog"
+               :close-on-click-modal="false" :show-close="true">
+      <template #header>
+        <div class="clear-all-header">
+          <div class="clear-all-icon-wrap">
+            <el-icon class="warn-icon"><WarningFilled /></el-icon>
+          </div>
+          <h3 class="clear-all-title">清除所有数据</h3>
+        </div>
+      </template>
+      <div class="clear-all-body">
+        <p class="clear-all-desc">此操作将永久删除以下数据，且无法恢复：</p>
+        <div class="clear-all-items">
+          <div class="clear-all-item">所有帖子记录</div>
+          <div class="clear-all-item">所有已提取的面试题</div>
+          <div class="clear-all-item">相关爬取日志与本地图片</div>
+          <div class="clear-all-item">LLM 交互日志、解析失败记录、小红书链接缓存</div>
+        </div>
+        <p class="clear-all-tip">请确认您已备份重要数据后再执行。</p>
+      </div>
+      <template #footer>
+        <div class="clear-all-footer">
+          <el-button size="large" @click="showClearAllDialog = false">取消</el-button>
+          <el-button type="danger" size="large" :loading="clearAllLoading" @click="confirmClearAll">
+            确认清除
+          </el-button>
+        </div>
+      </template>
+    </el-dialog>
 
     <!-- 正文内容弹窗 -->
     <el-dialog v-model="contentDialogVisible" :title="contentDialogTitle" width="560px" destroy-on-close>
@@ -144,9 +284,10 @@
           <div class="q-num">{{ idx + 1 }}.</div>
           <div class="q-body">
             <div class="q-text">{{ q.question_text }}</div>
-            <div v-if="q.answer_text" class="q-answer">{{ q.answer_text }}</div>
-            <div v-if="q.topic_tags?.length" class="q-tags">
+            <div class="q-meta-row">
+              <span v-if="q.topic_tags?.length" class="q-tags">
               <el-tag v-for="t in q.topic_tags" :key="t" size="small" style="margin-right:4px">{{ t }}</el-tag>
+              </span>
             </div>
           </div>
         </div>
@@ -156,23 +297,36 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
+import { WarningFilled, Loading, QuestionFilled } from '@element-plus/icons-vue'
 import { api } from '../api.js'
 
 const rawStats = ref({})
+const extractPolling = ref(false)
+const extractInitialByPlatform = ref({})  // { nowcoder: 5, xiaohongshu: 17 }
+let extractPollTimer = null
 const tasks    = ref([])
 const statsLoading   = ref(false)
 const ncLoading      = ref(false)
 const xhsLoading     = ref(false)
 const processLoading = ref(false)
-const extractLoading = ref(false)
-const retryLoading   = ref(false)
+const extractLoading   = ref(false)
+const retryLoading     = ref(false)
+const reExtractLoading = ref(false)
+const cleanLoading     = ref(false)
 const ncResult   = ref(null)
+const ncCrawlLog = ref([])  // 牛客发现链接列表，用于日志展示
 const xhsMsg     = ref(null)
+const bothLoading = ref(false)
 const extractMsg = ref(null)
 const taskFilter    = ref('')
 const taskPlatform  = ref('')
+const taskKeyword   = ref('')
+const keywordOptions = ref([])
+const taskPage      = ref(1)
+const taskPageSize  = ref(20)
+const taskTotal     = ref(0)
 const questionsDialogVisible = ref(false)
 const questionsLoading      = ref(false)
 const dialogQuestions       = ref([])
@@ -180,9 +334,22 @@ const contentDialogVisible  = ref(false)
 const contentDialogTitle    = ref('')
 const contentDialogText     = ref('')
 const contentLoading        = ref(false)
+const showClearAllDialog    = ref(false)
+const clearAllLoading       = ref(false)
+const crawlPolling          = ref(false)
+const crawlDiscovered       = ref(0)
+const crawlInitialDone      = ref(0)
+let crawlPollTimer          = null
+const refetchLoading        = ref(null)  // task_id 正在重抓正文
 
-const form = reactive({ keywords: '', maxPages: 2, xhsCount: 10 })
+const form = reactive({ keywords: '', maxPages: 5, xhsCount: 20 })
 
+const STATUS_OPTIONS = [
+  { value: 'pending', label: '待抓取', desc: '未获取正文' },
+  { value: 'fetched', label: '待提取', desc: '待 LLM 提取' },
+  { value: 'done',    label: '已完成', desc: '题目已入库' },
+  { value: 'error',   label: '失败',   desc: '抓取或提取出错' },
+]
 const STATUS_META = {
   pending:    { label: '待抓取', color: '#e6a23c' },
   fetched:    { label: '待提取', color: '#409eff' },
@@ -197,30 +364,86 @@ const fetchedCount = computed(() => {
   const v = rawStats.value['fetched']
   return typeof v === 'object' ? (v.count ?? 0) : (v ?? 0)
 })
+const fetchedByPlatform = computed(() => {
+  const v = rawStats.value['fetched_by_platform']
+  return v && typeof v === 'object' ? v : {}
+})
+const PLATFORM_LABELS = { nowcoder: '牛客', xiaohongshu: '小红书' }
+const extractProgressByPlatform = computed(() => {
+  if (!extractPolling.value) return []
+  const initial = extractInitialByPlatform.value || {}
+  const current = fetchedByPlatform.value || {}
+  const platforms = ['nowcoder', 'xiaohongshu']
+  return platforms
+    .filter(p => (initial[p] ?? 0) > 0)
+    .map(p => {
+      const init = initial[p] ?? 0
+      const cur = current[p] ?? 0
+      const done = init - cur
+      const pct = init > 0 ? Math.min(100, Math.round((done / init) * 100)) : 0
+      return {
+        platform: p,
+        label: PLATFORM_LABELS[p] || p,
+        pct,
+        text: `已处理 ${done} / ${init} 条`,
+      }
+    })
+})
 const errorCount = computed(() => {
   const v = rawStats.value['error']
   return typeof v === 'object' ? (v.count ?? 0) : (v ?? 0)
 })
 
-const statsList = computed(() => {
-  return Object.entries(rawStats.value).map(([status, v]) => ({
-    status,
-    count:     typeof v === 'object' ? (v.count ?? 0) : v,
-    questions: typeof v === 'object' ? (v.questions ?? 0) : 0,
-    label:     STATUS_META[status]?.label ?? status,
-    color:     STATUS_META[status]?.color ?? 'var(--primary)',
-  }))
+const doneCount = computed(() => {
+  const v = rawStats.value['done']
+  return typeof v === 'object' ? (v.count ?? 0) : (v ?? 0)
 })
 
-const loadStats = async () => {
-  statsLoading.value = true
+const crawlProgressPct = computed(() => {
+  if (!crawlPolling.value || crawlDiscovered.value <= 0) return 0
+  const delta = Math.max(0, doneCount.value - crawlInitialDone.value)
+  return Math.min(100, Math.round((delta / crawlDiscovered.value) * 100))
+})
+
+const crawlProgressText = computed(() => {
+  if (!crawlPolling.value) return ''
+  const pending = typeof rawStats.value['pending'] === 'object' ? (rawStats.value['pending']?.count ?? 0) : (rawStats.value['pending'] ?? 0)
+  const fetched = typeof rawStats.value['fetched'] === 'object' ? (rawStats.value['fetched']?.count ?? 0) : (rawStats.value['fetched'] ?? 0)
+  const done = doneCount.value
+  return `待抓取 ${pending} · 待提取 ${fetched} · 已完成 ${done}`
+})
+
+const statsList = computed(() => {
+  return Object.entries(rawStats.value)
+    .filter(([k]) => k !== 'fetched_by_platform')  // 排除内部字段
+    .map(([status, v]) => ({
+      status,
+      count:     typeof v === 'object' ? (v.count ?? 0) : v,
+      questions: typeof v === 'object' ? (v.questions ?? 0) : 0,
+      label:     STATUS_META[status]?.label ?? status,
+      color:     STATUS_META[status]?.color ?? 'var(--primary)',
+    }))
+})
+
+const loadStats = async (silent = false) => {
+  if (!silent) statsLoading.value = true
   try {
     const d = await api.getCrawlerStats()
     rawStats.value = d.crawl_stats || {}
+    if (Array.isArray(d.keywords)) keywordOptions.value = d.keywords
   } catch {
-    ElMessage.error('获取统计失败')
+    if (!silent) ElMessage.error('获取统计失败')
   } finally {
-    statsLoading.value = false
+    if (!silent) statsLoading.value = false
+  }
+}
+
+const loadKeywords = async () => {
+  try {
+    const d = await api.getCrawlerStats()
+    keywordOptions.value = d.keywords || []
+  } catch {
+    keywordOptions.value = []
   }
 }
 
@@ -229,8 +452,11 @@ const loadTasks = async () => {
     const d = await api.getCrawlerTasks({
       status: taskFilter.value,
       platform: taskPlatform.value,
-      limit: 100,
+      keyword: taskKeyword.value,
+      limit: taskPageSize.value,
+      offset: (taskPage.value - 1) * taskPageSize.value,
     })
+    taskTotal.value = d.total ?? 0
     // 将 raw_content 长度补充到每行，避免传输大字段
     tasks.value = (d.tasks || []).map(t => ({
       ...t,
@@ -238,6 +464,54 @@ const loadTasks = async () => {
     }))
   } catch {
     ElMessage.error('加载任务失败')
+  }
+}
+
+const onTaskPageChange = () => {
+  loadTasks()
+}
+
+const crawlBoth = async () => {
+  bothLoading.value = true
+  crawlPolling.value = false
+  ncCrawlLog.value = []
+  try {
+    await loadStats()
+    crawlInitialDone.value = doneCount.value
+    const kws = form.keywords.trim()
+      ? form.keywords.split(',').map(k => k.trim()).filter(Boolean)
+      : null
+    const body = { keywords: kws, max_pages: form.maxPages, max_notes: form.xhsCount, headless: false, process: true }
+    const [ncRes, xhsRes] = await Promise.all([
+      api.triggerCrawl({ ...body, platform: 'nowcoder' }),
+      api.triggerCrawl({ ...body, platform: 'xiaohongshu' }),
+    ])
+    const ncOk = ncRes?.status === 'ok'
+    const xhsOk = xhsRes?.status === 'ok'
+    const ncDiscovered = ncRes?.discovered ?? 0
+    ncCrawlLog.value = ncRes?.discovered_links || []
+    crawlDiscovered.value = ncDiscovered > 0 ? ncDiscovered : 999
+    crawlPolling.value = true
+    if (ncOk && xhsOk) {
+      ncResult.value = { ok: true, msg: `牛客发现 ${ncDiscovered} 条，小红书已启动。请完成扫码后查看下方进度。` }
+      xhsMsg.value = { ok: true, msg: xhsRes?.message }
+    } else if (ncOk) {
+      ncResult.value = { ok: true, msg: ncRes?.message }
+      xhsMsg.value = { ok: false, msg: xhsRes?.detail || '小红书启动失败' }
+    } else if (xhsOk) {
+      ncResult.value = { ok: false, msg: ncRes?.detail || '牛客启动失败' }
+      xhsMsg.value = { ok: true, msg: xhsRes?.message }
+    } else {
+      ncResult.value = { ok: false, msg: ncRes?.detail || '牛客失败' }
+      xhsMsg.value = { ok: false, msg: xhsRes?.detail || '小红书失败' }
+    }
+    await loadStats()
+    await loadTasks()
+  } catch (e) {
+    ncResult.value = { ok: false, msg: e?.response?.data?.detail || '请求失败' }
+    xhsMsg.value = { ok: false, msg: '请求失败' }
+  } finally {
+    bothLoading.value = false
   }
 }
 
@@ -255,10 +529,14 @@ const crawl = async (platform) => {
   }
 
   if (platform === 'xiaohongshu') {
-    xhsLoading.value = true; xhsMsg.value = null
+    xhsLoading.value = true; xhsMsg.value = null; crawlPolling.value = false
     try {
+      await loadStats()
+      crawlInitialDone.value = doneCount.value
       const d = await api.triggerCrawl(body)
       xhsMsg.value = { ok: true, msg: d.message || '✅ 小红书爬取已在后台启动，请查看弹出的浏览器完成扫码' }
+      crawlDiscovered.value = 999
+      crawlPolling.value = true
     } catch {
       xhsMsg.value = { ok: false, msg: '请求失败，请确认后端已启动' }
     } finally {
@@ -268,16 +546,25 @@ const crawl = async (platform) => {
   }
 
   // 牛客：发现立即返回，LLM 提取在后台运行
-  ncLoading.value = true; ncResult.value = null
+  ncLoading.value = true; ncResult.value = null; ncCrawlLog.value = []; crawlPolling.value = false
   try {
     const d = await api.triggerCrawl(body)
+    ncCrawlLog.value = d.discovered_links || []
     ncResult.value = {
       ok: d.status === 'ok',
       msg: d.status === 'ok'
-        ? `✅ ${d.message}（LLM 提取在后台运行，稍后刷新任务列表查看）`
+        ? `✅ ${d.message}（后台处理中，下方显示实时进度）`
         : (d.detail || '爬取失败'),
     }
-    if (d.status === 'ok') { await loadStats(); await loadTasks() }
+    if (d.status === 'ok' && (d.discovered ?? 0) > 0) {
+      await loadStats()
+      crawlDiscovered.value = d.discovered
+      crawlInitialDone.value = doneCount.value
+      crawlPolling.value = true
+      await loadTasks()
+    } else if (d.status === 'ok') {
+      await loadStats(); await loadTasks()
+    }
   } catch (e) {
     const detail = e?.response?.data?.detail || '请求失败，请确认后端已启动'
     ncResult.value = { ok: false, msg: detail }
@@ -302,15 +589,30 @@ const processQueue = async () => {
 const extractPending = async () => {
   extractLoading.value = true
   extractMsg.value = null
+  extractPolling.value = false
   try {
+    await loadStats()
+    extractInitialByPlatform.value = { ...(rawStats.value['fetched_by_platform'] || {}) }
+    if (fetchedCount.value <= 0) {
+      ElMessage.info('没有待提取的帖子')
+      extractLoading.value = false
+      return
+    }
     const d = await api.extractPending(30)
     extractMsg.value = { ok: true, text: `✅ ${d.message}` }
-    await loadStats(); await loadTasks()
+    extractPolling.value = true
+    await loadTasks()
   } catch {
     extractMsg.value = { ok: false, text: '启动失败，请确认后端已运行' }
   } finally {
     extractLoading.value = false
   }
+}
+
+const stopExtractPolling = () => {
+  if (extractPollTimer) clearInterval(extractPollTimer)
+  extractPollTimer = null
+  extractPolling.value = false
 }
 
 const openContentDialog = async (row) => {
@@ -347,10 +649,15 @@ const openQuestionsDialog = async (row) => {
 const retryErrors = async () => {
   retryLoading.value = true
   extractMsg.value = null
+  extractPolling.value = false
   try {
+    await loadStats()
     const d = await api.retryErrors(30)
     extractMsg.value = { ok: true, text: `🔄 ${d.message}` }
-    await loadStats(); await loadTasks()
+    if ((d.reset ?? 0) > 0) {
+      extractPolling.value = true  // 后台处理中，轮询刷新帖子列表
+    }
+    await loadTasks()
   } catch {
     extractMsg.value = { ok: false, text: '重试请求失败，请确认后端已运行' }
   } finally {
@@ -358,55 +665,408 @@ const retryErrors = async () => {
   }
 }
 
-onMounted(() => { loadStats(); loadTasks() })
+const reExtractAll = async () => {
+  reExtractLoading.value = true
+  extractMsg.value = null
+  extractPolling.value = false
+  try {
+    await loadStats()
+    const doneCount = typeof rawStats.value['done'] === 'object' ? (rawStats.value['done']?.count ?? 0) : (rawStats.value['done'] ?? 0)
+    const errorCount = typeof rawStats.value['error'] === 'object' ? (rawStats.value['error']?.count ?? 0) : (rawStats.value['error'] ?? 0)
+    if (doneCount <= 0 && errorCount <= 0) {
+      ElMessage.info('没有已完成或失败的帖子可重新提取')
+      reExtractLoading.value = false
+      return
+    }
+    const d = await api.reExtractAll(50)
+    extractMsg.value = { ok: true, text: `🔄 ${d.message}` }
+    if ((d.reset ?? 0) > 0) {
+      extractPolling.value = true
+    }
+    await loadStats()
+    await loadTasks()
+  } catch {
+    extractMsg.value = { ok: false, text: '重新提取请求失败，请确认后端已运行' }
+  } finally {
+    reExtractLoading.value = false
+  }
+}
+
+const confirmClearAll = async () => {
+  clearAllLoading.value = true
+  try {
+    const d = await api.clearAllCrawlData()
+    showClearAllDialog.value = false
+    ElMessage.success(d.message || '已清除')
+    await loadStats()
+    await loadTasks()
+    await loadKeywords()
+  } catch {
+    ElMessage.error('清除失败')
+  } finally {
+    clearAllLoading.value = false
+  }
+}
+
+const cleanData = async () => {
+  cleanLoading.value = true
+  extractMsg.value = null
+  try {
+    const d = await api.cleanData(50)
+    extractMsg.value = { ok: true, text: `🧹 ${d.message}` }
+    await loadStats(); await loadTasks()
+    ElMessage.success(d.message)
+  } catch {
+    extractMsg.value = { ok: false, text: '清洗请求失败，请确认后端已运行' }
+    ElMessage.error('清洗失败')
+  } finally {
+    cleanLoading.value = false
+  }
+}
+
+const canRefetchXhs = (row) => {
+  if (row?.source_platform !== 'xiaohongshu') return false
+  const empty = (row.content_len ?? 0) <= 0
+  const pageNotFound = (row.post_title || '').includes('页面不见了')
+  return empty || pageNotFound
+}
+
+const refetchXhsBody = async (row) => {
+  if (!row?.task_id) return
+  refetchLoading.value = row.task_id
+  try {
+    const d = await api.refetchXhsBody(row.task_id)
+    if (d?.status === 'ok') {
+      ElMessage.success(d.message || '重抓正文成功')
+      await loadStats()
+      await loadTasks()
+    } else {
+      ElMessage.warning(d?.message || '重抓失败，请确认已登录小红书')
+    }
+  } catch {
+    ElMessage.error('重抓正文请求失败')
+  } finally {
+    refetchLoading.value = null
+  }
+}
+
+const stopCrawlPolling = () => {
+  if (crawlPollTimer) clearInterval(crawlPollTimer)
+  crawlPollTimer = null
+  crawlPolling.value = false
+}
+
+onMounted(async () => {
+  await loadStats()
+  await loadTasks()
+  loadKeywords()
+  // 刷新后恢复提取进度显示（若后端仍在处理）
+  try {
+    const d = await api.getExtractionStatus()
+    if (d?.running) {
+      extractPolling.value = true
+      extractInitialByPlatform.value = d.initial_by_platform || (fetchedCount.value > 0 ? { nowcoder: fetchedCount.value, xiaohongshu: 0 } : {})
+    }
+  } catch {
+    // 忽略
+  }
+})
+onUnmounted(() => { stopExtractPolling(); stopCrawlPolling() })
+
+// 提取进行中时轮询显示进度（不自动刷新表格，避免体验差）
+watch(extractPolling, (polling) => {
+  if (extractPollTimer) clearInterval(extractPollTimer)
+  extractPollTimer = null
+  if (polling) {
+    extractPollTimer = setInterval(async () => {
+      await loadStats(true)
+      const allDone = extractProgressByPlatform.value.length === 0 || extractProgressByPlatform.value.every(p => p.pct >= 100)
+      if (fetchedCount.value <= 0 || allDone) {
+        stopExtractPolling()
+      }
+    }, 5000)
+  }
+})
+
+// 抓取进行中时轮询显示进度（不自动刷新表格，避免体验差）
+watch(crawlPolling, (polling) => {
+  if (crawlPollTimer) clearInterval(crawlPollTimer)
+  crawlPollTimer = null
+  if (polling) {
+    crawlPollTimer = setInterval(async () => {
+      await loadStats(true)
+      const pending = typeof rawStats.value['pending'] === 'object' ? (rawStats.value['pending']?.count ?? 0) : (rawStats.value['pending'] ?? 0)
+      const fetched = typeof rawStats.value['fetched'] === 'object' ? (rawStats.value['fetched']?.count ?? 0) : (rawStats.value['fetched'] ?? 0)
+      if (crawlProgressPct.value >= 100 || (pending === 0 && fetched === 0)) {
+        stopCrawlPolling()
+      }
+    }, 5000)
+  }
+})
 </script>
 
 <style scoped>
-.collect-page { padding: 0 4px; }
+.collect-page {
+  padding: 0 8px 24px;
+  max-width: 1000px;
+  margin: 0 auto;
+}
 .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .section-title { font-size: 16px; font-weight: 600; color: var(--text-main); margin: 0; }
-.top-section .section-title { font-size: 18px; }
+.stats-section .section-title { font-size: 18px; }
 
-/* 顶部：统计 + 采集 */
-.top-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; }
-.stats-block { background: var(--bg); border-radius: 10px; padding: 16px; }
-.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(70px, 1fr)); gap: 10px; }
-.stat-item { background: var(--card-bg); border-radius: 8px; padding: 12px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
-.stat-val { font-size: 22px; font-weight: 700; }
-.stat-key { font-size: 12px; color: var(--text-sub); margin-top: 4px; }
-.stat-sub { font-size: 11px; color: var(--text-sub); margin-top: 2px; }
-.stats-empty { color: var(--text-sub); font-size: 13px; text-align: center; padding: 12px; }
+/* 1. 统计区域 - 更紧凑的网格 */
+.stats-section { padding: 24px 28px; margin-bottom: 20px; }
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+}
+.stat-card {
+  background: linear-gradient(135deg, #fff 0%, #f8fafc 100%);
+  border-radius: 12px;
+  padding: 20px 18px;
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  text-align: center;
+  transition: box-shadow 0.2s, transform 0.2s;
+}
+.stat-card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.06); transform: translateY(-1px); }
+.stat-val { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
+.stat-key { font-size: 13px; color: var(--text-sub); margin-top: 6px; font-weight: 500; }
+.stat-sub { font-size: 11px; color: var(--text-sub); margin-top: 2px; opacity: 0.9; }
+.stats-empty { color: var(--text-sub); font-size: 13px; text-align: center; padding: 24px; }
 
-.crawl-block { display: flex; flex-direction: column; gap: 12px; }
-.crawl-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
-.crawl-card { background: var(--bg); border-radius: 10px; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
-.crawl-label { font-size: 14px; font-weight: 600; color: var(--text-main); }
-.crawl-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-sub); }
-.crawl-meta span { flex-shrink: 0; }
-.crawl-hint { font-size: 11px; color: var(--text-sub); }
-.crawl-card .el-input-number { width: 90px; }
+/* 2. 数据源 - 现代卡片风格 */
+.crawl-section {
+  padding: 28px 32px;
+  margin-bottom: 20px;
+  background: linear-gradient(180deg, #fafbff 0%, #fff 100%);
+  border: 1px solid rgba(91, 110, 245, 0.12);
+  border-radius: 16px;
+}
+.crawl-section-header { margin-bottom: 24px; }
+.subsection-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text-main);
+  margin: 0 0 16px 0;
+  letter-spacing: -0.02em;
+}
+.crawl-keywords-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.keywords-label {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-sub);
+  white-space: nowrap;
+}
+.crawl-keywords-input { flex: 1; min-width: 280px; max-width: 420px; }
+.crawl-keywords-input :deep(.el-input__wrapper) {
+  border-radius: 10px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+.crawl-cards {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 20px;
+  align-items: stretch;
+}
+.crawl-card {
+  border-radius: 14px;
+  overflow: hidden;
+  transition: transform 0.2s, box-shadow 0.2s;
+  display: flex;
+}
+.crawl-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+}
+.crawl-card.nowcoder .crawl-card-inner {
+  background: linear-gradient(145deg, #fff9f0 0%, #fff 50%);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+}
+.crawl-card.xiaohongshu .crawl-card-inner {
+  background: linear-gradient(145deg, #fff5f5 0%, #fff 50%);
+  border: 1px solid rgba(244, 63, 94, 0.2);
+}
+.crawl-card-inner {
+  padding: 24px;
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  flex: 1;
+  width: 100%;
+}
+.crawl-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+.crawl-hint-spacer {
+  visibility: hidden;
+  height: 1.2em;
+  font-size: 12px;
+  display: block;
+}
+.crawl-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.platform-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  object-fit: contain;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+}
+.platform-fallback {
+  display: none;
+  width: 36px;
+  height: 36px;
+  line-height: 36px;
+  text-align: center;
+  border-radius: 10px;
+  font-weight: 700;
+  font-size: 16px;
+}
+.crawl-card.nowcoder .platform-fallback { background: linear-gradient(135deg, #fbbf24, #f59e0b); color: #fff; }
+.crawl-card.xiaohongshu .platform-fallback { background: linear-gradient(135deg, #f43f5e, #e11d48); color: #fff; }
+.crawl-label {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text-main);
+  letter-spacing: -0.02em;
+}
+.crawl-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 14px;
+}
+.meta-label {
+  color: var(--text-sub);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.crawl-card .el-input-number { width: 120px; }
+.crawl-card .el-input-number :deep(.el-input__wrapper) { border-radius: 8px; }
+.crawl-both-wrap {
+  margin-top: 16px;
+  text-align: center;
+}
+.crawl-both-btn {
+  font-weight: 600;
+  padding: 10px 24px;
+}
+.crawl-btn {
+  font-weight: 600;
+  padding: 10px 20px;
+  border-radius: 10px;
+}
+.crawl-hint {
+  font-size: 12px;
+  color: var(--text-sub);
+  opacity: 0.9;
+}
 
-/* LLM 提取 */
-.extract-section { padding: 20px 24px; }
-.extract-desc { font-size: 13px; color: var(--text-sub); margin: -8px 0 14px 0; }
-.extract-actions { display: flex; gap: 10px; flex-wrap: wrap; }
-.extract-badges { display: flex; gap: 8px; }
-.badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; }
+/* 进度条 */
+.crawl-section .progress-bar-wrap {
+  margin-top: 20px;
+  padding: 16px 20px;
+  background: rgba(91, 110, 245, 0.06);
+  border-radius: 12px;
+  border: 1px solid rgba(91, 110, 245, 0.12);
+}
+.progress-bar-wrap { display: flex; align-items: center; gap: 16px; }
+.progress-bar-wrap .el-progress { flex: 1; }
+.progress-text { font-size: 13px; color: var(--text-sub); white-space: nowrap; font-weight: 500; }
+.crawl-section .result-msg { margin-top: 20px; border-radius: 12px; }
+
+/* 3. LLM 提取 */
+.extract-section { padding: 24px 28px; margin-bottom: 20px; }
+.extract-desc { font-size: 13px; color: var(--text-sub); margin: 0 0 18px 0; line-height: 1.5; }
+.extract-actions { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.extract-badges { display: flex; gap: 10px; align-items: center; }
+.badge { font-size: 12px; padding: 4px 10px; border-radius: 20px; font-weight: 500; }
 .badge-warn { background: #fef3c7; color: #b45309; }
 .badge-err { background: #fee2e2; color: #b91c1c; }
 
-/* 表格 */
-.table-section { padding: 20px 24px; }
-.table-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.post-table { border-radius: 8px; overflow: hidden; }
+/* LLM 提取进度条：牛客和小红书分开显示 */
+.extract-progress-wrap {
+  margin-top: 24px;
+  padding: 20px 24px;
+  background: linear-gradient(135deg, rgba(91, 110, 245, 0.08) 0%, rgba(91, 110, 245, 0.04) 100%);
+  border-radius: 14px;
+  border: 1px solid rgba(91, 110, 245, 0.15);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.extract-progress-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.extract-platform-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-main);
+  min-width: 56px;
+}
+.extract-progress-bar { flex: 1; min-width: 0; }
+.extract-progress-track {
+  height: 10px;
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.extract-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #5b6ef5 0%, #7c8ff7 100%);
+  border-radius: 10px;
+  transition: width 0.35s ease;
+}
+.extract-progress-text {
+  font-size: 14px;
+  color: var(--text-main);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.extract-section .result-msg { margin-top: 24px; }
+
+/* 4. 表格 */
+.table-section { padding: 24px 28px; }
+.table-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.status-help-icon { font-size: 16px; color: var(--text-sub); cursor: help; margin-left: -4px; }
+.status-help-icon:hover { color: var(--primary); }
+.status-help { font-size: 12px; line-height: 1.8; }
+.status-help div { margin-bottom: 4px; }
+.status-help div:last-child { margin-bottom: 0; }
+.post-table { border-radius: 10px; overflow: hidden; border: 1px solid var(--border); }
 .post-table :deep(.el-table__header th) { background: var(--bg) !important; font-weight: 600; font-size: 12px; }
 .post-table :deep(.el-table__row td) { font-size: 13px; }
 .post-table :deep(.el-table__body tr:hover > td) { background: var(--primary-light) !important; }
-.table-empty { text-align: center; color: var(--text-sub); padding: 32px 20px; font-size: 14px; }
+.table-empty { text-align: center; color: var(--text-sub); padding: 40px 20px; font-size: 14px; }
+.pagination-wrap { margin-top: 16px; display: flex; justify-content: flex-end; }
 
-.result-msg { padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-top: 12px; }
+.result-msg { padding: 12px 16px; border-radius: 10px; font-size: 13px; margin-top: 14px; line-height: 1.5; }
 .result-msg.ok { background: #f0fdf4; color: #166534; border: 1px solid #86efac; }
 .result-msg.err { background: #fef2f2; color: #991b1b; border: 1px solid #fca5a5; }
+.crawl-log-wrap { margin-top: 16px; padding: 12px 16px; background: #f8fafc; border-radius: 10px; border: 1px solid #e2e8f0; max-height: 240px; overflow-y: auto; }
+.crawl-log-title { font-size: 13px; font-weight: 600; color: var(--text-main); margin-bottom: 8px; }
+.crawl-log-list { display: flex; flex-direction: column; gap: 4px; }
+.crawl-log-item { font-size: 12px; display: flex; align-items: flex-start; gap: 6px; }
+.crawl-log-num { color: var(--text-sub); flex-shrink: 0; }
+.crawl-log-link { color: var(--primary); text-decoration: none; word-break: break-all; }
+.crawl-log-link:hover { text-decoration: underline; }
 
 .questions-list { max-height: 400px; overflow-y: auto; }
 .question-item { display: flex; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--border); }
@@ -414,7 +1074,89 @@ onMounted(() => { loadStats(); loadTasks() })
 .q-num { flex-shrink: 0; font-weight: 600; color: var(--primary); }
 .q-body { flex: 1; min-width: 0; }
 .q-text { font-size: 14px; line-height: 1.5; margin-bottom: 6px; }
-.q-answer { font-size: 13px; color: var(--text-sub); background: var(--bg); padding: 8px; border-radius: 6px; margin-top: 6px; white-space: pre-wrap; }
-.q-tags { margin-top: 8px; }
+.q-meta-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.extraction-badge { font-size: 11px; padding: 2px 6px; border-radius: 4px; }
+.extraction-badge.content { background: #dbeafe; color: #1d4ed8; }
+.extraction-badge.image { background: #fce7f3; color: #be185d; }
+.q-tags { display: inline-flex; flex-wrap: wrap; gap: 4px; }
 .content-body { max-height: 400px; overflow-y: auto; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+
+/* 清除所有确认弹窗 */
+/* 清除所有弹窗 - 简洁现代 */
+.clear-all-dialog :deep(.el-dialog) {
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: 0 24px 48px rgba(0,0,0,0.12);
+}
+.clear-all-dialog :deep(.el-dialog__header) {
+  padding: 24px 24px 0;
+  margin-right: 0;
+}
+.clear-all-dialog :deep(.el-dialog__body) { padding: 20px 24px 24px; }
+.clear-all-dialog :deep(.el-dialog__footer) { padding: 0 24px 24px; }
+.clear-all-header {
+  text-align: center;
+  padding-bottom: 8px;
+}
+.clear-all-icon-wrap {
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 12px;
+  background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.clear-all-icon-wrap .warn-icon {
+  font-size: 28px;
+  color: #b45309;
+}
+.clear-all-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-main);
+  margin: 0;
+  letter-spacing: -0.02em;
+}
+.clear-all-body { padding: 0 4px; }
+.clear-all-desc {
+  font-size: 14px;
+  color: var(--text-sub);
+  margin: 0 0 14px 0;
+  line-height: 1.5;
+}
+.clear-all-items {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+.clear-all-item {
+  font-size: 14px;
+  color: var(--text-main);
+  padding: 10px 14px;
+  background: #f8fafc;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+.clear-all-tip {
+  font-size: 13px;
+  color: #b91c1c;
+  margin: 0;
+  padding: 10px 14px;
+  background: #fef2f2;
+  border-radius: 10px;
+  border: 1px solid #fecaca;
+}
+.clear-all-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+@media (max-width: 768px) {
+  .stats-row { grid-template-columns: repeat(2, 1fr); }
+  .crawl-cards { grid-template-columns: 1fr; }
+}
 </style>

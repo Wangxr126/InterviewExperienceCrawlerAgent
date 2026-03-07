@@ -34,6 +34,22 @@ from backend.tools.interviewer_tools import KnowledgeRecommender
 
 logger = logging.getLogger(__name__)
 
+
+def _save_eval_failure(input_preview: str, raw_output: str, error: str) -> None:
+    """答题评估 LLM 解析失败时写入 llm_failures/answer_eval.jsonl"""
+    try:
+        from backend.services.llm_parse_failures import save_failure
+        save_failure(
+            source="answer_eval",
+            input_preview=input_preview,
+            raw_output=raw_output,
+            error=error,
+            metadata={},
+        )
+    except Exception as e:
+        logger.debug(f"保存评估失败记录异常: {e}")
+
+
 # 全局懒加载的 KnowledgeRecommender（无状态工具，可共享）
 _knowledge_recommender = KnowledgeRecommender()
 
@@ -81,6 +97,7 @@ def _evaluate_answer_structured(question_text: str,
         '{"score":3,"feedback":"总体评价","missed_points":["具体遗漏点1"],'
         '"strong_points":["答对的点"],"tags":["Redis","持久化"]}'
         "\n评分标准：0=完全不会，1=基本不会，2=大部分不会，3=勉强会有遗漏，4=基本掌握，5=完全掌握有延伸"
+        "\nfeedback 要求：分条列点，用 1. 2. 3. 或 一、二、三、 格式，每条单独一行，便于用户阅读"
     )
     prompt = (
         f"【面试题目】\n{question_text}\n\n"
@@ -116,15 +133,22 @@ def _evaluate_answer_structured(question_text: str,
         resp = requests.post(_url, headers=headers, json=payload, timeout=settings.llm_timeout or 60)
         if resp.status_code == 200:
             content = resp.json()["choices"][0]["message"]["content"]
-            result = json.loads(content)
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.error(f"_evaluate_answer_structured JSON 解析失败: {e}")
+                _save_eval_failure(prompt, content, error=str(e))
+                return default
             # 确保 score 在合法范围
             result["score"] = max(0, min(5, int(result.get("score", 3))))
             return result
         else:
             logger.warning(f"评估 LLM 返回 {resp.status_code}")
+            _save_eval_failure(prompt, resp.text[:2000] if resp.text else "", error=f"HTTP {resp.status_code}")
             return default
     except Exception as e:
         logger.error(f"_evaluate_answer_structured 异常: {e}")
+        _save_eval_failure(prompt, "", error=str(e))
         return default
 
 
@@ -506,11 +530,16 @@ class InterviewSystemOrchestrator:
     # 对话接口（InterviewerAgent 专注开放对话）
     # ===========================================================
 
-    async def chat(self, user_id: str, message: str,
-                   resume: Optional[str] = None,
-                   session_id: Optional[str] = None) -> str:
+    async def chat(
+        self,
+        user_id: str,
+        message: str,
+        resume: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> tuple:
         """
         自由对话接口：出题推荐、概念解释、笔记管理、掌握度查询等。
+        返回 (reply: str, thinking_steps: List[Dict])。
         对话记录与 LLM 回复均入库，支持前端加载历史。
         """
         if not session_id:
@@ -537,16 +566,29 @@ class InterviewSystemOrchestrator:
         full_input = f"{context_prefix}\n\n[用户消息]\n{message}" if context_prefix.strip() else message
 
         logger.info(f"💬 [InterviewerAgent] 处理用户 {user_id} 的对话，消息: {message[:80]}")
+        # 注入当前 user_id 到线程上下文，工具可直接读取，无需 Agent 每次传参
+        from backend.agents.context import set_current_user_id
+        from backend.agents.thinking_capture import ThinkingCapture
+        set_current_user_id(user_id)
+
         loop = asyncio.get_event_loop()
+
+        def _run_agent_with_capture():
+            with ThinkingCapture() as tc:
+                result = self.interviewer.run(full_input)
+            return result, tc.get_steps()
+
         try:
-            response = await loop.run_in_executor(None, self.interviewer.run, full_input)
+            response, thinking_steps = await loop.run_in_executor(None, _run_agent_with_capture)
         except Exception as agent_err:
             logger.error(f"❌ [InterviewerAgent] run() 抛出异常: {agent_err}", exc_info=True)
             raise
-        logger.info(f"✅ [InterviewerAgent] 回复完成 ({len(response)}字): {response[:200]}")
+        logger.info(f"✅ [InterviewerAgent] 回复完成 ({len(response)}字, 思考{len(thinking_steps)}步): {response[:200]}")
 
-        # 入库 AI 回复（reasoning 需 agent 暴露时再补充）
-        sqlite_service.update_session_history(session_id, "assistant", response)
+        # 入库 AI 回复（含 thinking_steps 摘要）
+        reasoning_summary = _format_thinking_for_db(thinking_steps)
+        sqlite_service.update_session_history(session_id, "assistant", response,
+                                              reasoning=reasoning_summary or None)
 
         self._write_working(user_id, f"AI：{response[:200]}", importance=0.4,
                              session_id=session_id)
@@ -558,7 +600,7 @@ class InterviewSystemOrchestrator:
             session_id=session_id
         )
 
-        return response
+        return response, thinking_steps
 
     # ===========================================================
     # 公开接口
@@ -635,6 +677,28 @@ class InterviewSystemOrchestrator:
             return mt.execute("summary", limit=10)
         except Exception as e:
             return f"获取记忆摘要失败: {e}"
+
+
+# ===========================================================
+# 辅助函数
+# ===========================================================
+
+def _format_thinking_for_db(steps: list) -> str:
+    """将思考步骤列表格式化为纯文本，用于入库摘要。"""
+    if not steps:
+        return ""
+    lines = []
+    for i, s in enumerate(steps, 1):
+        lines.append(f"--- 第 {i} 步 ---")
+        if s.get("thought"):
+            lines.append(f"🤔 {s['thought']}")
+        if s.get("action"):
+            lines.append(f"🎬 {s['action']}")
+        if s.get("observation"):
+            lines.append(f"👀 {s['observation']}")
+        if s.get("warning"):
+            lines.append(s["warning"])
+    return "\n".join(lines)
 
 
 # ===========================================================

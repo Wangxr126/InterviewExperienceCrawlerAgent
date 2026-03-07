@@ -55,14 +55,69 @@ RULES = {
 
 
 # ══════════════════════════════════════════════════════════════
-# 详情页正文提取（来自 debug_nowcoder_feed.py 验证通过的逻辑）
+# 详情页正文提取：以 HTML 解析（DOM）为主，不依赖正则/关键词
+# 策略：1) DOM 解析正文区  2) meta 兜底  3) JSON 中 HTML 用 BeautifulSoup 解析
 # ══════════════════════════════════════════════════════════════
 
+# 正文区域 DOM 选择器（按优先级，覆盖 discuss 与 feed 页面）
+_CONTENT_DOM_SELECTORS = [
+    ("div", {"class": lambda x: x and "nc-post-content" in str(x)}),
+    ("div", {"class": lambda x: x and "post-topic-des" in str(x)}),
+    ("div", {"class": lambda x: x and "feed-detail-content" in str(x)}),
+    ("div", {"class": lambda x: x and "detail-content" in str(x)}),
+    ("div", {"class": lambda x: x and "content-body" in str(x)}),
+    ("div", {"class": lambda x: x and "tw-prose" in str(x)}),
+    ("div", {"class": lambda x: x and "post-content" in str(x)}),
+    ("div", {"class": lambda x: x and "article-content" in str(x)}),
+]
+_CONTENT_IDS = ["js-post-content", "post-content", "main-content"]
+
+_TITLE_SELECTORS = [
+    ("span", {"class": lambda x: x and "post-title" in str(x)}),
+    ("h1", {}),
+    ("div", {"class": lambda x: x and "title" in str(x).lower()}),
+]
+
+
+def _extract_content_from_dom(soup: BeautifulSoup) -> Tuple[str, str]:
+    """
+    从 DOM 解析正文（主策略）。通过 HTML 标签结构定位正文区域，不依赖正则。
+    返回 (title, body)。
+    """
+    title, body = "", ""
+    # 标题
+    for tag, attrs in _TITLE_SELECTORS:
+        el = soup.find(tag, attrs) if attrs else soup.find(tag)
+        if el:
+            t = el.get_text(strip=True)
+            if t and len(t) < 200:
+                title = t.replace("_牛客网", "").strip()
+                break
+    # 正文：按 class 选择器
+    for tag, attrs in _CONTENT_DOM_SELECTORS:
+        div = soup.find(tag, attrs)
+        if div:
+            for t in div(["script", "style"]):
+                t.decompose()
+            text = div.get_text(separator="\n", strip=True)
+            if len(text) > 50:
+                body = text
+                break
+    if not body:
+        for aid in _CONTENT_IDS:
+            div = soup.find(id=aid)
+            if div:
+                for t in div(["script", "style"]):
+                    t.decompose()
+                text = div.get_text(separator="\n", strip=True)
+                if len(text) > 50:
+                    body = text
+                    break
+    return title, body
+
+
 def _extract_content_from_meta(soup: BeautifulSoup) -> Tuple[str, str]:
-    """
-    从 meta 标签提取正文（最可靠策略）。
-    牛客 feed 页面会把帖子正文放入 og:description 和 description。
-    """
+    """从 meta 标签提取（兜底，可能被截断）"""
     title, body = "", ""
     for sel in ['meta[property="og:description"]', 'meta[name="description"]']:
         el = soup.select_one(sel)
@@ -81,32 +136,28 @@ def _extract_content_from_meta(soup: BeautifulSoup) -> Tuple[str, str]:
     return title, body
 
 
-def _extract_content_from_dom(soup: BeautifulSoup) -> str:
-    """从 DOM 提取正文（备用策略）"""
-    for cls in ["nc-post-content", "post-topic-des", "feed-detail-content",
-                "tw-prose", "post-content", "article-content"]:
-        div = soup.find("div", class_=lambda x: x and cls in str(x))
-        if div:
-            for t in div(["script", "style"]):
-                t.decompose()
-            text = div.get_text(separator="\n", strip=True)
-            if len(text) > 50:
-                return text
-    for aid in ["js-post-content", "post-content", "main-content"]:
-        div = soup.find(id=aid)
-        if div:
-            for t in div(["script", "style"]):
-                t.decompose()
-            text = div.get_text(separator="\n", strip=True)
-            if len(text) > 50:
-                return text
-    return ""
+def _html_to_text(html_str: str) -> str:
+    """将 HTML 片段解析为纯文本，使用 BeautifulSoup 而非正则"""
+    if not html_str or not isinstance(html_str, str):
+        return ""
+    try:
+        soup = BeautifulSoup(html_str, "html.parser")
+        for t in soup(["script", "style"]):
+            t.decompose()
+        return soup.get_text(separator="\n", strip=True)
+    except Exception:
+        return ""
 
 
 def _extract_json_scripts(html: str) -> list:
-    """提取页面中的 JSON 数据块"""
+    """提取页面中的 JSON 数据块（__NEXT_DATA__、__INITIAL_STATE__、__PRELOADED_STATE__ 等）"""
     found = []
-    m = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.DOTALL)
+    m = re.search(
+        r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*type=["\']application/json["\'][^>]*>(.*?)</script>',
+        html, re.DOTALL
+    )
+    if not m:
+        m = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.DOTALL)
     if m:
         try:
             found.append(json.loads(m.group(1).strip()))
@@ -137,20 +188,46 @@ def _extract_json_scripts(html: str) -> list:
                         pass
                     break
             i += 1
+    m = re.search(r'window\.__PRELOADED_STATE__\s*=\s*(\{)', html)
+    if m:
+        start = m.start(1)
+        depth, i, in_str, escape = 0, start, None, False
+        while i < len(html):
+            c = html[i]
+            if in_str:
+                escape = (c == "\\" and not escape)
+                if not escape and c == in_str:
+                    in_str = None
+                i += 1
+                continue
+            if c in ('"', "'"):
+                in_str = c
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        found.append(json.loads(html[start:i + 1]))
+                    except json.JSONDecodeError:
+                        pass
+                    break
+            i += 1
     return found
 
 
 def _dig_content_fields(obj, depth=0, max_depth=14) -> list:
-    """递归查找正文字段"""
+    """递归查找正文字段，返回 [(text, is_html), ...]，用 BeautifulSoup 解析 HTML"""
     if depth > max_depth:
         return []
     results = []
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k.lower() in ("content", "contenttext", "content_text", "body",
-                             "postcontent", "post_content", "description", "text"):
+                             "postcontent", "post_content", "description", "text", "html"):
                 if isinstance(v, str) and len(v) > 20 and not v.startswith("http"):
-                    clean = re.sub(r"<[^>]+>", " ", v).strip()
+                    # 用 BeautifulSoup 解析 HTML，不用正则 strip
+                    clean = _html_to_text(v)
                     if len(clean) > 20:
                         results.append(clean)
             results.extend(_dig_content_fields(v, depth + 1, max_depth))
@@ -160,70 +237,259 @@ def _dig_content_fields(obj, depth=0, max_depth=14) -> list:
     return results
 
 
+def _extract_content_from_initial_state_feed(html: str) -> Tuple[str, str]:
+    """
+    牛客 feed 页面：从 __INITIAL_STATE__ 的 prefetchData.ssrCommonData.contentData 提取主帖正文。
+    meta/og:description 会被截断，完整内容在 prefetchData 中。返回 (title, body)。
+    """
+    m = re.search(r"__INITIAL_STATE__\s*=\s*(\{)", html)
+    if not m:
+        return "", ""
+    start = m.start(1)
+    depth, i, in_str, escape = 0, start, None, False
+    while i < len(html):
+        c = html[i]
+        if in_str:
+            escape = c == "\\" and not escape
+            if not escape and c == in_str:
+                in_str = None
+            i += 1
+            continue
+        if c in ('"', "'"):
+            in_str = c
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    d = json.loads(html[start : i + 1])
+                except json.JSONDecodeError:
+                    return "", ""
+                break
+        i += 1
+    else:
+        return "", ""
+
+    prefetch = d.get("prefetchData") or d.get("prefetch")
+    if isinstance(prefetch, dict):
+        prefetch = list(prefetch.values())
+    if not isinstance(prefetch, list):
+        return "", ""
+
+    title, body = "", ""
+    for item in prefetch:
+        if not isinstance(item, dict):
+            continue
+        ssr = item.get("ssrCommonData") or item.get("ssrData")
+        if not isinstance(ssr, dict):
+            continue
+        content_data = ssr.get("contentData")
+        if isinstance(content_data, dict):
+            c = content_data.get("content") or content_data.get("text") or ""
+            if isinstance(c, str) and len(c) > 100:
+                if "<" in c and ">" in c:
+                    c = _html_to_text(c)
+                body = c.strip()
+                title = (content_data.get("title") or content_data.get("subject") or "").strip()
+                break
+    return title, body
+
+
 def _extract_content_from_json(html: str) -> str:
-    """从 JSON 块中提取正文（兜底策略）"""
+    """从 JSON 块中提取正文（SPA 兜底）。用 HTML 解析取文本，不依赖关键词打分。"""
     blocks = _extract_json_scripts(html)
     candidates = []
     for j in blocks:
         for text in _dig_content_fields(j):
-            # 面经特征打分
-            score = 0
-            if "一面" in text or "二面" in text or "三面" in text or "hr面" in text:
-                score += 15
-            if "面经" in text:
-                score += 10
-            if "分钟" in text or "自我介绍" in text or "八股" in text or "反问" in text:
-                score += 5
-            candidates.append((score, len(text), text))
-    candidates.sort(key=lambda x: (-x[0], -x[1]))
-    for _, length, text in candidates:
-        if length > 50:
-            return text
+            if len(text) > 50:
+                candidates.append(text)
+    # 取最长的正文块（主帖通常最长），不用关键词打分
+    if candidates:
+        return max(candidates, key=len)
     return ""
 
 
+def _resolve_feed_to_discuss(soup: BeautifulSoup, url: str) -> str:
+    """
+    feed 页面尝试解析出 discuss 链接，discuss 页面通常有完整服务端渲染正文。
+    优先使用 canonical，避免误取侧栏推荐链接。
+    """
+    if "/feed/main/detail/" not in url:
+        return url
+    canonical = soup.select_one('link[rel="canonical"]')
+    if canonical and canonical.get("href"):
+        h = canonical["href"].strip()
+        if "/discuss/" in h:
+            return h if h.startswith("http") else urljoin("https://www.nowcoder.com", h)
+    return url
+
+
 def _fetch_post_content_full_impl(
-    html: str, soup: BeautifulSoup
+    html: str, soup: BeautifulSoup, url: str = ""
 ) -> Tuple[str, str, List[str]]:
     """
-    三级提取策略，返回 (title, body, image_urls)
-      1. meta 标签（最可靠）
-      2. DOM 类名选择器
-      3. JSON 块递归搜索
+    四级提取策略，返回 (title, body, image_urls)。
+    feed 页优先从 __INITIAL_STATE__ 取完整正文（meta 会截断），再 DOM → meta → JSON。
     """
-    # 1. meta
+    title, body = "", ""
+    # 0. feed 页：__INITIAL_STATE__.prefetchData.contentData（完整内容，meta 会截断）
+    if "/feed/main/detail/" in url:
+        title, body = _extract_content_from_initial_state_feed(html)
+    if body:
+        image_urls = _collect_image_urls(soup, html)
+        return title, body, image_urls
+
+    # 1. DOM 解析（主策略）
+    title, body = _extract_content_from_dom(soup)
+    if body:
+        image_urls = _collect_image_urls(soup, html)
+        return title, body, image_urls
+
+    # 2. meta 兜底（可能被截断）
     title, body = _extract_content_from_meta(soup)
     if body:
-        # meta 中无图片，需从 DOM 中补充图片 URL
         image_urls = _collect_image_urls(soup, html)
         return title, body, image_urls
 
-    # 2. DOM
-    body = _extract_content_from_dom(soup)
-    if body:
-        image_urls = _collect_image_urls(soup, html)
-        return title, body, image_urls
-
-    # 3. JSON
+    # 3. JSON 块（SPA 页面，HTML 用 BeautifulSoup 解析）
     body = _extract_content_from_json(html)
     image_urls = _collect_image_urls(soup, html) if body else []
     return title, body, image_urls
 
 
-def _collect_image_urls(soup: BeautifulSoup, html: str = "") -> List[str]:
-    """从页面中收集图片 URL（优先从正文区域）"""
-    BASE = "https://www.nowcoder.com"
+# 图片提取：与 test_nowcoder_fetch.py 完全一致（DOM + JSON/imgMoment）
+_BASE_URL = "https://www.nowcoder.com"
+_CONTENT_CLASSES_FOR_IMG = [
+    "nc-post-content", "post-topic-des", "feed-detail-content",
+    "detail-content", "content-body", "post-content", "feed-content-text", "feed-img",
+]
+
+
+def _is_user_content_image_url(url: str) -> bool:
+    """仅根据 URL 判断是否像用户上传图（无 img 标签时用）"""
+    if not url or not url.startswith("http") or url.startswith("data:"):
+        return False
+    if "static.nowcoder.com" in url:
+        return False
+    if "uploadfiles.nowcoder.com/images/20220815/" in url and "318889480" in url:
+        return False
+    if "avatar" in url.lower() or "logo" in url.lower() or "favicon" in url.lower():
+        return False
+    return True
+
+
+def _is_user_content_image(img_tag, src: str) -> bool:
+    """判断是否为正文中的用户上传图片（排除表情、头像、UI 图标）"""
+    if not src or not src.startswith("http") or src.startswith("data:"):
+        return False
+    if "static.nowcoder.com" in src:
+        return False
+    if img_tag and (img_tag.get("data-card-emoji") or img_tag.get("data-card-nowcoder")):
+        return False
+    style = (img_tag.get("style") or "").lower() if img_tag else ""
+    if "18px" in style or "14px" in style or "12px" in style:
+        if "width" in style or "height" in style:
+            return False
+    if "uploadfiles.nowcoder.com/images/20220815/" in src and "318889480" in src:
+        return False
+    return True
+
+
+def _collect_content_blocks(obj, depth=0, max_depth=14) -> list:
+    """收集 content 块及其父对象，返回 [(html, parent_obj), ...]。主帖图片在 imgMoment/contentImageUrls。"""
+    if depth > max_depth:
+        return []
+    blocks = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.lower() in ("content", "html", "body", "text", "description"):
+                if isinstance(v, str) and len(v) > 50:
+                    blocks.append((v, obj))
+            blocks.extend(_collect_content_blocks(v, depth + 1, max_depth))
+    elif isinstance(obj, list):
+        for v in obj:
+            blocks.extend(_collect_content_blocks(v, depth + 1, max_depth))
+    return blocks
+
+
+def _extract_images_from_html(html: str) -> List[str]:
+    """从单个 HTML 字符串中提取用户上传图"""
     urls = []
-    for cls in ["nc-post-content", "post-topic-des", "post-content"]:
+    try:
+        s = BeautifulSoup(html, "html.parser")
+        for img in s.find_all("img", src=True):
+            src = img.get("src", "").strip()
+            if _is_user_content_image(img, src):
+                urls.append(src)
+    except Exception:
+        pass
+    return urls
+
+
+def _extract_from_img_moment(parent: dict) -> List[str]:
+    """从主帖的 imgMoment 或 contentImageUrls 提取图片 URL（用户上传图在此，不在 content HTML）"""
+    urls = []
+    for key in ("imgMoment", "contentImageUrls"):
+        arr = parent.get(key)
+        if not isinstance(arr, list):
+            continue
+        for item in arr:
+            if isinstance(item, dict) and "src" in item:
+                src = item.get("src", "").strip()
+                if src and _is_user_content_image_url(src):
+                    urls.append(src)
+            elif isinstance(item, str) and _is_user_content_image_url(item):
+                urls.append(item)
+    return urls
+
+
+def _dig_image_urls_from_main_post_only(obj, depth=0, max_depth=14) -> List[str]:
+    """仅从主帖提取图片。主帖 = content 最长的块。图片来源：content HTML + imgMoment/contentImageUrls"""
+    blocks = _collect_content_blocks(obj, depth, max_depth)
+    if not blocks:
+        return []
+    main_block = max(blocks, key=lambda x: len(x[0]))
+    html, parent = main_block[0], main_block[1]
+    urls = _extract_images_from_html(html)
+    urls.extend(_extract_from_img_moment(parent))
+    return list(dict.fromkeys(urls))
+
+
+def _collect_image_urls_from_dom(soup: BeautifulSoup) -> List[str]:
+    """从 DOM 正文区域收集图片 URL，仅保留用户上传图（排除表情、UI）"""
+    urls = []
+    for cls in _CONTENT_CLASSES_FOR_IMG:
         div = soup.find("div", class_=lambda x: x and cls in str(x))
         if div:
             for img in div.find_all("img", src=True):
                 src = img.get("src", "").strip()
                 if src and not src.startswith("data:"):
-                    urls.append(src if src.startswith("http") else
-                                ("https:" + src if src.startswith("//") else urljoin(BASE, src)))
+                    u = src if src.startswith("http") else (
+                        "https:" + src if src.startswith("//") else urljoin(_BASE_URL, src)
+                    )
+                    if _is_user_content_image(img, u) and u not in urls:
+                        urls.append(u)
             if urls:
                 return urls
+    return urls
+
+
+def _collect_image_urls_from_json(html: str) -> List[str]:
+    """从 JSON 收集用户上传图。仅从主帖 content（最长的块）提取，排除相关推荐等。"""
+    urls = []
+    for block in _extract_json_scripts(html):
+        for u in _dig_image_urls_from_main_post_only(block):
+            if u not in urls:
+                urls.append(u)
+    return urls
+
+
+def _collect_image_urls(soup: BeautifulSoup, html: str = "") -> List[str]:
+    """从 DOM 和 JSON 收集图片 URL（feed 页面图片多在 JSON 中），与 test_nowcoder_fetch 一致"""
+    urls = _collect_image_urls_from_dom(soup)
+    if not urls and html:
+        urls = _collect_image_urls_from_json(html)
     return urls
 
 
@@ -307,7 +573,8 @@ class NowcoderCrawler:
     def fetch_post_content_full(self, post_url: str) -> Tuple[str, List[str]]:
         """
         爬取帖子详情页，返回 (正文纯文本, 图片URL列表)。
-        提取优先级：meta 标签 → DOM 类名选择器 → JSON 块
+        以 HTML 解析（DOM）为主，不依赖正则/关键词。
+        feed 链接若 DOM 无正文，会尝试解析 discuss 链接并重新抓取。
         """
         if not post_url.startswith("http"):
             return "", []
@@ -321,13 +588,24 @@ class NowcoderCrawler:
 
             html = resp.text
             soup = BeautifulSoup(html, "html.parser")
+            title, body, image_urls = _fetch_post_content_full_impl(html, soup, post_url)
 
-            title, body, image_urls = _fetch_post_content_full_impl(html, soup)
+            # feed 页面仍无正文时，尝试跳转到 discuss 获取完整服务端渲染内容
+            if not body and "/feed/main/detail/" in post_url:
+                discuss_url = _resolve_feed_to_discuss(soup, post_url)
+                if discuss_url != post_url:
+                    logger.info(f"feed 页面无正文，尝试 discuss 链接: {discuss_url[:60]}")
+                    time.sleep(random.uniform(1, 2))
+                    resp2 = self.session.get(discuss_url, timeout=20)
+                    if resp2.status_code == 200:
+                        html2 = resp2.text
+                        soup2 = BeautifulSoup(html2, "html.parser")
+                        title, body, image_urls = _fetch_post_content_full_impl(html2, soup2, discuss_url)
 
             if body:
-                logger.debug(f"详情页提取成功: {post_url[:60]} ({len(body)} 字, {len(image_urls)} 图)")
+                logger.info(f"牛客 详情页解析成功: {title[:30] or '(无标题)'}... ({len(body)}字, {len(image_urls)}图)")
             else:
-                logger.warning(f"未识别到正文结构: {post_url}")
+                logger.warning(f"牛客 未识别到正文结构: {post_url[:80]}")
 
             return body, image_urls
 
@@ -339,8 +617,9 @@ class NowcoderCrawler:
 
     def discover_page(self, keyword: str, page: int) -> List[Dict]:
         """爬取一页搜索结果，返回帖子元数据列表"""
-        list_url = f"{self.BASE_URL}/search/all?query={keyword}&type=all&searchType=历史搜索&page={page}"
+        list_url = f"{self.BASE_URL}/search/all?query={keyword}&type=all&searchType=顶部搜索栏&page={page}"
         try:
+            logger.info(f"牛客 请求列表页: keyword={keyword!r}, page={page}")
             time.sleep(random.uniform(2, 4))
             self._update_headers()
             resp = self.session.get(list_url, timeout=20)
@@ -360,6 +639,7 @@ class NowcoderCrawler:
                 return []
 
             results = []
+            total = len(post_cards)
             for idx, card in enumerate(post_cards, 1):
                 try:
                     # 标题
@@ -402,12 +682,13 @@ class NowcoderCrawler:
                         "business_line": analysis["business"],
                         "difficulty": analysis["difficulty"],
                         "post_type": analysis["post_type"],
+                        "discover_keyword": keyword,
                     })
-                    logger.debug(
-                        f"  [{analysis['company']}-{analysis['role']}] {title[:20]}... ({analysis['difficulty']})"
+                    logger.info(
+                        f"牛客 [{idx}/{total}] 列表页发现: {title[:30]}... | {post_url[:60]}"
                     )
                 except Exception as e:
-                    logger.debug(f"解析单条出错: {e}")
+                    logger.warning(f"牛客 列表页解析单条出错 [{idx}/{total}]: {e}")
                     continue
 
             logger.info(f"牛客 keyword={keyword} page={page} 发现 {len(results)} 条")
@@ -445,15 +726,20 @@ class NowcoderCrawler:
                 posts = self.discover_page(kw, page)
                 if not posts:
                     break
+                new_in_page = 0
                 for p in posts:
                     url = p["source_url"]
                     if url in seen_urls:
                         continue
                     seen_urls.add(url)
+                    new_in_page += 1
                     if db_check and db_check(url):
                         skipped_db += 1
                         continue
                     all_posts.append(p)
+                if new_in_page == 0:
+                    logger.info(f"牛客 keyword={kw!r} page={page} 无新链接（全部重复），提前终止翻页")
+                    break
             time.sleep(random.uniform(1, 2))
 
         if skipped_db:

@@ -45,9 +45,12 @@ beautifulsoup4==4.14.0
 lxml==6.0.2
 fake-useragent==1.5.1
 
-# ── 图像处理（OCR 可选）─────────────────────────────────────
+# ── 图像处理（OCR 本地识别，不依赖 LLM）──────────────────────
 pillow==10.4.0
-# pytesseract>=0.3.10     # OCR 需同时安装 Tesseract-OCR 可执行文件
+easyocr>=1.7.0            # 本地 OCR，支持中英文，无需 Vision API
+
+# ── 日志（终端彩色：INFO 绿 / WARNING 黄 / ERROR 红）────────────────
+loguru>=0.7.0
 
 # ── 环境配置 ─────────────────────────────────────────────────
 python-dotenv==1.2.1

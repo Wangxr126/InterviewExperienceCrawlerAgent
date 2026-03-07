@@ -36,8 +36,9 @@
         <IngestView  v-show="currentView === 'ingest'" :user-id="userId"
                      @ingested="loadMeta" />
         <CollectView v-show="currentView === 'collect'" />
-        <ReportView  v-show="currentView === 'report'" :user-id="userId"
-                     :is-active="currentView === 'report'" />
+        <ReportView   v-show="currentView === 'report'"   :user-id="userId"
+                      :is-active="currentView === 'report'" />
+        <FinetuneView v-show="currentView === 'finetune'" />
       </main>
     </div>
 
@@ -56,6 +57,7 @@ import ChatView     from './views/ChatView.vue'
 import IngestView   from './views/IngestView.vue'
 import CollectView  from './views/CollectView.vue'
 import ReportView   from './views/ReportView.vue'
+import FinetuneView from './views/FinetuneView.vue'
 import MasteryDialog from './components/MasteryDialog.vue'
 
 const userId      = ref('')
@@ -65,11 +67,12 @@ const chatViewRef = ref(null)
 const meta        = ref({ total: 0, companies: [], tags: [], positions: [], difficulties: [] })
 
 const navItems = [
-  { key: 'browse',  icon: '📚', label: '题库浏览' },
-  { key: 'chat',    icon: '💬', label: '练习对话' },
-  { key: 'ingest',  icon: '🔗', label: '收录面经' },
-  { key: 'collect', icon: '🕷️', label: '数据采集' },
-  { key: 'report',  icon: '📊', label: '学习报告' },
+  { key: 'browse',   icon: '📚', label: '题库浏览' },
+  { key: 'chat',     icon: '💬', label: '练习对话' },
+  { key: 'ingest',   icon: '🔗', label: '收录面经' },
+  { key: 'collect',  icon: '🕷️', label: '数据采集' },
+  { key: 'report',   icon: '📊', label: '学习报告' },
+  { key: 'finetune', icon: '🧪', label: '微调标注' },
 ]
 
 const loadMeta = async () => {

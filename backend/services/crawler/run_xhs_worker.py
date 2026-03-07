@@ -56,6 +56,14 @@ def main():
 
     logger.info(f"XHS worker 启动: keywords={keywords}, max_notes={max_notes}, headless={headless}")
 
+    # 预热 LLM（子进程独立运行，需单独预热，避免首次提取超慢）
+    if do_process:
+        try:
+            from backend.services.llm_warmup import warmup_llm
+            warmup_llm(timeout=120)
+        except Exception as e:
+            logger.warning(f"LLM 预热跳过: {e}")
+
     from backend.services.crawler.xhs_crawler import XHSCrawler
     from backend.services.sqlite_service import sqlite_service
     from backend.services.crawler.crawl_helpers import save_xhs_post

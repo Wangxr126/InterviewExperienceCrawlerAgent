@@ -72,11 +72,16 @@ class _Settings:
 
     @property
     def llm_timeout(self) -> int:
-        return _get_int("LLM_TIMEOUT", 60)
+        return _get_int("LLM_TIMEOUT", 180)
 
     @property
     def llm_temperature(self) -> float:
         return _get_float("LLM_TEMPERATURE", 0.3)
+
+    @property
+    def llm_warmup_enabled(self) -> bool:
+        """启动时是否预热 LLM（解决 Ollama/云端 冷启动首请求慢或无响应）"""
+        return _get_bool("LLM_WARMUP_ENABLED", True)
 
     # ── 2. Hunter Agent ───────────────────────────────────────────
     @property
@@ -129,6 +134,29 @@ class _Settings:
     def interviewer_temperature(self) -> float:
         return _get_float("INTERVIEWER_TEMPERATURE", 0.6)
 
+    # ── 4.5 微调辅助大模型 ────────────────────────────────────────
+    @property
+    def finetune_llm_model(self) -> str:
+        return _get("FINETUNE_LLM_MODEL") or self.llm_model_id
+
+    @property
+    def finetune_llm_api_key(self) -> str:
+        return _get("FINETUNE_LLM_API_KEY") or self.llm_api_key
+
+    @property
+    def finetune_llm_base_url(self) -> str:
+        return _get("FINETUNE_LLM_BASE_URL") or self.llm_base_url
+
+    @property
+    def finetune_llm_temperature(self) -> float:
+        return _get_float("FINETUNE_LLM_TEMPERATURE", 0.1)
+
+    # ── 4.6 爬虫/题目提取 ──────────────────────────────────────────
+    @property
+    def extractor_temperature(self) -> float:
+        """面经题目提取 LLM 温度。结构化 JSON 输出建议 0.0~0.2，小模型可略高至 0.2 减少刻板错误。"""
+        return _get_float("EXTRACTOR_TEMPERATURE", 0.2)
+
     # ── 5. Embedding ──────────────────────────────────────────────
     @property
     def embed_model_type(self) -> str:
@@ -176,24 +204,7 @@ class _Settings:
     def qdrant_collection(self) -> str:
         return _get("QDRANT_COLLECTION", "hello_agents_vectors")
 
-    # ── 8. 工具 API ───────────────────────────────────────────────
-    @property
-    def tavily_api_key(self) -> str:
-        return _get("TAVILY_API_KEY")
-
-    @property
-    def serpapi_api_key(self) -> str:
-        return _get("SERPAPI_API_KEY")
-
-    @property
-    def amap_api_key(self) -> str:
-        return _get("AMAP_API_KEY")
-
-    @property
-    def unsplash_access_key(self) -> str:
-        return _get("UNSPLASH_ACCESS_KEY")
-
-    # ── 9. 本地存储（统一在 backend/data 下，可通过 DATA_DIR 覆盖）──
+    # ── 8. 本地存储 ───────────────────────────────────────────────
     @property
     def backend_data_dir(self) -> Path:
         """后端数据根目录，默认 backend/data"""
@@ -219,15 +230,31 @@ class _Settings:
 
     @property
     def post_images_dir(self) -> Path:
-        """帖子图片存储目录"""
+        """帖子图片存储目录：backend/data/post_images/{task_id}/"""
         return self.backend_data_dir / "post_images"
 
-    # ── 10. 爬虫基础 ──────────────────────────────────────────────
+    @property
+    def nowcoder_output_dir(self) -> Path:
+        """牛客测试/调试输出目录（正文 txt + 图片，不含 HTML）"""
+        return self.backend_data_dir / "nowcoder_output"
+
+    @property
+    def logs_dir(self) -> Path:
+        """日志相关 data 统一目录：LLM CSV、llm_failures、xhs_link_cache 等"""
+        return self.backend_data_dir / "logs"
+
+    @property
+    def llm_prompt_log_csv(self) -> str:
+        """LLM 交互日志路径（JSONL 格式，精简原始+输出），留空则不记录"""
+        p = _get("LLM_PROMPT_LOG_CSV", "").strip()
+        return "" if not p else _resolve_data_path(p)
+
+    # ── 9. 爬虫 ──────────────────────────────────────────────────
     @property
     def nowcoder_cookie(self) -> str:
         return _get("NOWCODER_COOKIE")
 
-    # ── 11. 调度器 ────────────────────────────────────────────────
+    # ── 10. 调度器 ────────────────────────────────────────────────
     @property
     def scheduler_enable_nowcoder(self) -> bool:
         return _get_bool("SCHEDULER_ENABLE_NOWCODER", True)
@@ -271,18 +298,30 @@ class _Settings:
         return str(self.backend_data_dir / "xhs_user_data") if not p else _resolve_data_path(p)
 
     @property
+    def xhs_link_cache_path(self) -> str:
+        """小红书已获取链接缓存文件（存于 logs 目录）"""
+        p = _get("XHS_LINK_CACHE", "").strip()
+        return str(self.logs_dir / "xhs_link_cache.txt") if not p else _resolve_data_path(p)
+
+    @property
     def xhs_login_wait_seconds(self) -> int:
         return _get_int("XHS_LOGIN_WAIT_SECONDS", 120)
 
     @property
     def crawler_process_batch_size(self) -> int:
-        return _get_int("CRAWLER_PROCESS_BATCH_SIZE", 5)
+        """任务队列每批处理条数（定时任务、API 默认值均由此读取）"""
+        return _get_int("CRAWLER_PROCESS_BATCH_SIZE", 30)
 
-    # ── 12. 对话与 Agent ───────────────────────────────────────────
+    @property
+    def crawler_process_batch_max(self) -> int:
+        """API 可传入的 batch_size 上限"""
+        return _get_int("CRAWLER_PROCESS_BATCH_MAX", 200)
+
+    # ── 11. 对话与 Agent ──────────────────────────────────────────
     @property
     def default_user_id(self) -> str:
         """默认用户 ID，前端未指定时使用"""
-        return _get("DEFAULT_USER_ID", "user_001")
+        return _get("DEFAULT_USER_ID", "Wangxr")
 
     @property
     def interviewer_max_steps(self) -> int:

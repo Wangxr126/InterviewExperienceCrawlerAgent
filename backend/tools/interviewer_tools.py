@@ -11,8 +11,14 @@ from hello_agents.tools import Tool, ToolParameter
 from backend.services.neo4j_service import neo4j_service
 from backend.services.sqlite_service import sqlite_service
 from backend.tools.architect_tools import generate_embedding
+from backend.agents.context import get_current_user_id
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_user_id(parameters: Dict[str, Any]) -> str:
+    """从参数中取 user_id，未传则从线程上下文取（Orchestrator 每次对话前设置）"""
+    return parameters.get("user_id") or get_current_user_id()
 
 
 # ==============================================================================
@@ -53,7 +59,7 @@ class SmartRecommendationEngine(Tool):
         ]
 
     def run(self, parameters: Dict[str, Any]) -> str:
-        user_id = parameters.get("user_id", "")
+        user_id = _resolve_user_id(parameters)
         mode = parameters.get("mode", "auto")
         topic = parameters.get("topic", "")
         company = parameters.get("company", "")
@@ -175,7 +181,7 @@ class ProgressTracker(Tool):
         ]
 
     def run(self, parameters: Dict[str, Any]) -> str:
-        user_id = parameters.get("user_id", "")
+        user_id = _resolve_user_id(parameters)
         question_id = parameters.get("question_id", "")
         score = int(parameters.get("score", 0))
         user_answer = parameters.get("user_answer", "")
@@ -414,7 +420,7 @@ class NoteTool(Tool):
 
     def run(self, parameters: Dict[str, Any]) -> str:
         action = parameters.get("action", "list").lower()
-        user_id = parameters.get("user_id", "")
+        user_id = _resolve_user_id(parameters)
         note_id = parameters.get("note_id")
         question_id = parameters.get("question_id")
         title = parameters.get("title", "")
@@ -502,7 +508,7 @@ class MasteryReporter(Tool):
         ]
 
     def run(self, parameters: Dict[str, Any]) -> str:
-        user_id = parameters.get("user_id", "")
+        user_id = _resolve_user_id(parameters)
         tags = parameters.get("tags") or []
 
         if not user_id:
@@ -583,7 +589,7 @@ class ResumeAnalysisTool(Tool):
         ]
 
     def run(self, parameters: Dict[str, Any]) -> str:
-        user_id = parameters.get("user_id", "")
+        user_id = _resolve_user_id(parameters)
         resume_text = parameters.get("resume_text", "")
         target_company = parameters.get("target_company", "")
         target_position = parameters.get("target_position", "")
@@ -654,7 +660,7 @@ class InterviewEvaluator(Tool):
         ]
 
     def run(self, parameters: Dict[str, Any]) -> str:
-        user_id = parameters.get("user_id", "")
+        user_id = _resolve_user_id(parameters)
         session_id = parameters.get("session_id", "")
 
         if not user_id:
@@ -755,7 +761,7 @@ class KnowledgeRecommender(Tool):
         ]
 
     def run(self, parameters: Dict[str, Any]) -> str:
-        user_id = parameters.get("user_id", "")
+        user_id = _resolve_user_id(parameters)
         tags = parameters.get("tags") or []
         max_resources = int(parameters.get("max_resources", 2))
         max_mistakes = int(parameters.get("max_mistakes", 3))

@@ -24,11 +24,18 @@ def save_xhs_post(
     Returns:
         task_id 若新增成功，否则 None（URL 已存在）
     """
+    # 去掉小红书标题末尾的「 - 小红书」后缀（meta 回退时常见）
+    title = (post.get("title") or "").strip()
+    for suffix in (" - 小红书", "- 小红书", " - 小红书 "):
+        if title.endswith(suffix):
+            title = title[:-len(suffix)].strip()
+            break
     task_id = sqlite_service.add_crawl_task(
         source_url=post.get("source_url", ""),
         source_platform="xiaohongshu",
-        post_title=post.get("title", ""),
+        post_title=title,
         post_type=post.get("post_type", ""),
+        discover_keyword=post.get("discover_keyword", ""),
     )
     if not task_id:
         return None

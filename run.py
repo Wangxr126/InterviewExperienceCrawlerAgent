@@ -8,9 +8,13 @@
 
 NewCoderAgent 环境路径固定写死，无需 conda activate。
 """
-import sys
+import logging
 import os
 import subprocess
+import sys
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("run")
 
 # ── 固定使用 NewCoderAgent conda 环境 ──────────────────────────
 CONDA_ENV_PYTHON = r"C:\Users\Wangxr\.conda\envs\NewCoderAgent\python.exe"
@@ -18,10 +22,10 @@ CONDA_ENV_PYTHON = r"C:\Users\Wangxr\.conda\envs\NewCoderAgent\python.exe"
 # 如果当前解释器不是目标环境，用目标环境重新启动本脚本
 if os.path.abspath(sys.executable).lower() != os.path.abspath(CONDA_ENV_PYTHON).lower():
     if not os.path.exists(CONDA_ENV_PYTHON):
-        print(f"❌ 找不到 NewCoderAgent 环境: {CONDA_ENV_PYTHON}")
-        print("   请确认路径正确，或修改 run.py 中的 CONDA_ENV_PYTHON 变量")
+        logger.error("找不到 NewCoderAgent 环境: %s", CONDA_ENV_PYTHON)
+        logger.error("请确认路径正确，或修改 run.py 中的 CONDA_ENV_PYTHON 变量")
         sys.exit(1)
-    print(f"🔄 切换到 NewCoderAgent 环境: {CONDA_ENV_PYTHON}")
+    logger.info("切换到 NewCoderAgent 环境: %s", CONDA_ENV_PYTHON)
     result = subprocess.run([CONDA_ENV_PYTHON] + sys.argv, env={**os.environ,
         "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
     sys.exit(result.returncode)
@@ -40,8 +44,8 @@ def check_deps():
         except ImportError:
             missing.append(pkg)
     if missing:
-        print(f"❌ 缺少依赖: {missing}")
-        print(f"   请运行: {CONDA_ENV_PYTHON} -m pip install {' '.join(missing)}")
+        logger.error("缺少依赖: %s", missing)
+        logger.error("请运行: %s -m pip install %s", CONDA_ENV_PYTHON, " ".join(missing))
         sys.exit(1)
 
 
@@ -51,12 +55,12 @@ def check_neo4j():
         import socket
         sock = socket.create_connection(("localhost", 7687), timeout=2)
         sock.close()
-        print("✅ Neo4j (localhost:7687) 连接正常")
+        logger.info("Neo4j (localhost:7687) 连接正常")
     except Exception:
-        print("⚠️  Neo4j (localhost:7687) 未就绪")
-        print("   → 请先运行: docker compose up -d")
-        print("   → 等待约 30 秒后服务启动完成")
-        print("   → 浏览器打开 http://localhost:7474 可查看知识图谱")
+        logger.warning("Neo4j (localhost:7687) 未就绪")
+        logger.warning("请先运行: docker compose up -d")
+        logger.warning("等待约 30 秒后服务启动完成")
+        logger.warning("浏览器打开 http://localhost:7474 可查看知识图谱")
 
 
 def main():
@@ -77,19 +81,20 @@ def main():
 
     check_neo4j()
 
-    print(f"""
+    logger.info("""
 ╔══════════════════════════════════════════════════════╗
 ║            面经 Agent 后端已启动                      ║
 ╠══════════════════════════════════════════════════════╣
 ║  Python 环境：NewCoderAgent                          ║
-║  API 地址  ：http://localhost:{port}
-║  API 文档  ：http://localhost:{port}/docs
-║  【前端-生产】：直接访问 http://localhost:{port}
-║  【前端-开发】：cd web && npm run dev  → localhost:5173
+║  API 地址  ：http://localhost:%s
+║  API 文档  ：http://localhost:%s/docs
+║  前端-生产  ：http://localhost:%s
+║  前端-开发  ：cd web && npm run dev  → localhost:5173
 ║  Neo4j 管理：http://localhost:7474
+║  Ollama LLM ：http://localhost:11434
 ║  退出      ：Ctrl+C
 ╚══════════════════════════════════════════════════════╝
-    """)
+""", port, port, port)
 
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
 
