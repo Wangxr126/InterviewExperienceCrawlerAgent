@@ -1,4 +1,4 @@
-﻿"""
+"""
 面经 Agent 后端 FastAPI 主入口
 启动：python run.py  或  uvicorn backend.main:app --reload
 API 文档：http://localhost:8000/docs
@@ -148,11 +148,12 @@ def _print_agent_llm_config():
     logger.info(f"  [全局] provider={s.llm_provider}, model={s.llm_model_id or '(未设置)'}")
     logger.info(f"          base_url={base or '(未设置)'}, timeout={s.llm_timeout}, temperature={s.llm_temperature}")
     logger.info("-" * 60)
-    am = s.architect_model or s.llm_model_id
-    logger.info(f"  [Architect] model={am}, temperature={s.architect_temperature}, base={s.architect_base_url or s.llm_base_url or '(同全局)'}")
+    # Miner Agent
+    mm = s.llm_model_id  # Miner 使用全局模型
+    logger.info(f"  [Miner Agent] model={mm}, temperature={s.miner_temperature}, max_tokens={s.miner_max_tokens}, base={s.llm_base_url or '(同全局)'}")
+    # Interviewer Agent
     im = s.interviewer_model or s.llm_model_id
-    logger.info(f"  [Interviewer] model={im}, temperature={s.interviewer_temperature}, base={s.interviewer_base_url or s.llm_base_url or '(同全局)'}")
-    logger.info(f"  [Miner Agent/题目提取] model={s.llm_model_id or '(未设置)'}, temperature={s.extractor_temperature}, max_tokens={s.extractor_max_tokens} (使用全局 base_url)")
+    logger.info(f"  [Interviewer Agent] model={im}, temperature={s.interviewer_temperature}, base={s.interviewer_base_url or s.llm_base_url or '(同全局)'}")
     logger.info("=" * 60)
 
 
@@ -160,6 +161,11 @@ def _print_agent_llm_config():
 async def startup_event():
     """FastAPI 启动时启动后台调度器，并可选预热 LLM"""
     from backend.config.config import settings as _s
+    from backend.services.crawler.question_extractor import _print_miner_config_once
+    
+    # 初始化 Miner Agent 配置（提前打印，避免首次提取时才显示）
+    _print_miner_config_once()
+    
     _print_agent_llm_config()
     logger.info(
         f"LLM 配置: provider={_s.llm_provider}, model={_s.llm_model_id}, "

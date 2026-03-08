@@ -40,7 +40,13 @@ class _ThreadLocalStdout:
         buf: Optional[io.StringIO] = getattr(_tl, "capture_buf", None)
         if buf is not None:
             return buf.write(text)
-        return _original_stdout.write(text)  # type: ignore[union-attr]
+        # Windows 兼容：处理 emoji 等特殊字符
+        try:
+            return _original_stdout.write(text)  # type: ignore[union-attr]
+        except UnicodeEncodeError:
+            # 替换无法编码的字符
+            safe_text = text.encode('utf-8', errors='replace').decode('utf-8')
+            return _original_stdout.write(safe_text)  # type: ignore[union-attr]
 
     def flush(self) -> None:
         _original_stdout.flush()  # type: ignore[union-attr]

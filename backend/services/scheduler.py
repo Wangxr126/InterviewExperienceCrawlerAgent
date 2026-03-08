@@ -31,7 +31,6 @@ from backend.services.sqlite_service import sqlite_service
 from backend.services.neo4j_service import neo4j_service
 from backend.services.crawler.question_extractor import extract_questions_from_post
 from backend.services.knowledge_manager import knowledge_manager
-from backend.services.miner_agent import miner_agent
 from backend.config.config import settings
 
 logger = logging.getLogger(__name__)
@@ -410,7 +409,7 @@ def _process_pending_tasks(batch_size: int = None):
 def _get_embedding(text: str) -> Optional[List[float]]:
     """获取文本向量（调用 DashScope Embedding API），失败时返回 None"""
     try:
-        from backend.tools.architect_tools import generate_embedding
+        from backend.tools.knowledge_manager_tools import generate_embedding
         vec = generate_embedding(text)
         return vec if vec else None
     except Exception as e:

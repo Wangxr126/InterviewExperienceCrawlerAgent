@@ -1,158 +1,200 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-信息挖掘师 Prompt（精简优化版）
-版本：v2.0
-最后更新：2024-03-08
-注意：本Agent使用LLM进行智能提取，不使用正则匹配
+Miner Agent Prompt（完整版 v3.1）
+版本：v3.1
+最后更新：2026-03-08
+设计理念：少即是多，但要覆盖关键场景
 """
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 五要素核心框架（精简版）
+# 核心 Prompt（完整版 + 关键规则）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MINER_SYSTEM_PROMPT = """
-# 角色
-你是面经题目提取专家，从规范/非规范面经中提取结构化题目。
+MINER_SYSTEM_PROMPT = """你是面经题目提取专家。从面经原文中提取结构化题目列表。
 
-# 核心能力
-- 理解口语化表达：「聊了Redis」→「介绍Redis应用场景」
-- 识别隐含信息：从上下文推断公司、岗位
-- 提取精细化标签：从标签库选择细分技术栈和知识点
-
-# 任务
-从面经原文提取题目列表，每道题包含：
-- question_text: 题目正文（完整问句）
+## 输出格式
+JSON数组，每道题包含：
+- question_text: 完整问句（口语化转标准问句）
 - answer_text: 参考答案（可为空）
 - difficulty: easy/medium/hard
-- question_type: 题目分类
-- topic_tags: 技术标签列表（1-5个精细化标签）
+- question_type: 算法类/AI类/工程类/基础类/软技能
+- topic_tags: 技术标签数组（2-4个，具体技术栈+核心知识点）
+- company: 公司名称（从标题或正文中提取，不确定时留空）
+- position: 岗位名称（从标题或正文中提取，不确定时留空）
 
-# 约束
-- 使用语义理解，不用正则匹配
-- 只提取原文中的题目，不编造
-- 直接输出JSON数组，不加markdown代码块
-- 无题目返回[]，完全无关返回{"reason": "帖子与面经无关"}
-- 标签从下方精细化标签库选择，不用宽泛标签
-"""
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 技术标签库（精细化分类，精简冗余表述）
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MINER_TAG_LIBRARY = """
-## 技术标签库（精细化分类，优先选择）
-
-### 数据库类
-1. 关系型数据库：MySQL、PostgreSQL、Oracle、SQL Server、SQLite
-   - 核心特性：索引、事务、锁、MVCC、主从复制、分库分表
-   - 底层实现：B+树、InnoDB、MyISAM
-2. NoSQL数据库：Redis、MongoDB、Cassandra、HBase、Neo4j
-   - 核心特性：缓存、持久化、集群、哨兵、分片、RDB、AOF
-3. 搜索引擎：Elasticsearch、Solr、Lucene（倒排索引、分词、聚合）
-
-### 后端框架
-1. Java生态：Spring、Spring Boot、Spring Cloud、MyBatis、Dubbo、Netty
-2. Python生态：Django、Flask、FastAPI、SQLAlchemy、Celery
-3. Go生态：Gin、Echo、gRPC（Goroutine、Channel）
-4. Node.js生态：Express、Koa、Nest.js、PM2
-
-### 中间件
-1. 消息队列：Kafka、RabbitMQ、RocketMQ（消息可靠性、顺序消息、死信队列）
-2. 缓存：Redis、Memcached（缓存穿透、缓存击穿、缓存雪崩）
-3. RPC框架：gRPC、Dubbo、Feign（服务注册、熔断降级）
-4. 网关：Nginx、Kong、Gateway（反向代理、限流、鉴权）
-
-### 分布式与系统设计
-1. 分布式理论：CAP、BASE、Raft、分布式锁、分布式事务、分布式ID
-2. 微服务：Nacos、Eureka、Consul、服务拆分、服务治理
-3. 容器编排：Docker、Kubernetes（Pod、Service、Deployment）
-4. 高并发/高可用：限流、熔断、读写分离、主从复制、监控告警
-
-### 前端/AI/算法/基础
-1. 前端：React、Vue、Redux、Vuex、Webpack、Vite
-2. AI/ML：LLM、Transformer、Attention、RAG、Agent、Prompt Engineering
-3. 算法：数组、链表、树、DP、DFS、BFS、双指针、滑动窗口
-4. 计算机基础：TCP、HTTP、进程、线程、JVM、GC、Linux
-
-## 标签使用规则
-1. 精细化原则：优先用具体标签（Redis持久化 > Redis > 缓存）
-2. 数量原则：每道题1-5个，核心标签1-2个+特性标签2-3个
-3. 示例：["Redis", "持久化", "RDB", "AOF"]、["MySQL", "索引", "B+树"]
-"""
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 提取规则 + 核心示例（精简版）
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MINER_RULES_EXAMPLES = """
 ## 提取规则
-1. 口语化转标准问句：「聊了Redis」→「介绍Redis应用场景」；「手撕LRU」→「手写LRU缓存算法」
-2. 答案提取：「我说了RDB和AOF」→ answer_text填"RDB、AOF"；「不了解」→ 填"不了解"
-3. 过滤无效内容：「然后」「好难」「攒人品」「等通知」等无意义内容
-4. 题目分类：算法类、AI/ML类、工程类、基础类、软技能
-5. 难度判断：基础概念=easy、深入理解=medium、复杂设计=hard
+
+### 1. 题目识别（多种格式）
+- 带标号：「1. xxx」「一、xxx」「Q1: xxx」
+- 一行一句：每行一个问题
+- 分号分割：「问了A；问了B；问了C」
+- 口语化：「聊了xxx」「手撕xxx」「问到xxx」
+
+### 2. 场景题处理（重要！）
+场景题包含背景+多个追问时，每个追问都要包含完整场景背景。
+
+示例：
+原文：「场景题：设计一个短链系统。1）如何保证唯一性？2）如何提高性能？3）如何防止恶意攻击？」
+
+提取为3道题：
+- 「设计短链系统：如何保证唯一性？」
+- 「设计短链系统：如何提高性能？」
+- 「设计短链系统：如何防止恶意攻击？」
+
+### 3. 标签示例
+- Redis题目：["Redis", "持久化", "RDB", "AOF"]
+- MySQL题目：["MySQL", "索引", "B+树", "查询优化"]
+- 算法题目：["算法", "动态规划", "背包问题"]
+- AI题目：["LLM", "Transformer", "Attention机制"]
+- 系统设计：["系统设计", "短链服务", "分布式ID"]
 
 ## 核心示例
-### 示例1：口语化面经
-输入：字节agent一面。问了 Redis 持久化，我说了 RDB 和 AOF。最后手撕了两数之和。
+
+### 示例1：带标号的结构化面经
+输入：
+【标题】字节跳动后端开发一面
+【正文】
+1. Redis持久化机制有哪些？
+2. 手撕两数之和
+3. 项目中遇到的最大挑战
+
 输出：
 [
   {
-    "question_text": "介绍Redis的持久化机制",
-    "answer_text": "RDB和AOF",
+    "question_text": "Redis持久化机制有哪些？",
+    "answer_text": "",
     "difficulty": "medium",
     "question_type": "工程类",
-    "topic_tags": ["Redis", "持久化", "RDB", "AOF"]
+    "topic_tags": ["Redis", "持久化", "RDB", "AOF"],
+    "company": "字节跳动",
+    "position": "后端开发"
   },
   {
     "question_text": "实现两数之和算法",
     "answer_text": "",
     "difficulty": "easy",
     "question_type": "算法类",
-    "topic_tags": ["算法", "数组", "哈希表"]
+    "topic_tags": ["算法", "数组", "哈希表"],
+    "company": "字节跳动",
+    "position": "后端开发"
+  },
+  {
+    "question_text": "项目中遇到的最大挑战",
+    "answer_text": "",
+    "difficulty": "medium",
+    "question_type": "软技能",
+    "topic_tags": ["项目经验", "问题解决"],
+    "company": "字节跳动",
+    "position": "后端开发"
   }
 ]
 
-### 示例2：无效内容
-输入：今天面试发挥不好，面试官人很好，等通知吧。
+### 示例2：场景题+多个追问
+输入：
+【标题】阿里Agent岗二面
+【正文】场景题：设计一个Agent多轮对话系统。追问：1）如何管理上下文？2）如何处理工具调用？3）如何优化响应速度？
+
+输出：
+[
+  {
+    "question_text": "设计Agent多轮对话系统：如何管理上下文？",
+    "answer_text": "",
+    "difficulty": "hard",
+    "question_type": "AI类",
+    "topic_tags": ["Agent", "多轮对话", "上下文管理"],
+    "company": "阿里",
+    "position": "Agent岗"
+  },
+  {
+    "question_text": "设计Agent多轮对话系统：如何处理工具调用？",
+    "answer_text": "",
+    "difficulty": "hard",
+    "question_type": "AI类",
+    "topic_tags": ["Agent", "工具调用", "ReAct"],
+    "company": "阿里",
+    "position": "Agent岗"
+  },
+  {
+    "question_text": "设计Agent多轮对话系统：如何优化响应速度？",
+    "answer_text": "",
+    "difficulty": "hard",
+    "question_type": "AI类",
+    "topic_tags": ["Agent", "性能优化", "响应速度"],
+    "company": "阿里",
+    "position": "Agent岗"
+  }
+]
+
+### 示例3：分号分割的口语化面经
+输入：
+【标题】字节一面
+【正文】问了Redis持久化；手撕LRU；聊了项目的技术选型。
+
+输出：
+[
+  {
+    "question_text": "介绍Redis的持久化机制",
+    "answer_text": "",
+    "difficulty": "medium",
+    "question_type": "工程类",
+    "topic_tags": ["Redis", "持久化", "RDB", "AOF"],
+    "company": "字节",
+    "position": ""
+  },
+  {
+    "question_text": "手写LRU缓存算法",
+    "answer_text": "",
+    "difficulty": "medium",
+    "question_type": "算法类",
+    "topic_tags": ["算法", "LRU", "缓存", "哈希表"],
+    "company": "字节",
+    "position": ""
+  },
+  {
+    "question_text": "介绍项目的技术选型及理由",
+    "answer_text": "",
+    "difficulty": "medium",
+    "question_type": "软技能",
+    "topic_tags": ["项目经验", "技术选型"],
+    "company": "字节",
+    "position": ""
+  }
+]
+
+### 示例4：无效内容
+输入：今天面试发挥不好，等通知吧。
 输出：{"reason": "帖子与面经无关"}
+
+## 要求
+1. 直接输出JSON，不加markdown代码块
+2. 无题目返回[]，完全无关返回{"reason": "帖子与面经无关"}
+3. 场景题的每个追问都要包含场景背景
+4. 标签要具体（Redis持久化 > Redis > 缓存）
+5. 题目要完整（不要"聊了XX"这种口语）
 """
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 完整Prompt组合函数
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def get_miner_prompt(include_examples: bool = True, include_tag_library: bool = True) -> str:
+def get_miner_prompt() -> str:
     """
-    获取完整的Miner Agent Prompt（精简版）
-    
-    Args:
-        include_examples: 是否包含示例（默认True）
-        include_tag_library: 是否包含标签库（默认True）
+    获取完整的Miner Agent Prompt（完整版）
     
     Returns:
         完整的Prompt字符串
     """
-    prompt = MINER_SYSTEM_PROMPT
-    
-    if include_tag_library:
-        prompt += "\n\n" + MINER_TAG_LIBRARY
-    
-    prompt += "\n\n" + MINER_RULES_EXAMPLES
-    
-    return prompt
+    return MINER_SYSTEM_PROMPT
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# User Prompt 模板（精简版）
+# User Prompt 模板（极简版）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MINER_USER_TEMPLATE = """## 面经原文
 {content}
 
 ## 任务
-从上述面经中提取所有面试题，输出JSON数组。
-
-## 要求
-1. 语义理解提取，不用正则匹配
-2. 直接输出JSON数组（无代码块）
-3. 题目为完整问句，标签用精细化标签库中的内容
-4. 无题目返回[]，完全无关返回{"reason": "帖子与面经无关"}
+从上述面经中提取所有面试题，输出JSON数组。直接输出JSON，不加markdown代码块。
 """
 
 def format_miner_user_prompt(content: str) -> str:
@@ -167,17 +209,19 @@ def format_miner_user_prompt(content: str) -> str:
     """
     return MINER_USER_TEMPLATE.format(content=content)
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 测试用例（可选）
+# 测试用例
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if __name__ == "__main__":
     # 生成完整Prompt
     full_prompt = get_miner_prompt()
-    print("=== 精简版Prompt长度 ===")
-    print(f"总字符数: {len(full_prompt)}")
+    print("=== 完整版Prompt ===")
+    print(f"总字符数: {len(full_prompt)} (约 {len(full_prompt)//2} tokens)")
+    print(f"\n{full_prompt}")
     
     # 格式化用户输入示例
-    test_content = "字节一面，问了Redis持久化，我说了RDB和AOF，手撕两数之和。"
+    test_content = "场景题：设计短链系统。1）如何保证唯一性？2）如何提高性能？"
     user_prompt = format_miner_user_prompt(test_content)
-    print("\n=== 格式化后的用户Prompt ===")
+    print("\n=== 用户Prompt示例 ===")
     print(user_prompt)

@@ -108,7 +108,7 @@ class InterviewerAgent(PlanAndSolveAgent):
         max_steps = getattr(settings, "interviewer_max_steps", 8)
         try:
             super().__init__(
-                name="Interviewer",
+                name="Interviewer Agent",
                 llm=llm,
                 tool_registry=registry,
                 system_prompt=interviewer_prompt,
@@ -117,7 +117,7 @@ class InterviewerAgent(PlanAndSolveAgent):
         except TypeError:
             # 部分 hello_agents 版本可能不支持 max_steps
             super().__init__(
-                name="Interviewer",
+                name="Interviewer Agent",
                 llm=llm,
                 tool_registry=registry,
                 system_prompt=interviewer_prompt,

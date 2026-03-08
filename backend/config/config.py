@@ -1,4 +1,4 @@
-﻿"""
+"""
 配置管理 —— 纯环境变量读取器
 所有值均来自 .env 文件（项目根目录），不在此处硬编码。
 修改配置请直接编辑 /.env 文件。
@@ -183,17 +183,17 @@ class _Settings:
         return self.architect_local_provider if self.architect_mode == "local" else self.architect_remote_provider
 
     @property
-    def architect_model(self) -> str:
+    def knowledge_manager_model(self) -> str:
         return self.architect_local_model if self.architect_mode == "local" else self.architect_remote_model
 
     @property
-    def architect_api_key(self) -> str:
+    def knowledge_manager_api_key(self) -> str:
         local_key = _get("ARCHITECT_LOCAL_API_KEY") or self.llm_local_api_key
         remote_key = _get("ARCHITECT_REMOTE_API_KEY") or self.llm_remote_api_key
         return local_key if self.architect_mode == "local" else remote_key
 
     @property
-    def architect_base_url(self) -> str:
+    def knowledge_manager_base_url(self) -> str:
         return self.architect_local_base_url if self.architect_mode == "local" else self.architect_remote_base_url
 
     @property
@@ -201,12 +201,12 @@ class _Settings:
         return self.architect_local_timeout if self.architect_mode == "local" else self.architect_remote_timeout
 
     @property
-    def architect_temperature(self) -> float:
-        return _get_float("ARCHITECT_TEMPERATURE", 0.0)
+    def knowledge_manager_temperature(self) -> float:
+        return _get_float("KNOWLEDGE_MANAGER_TEMPERATURE", 0.0)
 
     @property
-    def architect_max_tokens(self) -> int:
-        return _get_int("ARCHITECT_MAX_TOKENS", 0) or self.llm_max_tokens
+    def knowledge_manager_max_tokens(self) -> int:
+        return _get_int("KNOWLEDGE_MANAGER_MAX_TOKENS", 0) or self.llm_max_tokens
 
     # ── 4. Interviewer Agent ──────────────────────────────────────
     @property
@@ -352,19 +352,19 @@ class _Settings:
 
     # ── 4.6 爬虫/题目提取 ──────────────────────────────────────────
     @property
-    def extractor_temperature(self) -> float:
+    def miner_temperature(self) -> float:
         """面经题目提取 LLM 温度。结构化 JSON 输出建议 0.0~0.2，小模型可略高至 0.2 减少刻板错误。"""
-        return _get_float("EXTRACTOR_TEMPERATURE", 0.2)
+        return _get_float("MINER_TEMPERATURE", 0.2)
 
     @property
-    def extractor_max_tokens(self) -> int:
+    def miner_max_tokens(self) -> int:
         """题目提取最大输出token数，避免截断导致JSON解析错误"""
-        return _get_int("EXTRACTOR_MAX_TOKENS", 0) or self.llm_max_tokens
+        return _get_int("MINER_MAX_TOKENS", 0) or self.llm_max_tokens
 
     @property
-    def extractor_max_retries(self) -> int:
+    def miner_max_retries(self) -> int:
         """题目提取失败时的最大重试次数（返回空或格式错误时重试）"""
-        return _get_int("EXTRACTOR_MAX_RETRIES", 3)
+        return _get_int("MINER_MAX_RETRIES", 3)
 
     @property
     def crawler_fetch_max_retries(self) -> int:

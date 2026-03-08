@@ -20,7 +20,6 @@ import json
 import logging
 import re
 import time
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -29,11 +28,11 @@ logger = logging.getLogger(__name__)
 
 # 日志：精简原始（不存完整 prompt/few-shot）、输出截断、JSONL 格式
 
-# Miner Agent配置打印标志（只打印一次）
+# Miner Service配置打印标志（只打印一次）
 _miner_config_printed = False
 
 def _print_miner_config_once():
-    """首次调用时打印Miner Agent配置"""
+    """首次调用时打印Miner Service配置"""
     global _miner_config_printed
     if _miner_config_printed:
         return
@@ -42,18 +41,18 @@ def _print_miner_config_once():
     try:
         from backend.config.config import settings
         logger.info("=" * 60)
-        logger.info("✅ Miner Agent (题目提取) 初始化完成")
+        logger.info("✅ Miner Service (题目提取) 初始化完成")
         logger.info("=" * 60)
         logger.info(f"   - Model: {settings.llm_model_id}")
         logger.info(f"   - Provider: {settings.llm_provider}")
         logger.info(f"   - Base URL: {settings.llm_base_url}")
-        logger.info(f"   - Temperature: {settings.extractor_temperature}")
-        logger.info(f"   - Max Tokens: {settings.extractor_max_tokens or settings.llm_max_tokens}")
-        logger.info(f"   - Max Retries: {settings.extractor_max_retries}")
+        logger.info(f"   - Temperature: {settings.miner_temperature}")
+        logger.info(f"   - Max Tokens: {settings.miner_max_tokens or settings.llm_max_tokens}")
+        logger.info(f"   - Max Retries: {settings.miner_max_retries}")
         logger.info(f"   - Timeout: {settings.llm_timeout}s")
         logger.info("=" * 60)
     except Exception as e:
-        logger.warning(f"无法打印Miner Agent配置: {e}")
+        logger.warning(f"无法打印Miner Service配置: {e}")
 _MAX_LOG_INPUT_PREVIEW = 1200   # 原始内容预览最大字符
 _MAX_LOG_OUTPUT = 3000         # 输出最大字符
 _OCR_PLACEHOLDER = "[OCR 省略]"  # 替换大段 OCR 噪音
@@ -207,7 +206,7 @@ def _call_llm(user_prompt: str) -> Optional[str]:
             {"role": "user",   "content": user_prompt},
         ]
         # 尝试使用 JSON mode（Ollama 部分模型支持）
-        temp = settings.extractor_temperature
+        temp = settings.miner_temperature
         try:
             resp = client.chat.completions.create(
                 model=settings.llm_model_id,
@@ -261,7 +260,7 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
                 return [], "unrelated"
             # 处理空对象 {} 的情况（LLM有时返回空对象表示无题目）
             if not data:
-                logger.info("LLM 返回空对象 {}，判定为无题目")
+                logger.warning("⚠️ LLM 返回空对象 {}，判定为无题目（应返回空数组[]）")
                 return [], "empty"
     except json.JSONDecodeError:
         pass
@@ -420,14 +419,14 @@ def extract_questions_from_post(
     if len(content) > MAX_CONTENT_CHARS:
         logger.info(f"内容截断: {len(content)} → {MAX_CONTENT_CHARS} chars")
 
-    user_prompt = EXTRACT_PROMPT_TEMPLATE.format(
-        company=company or "未知",
-        position=position or "未知",
-        content=truncated,
-    )
+    # 拼接标题和内容
+    full_content = f"【标题】{post_title}\n\n【正文】\n{truncated}" if post_title else truncated
+    
+    # 使用新的 Prompt 系统
+    user_prompt = format_miner_user_prompt(full_content)
 
     from backend.config.config import settings
-    max_retries = settings.extractor_max_retries
+    max_retries = settings.miner_max_retries
     
     # 重试循环
     for attempt in range(1, max_retries + 1):
@@ -464,10 +463,16 @@ def extract_questions_from_post(
 
     questions: List[Dict] = []
     for item in items:
+        logger.debug(f"处理 item: {type(item)}")
         if not isinstance(item, dict):
+            logger.debug(f"跳过非字典项: {type(item)}")
             continue
+        
         q_text = str(item.get("question_text", "")).strip()
-        if not q_text or len(q_text) < 5:
+        
+        # 放宽过滤条件：只过滤完全为空的题目
+        if not q_text:
+            logger.warning(f"题目为空被过滤")
             continue
 
         tags_raw = item.get("topic_tags", [])
@@ -484,8 +489,8 @@ def extract_questions_from_post(
         item_difficulty = str(item.get("difficulty", "")).strip()
         difficulty_val = _normalize_difficulty(item_difficulty) if item_difficulty else ""
         questions.append({
-            "q_id": f"Q-{uuid.uuid4().hex[:10].upper()}",
-            "question_text": q_text,
+            # q_id 由数据库自动生成（INTEGER PRIMARY KEY AUTOINCREMENT）
+                        "question_text": q_text,
             "answer_text": str(item.get("answer_text", "")).strip(),
             "difficulty": difficulty_val,
             "question_type": str(item.get("question_type", "技术题")),

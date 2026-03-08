@@ -39,7 +39,7 @@ class SqliteService:
             # ── 题目元数据补充表（与 Neo4j 双写，支持结构化过滤）──
             """
             CREATE TABLE IF NOT EXISTS questions (
-                q_id            TEXT PRIMARY KEY,
+                q_id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 question_text   TEXT NOT NULL,
                 answer_text     TEXT,
                 difficulty      TEXT DEFAULT 'medium',
@@ -50,6 +50,7 @@ class SqliteService:
                 position        TEXT,
                 business_line   TEXT,
                 topic_tags      TEXT DEFAULT '[]',
+                extraction_source TEXT DEFAULT 'content',
                 created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -265,37 +266,28 @@ class SqliteService:
         
         return cleaned.strip()
     
-    def upsert_question(self, q_id: str, question_text: str, answer_text: str,
+    def upsert_question(self, question_text: str, answer_text: str,
                         difficulty: str = "medium", question_type: str = "技术题",
                         source_platform: str = "", source_url: str = "",
                         company: str = "", position: str = "", business_line: str = "",
-                        topic_tags: List[str] = None):
+                        topic_tags: List[str] = None, extraction_source: str = "content"):
         # 清洗题目文本，去除标号
         question_text = self._clean_question_text(question_text)
         
         tags_json = json.dumps(topic_tags or [], ensure_ascii=False)
         with self._get_conn() as conn:
-            conn.execute("""
+            cursor = conn.execute("""
                 INSERT INTO questions
-                    (q_id, question_text, answer_text, difficulty, question_type,
+                    (question_text, answer_text, difficulty, question_type,
                      source_platform, source_url, company, position, business_line,
-                     topic_tags, updated_at)
+                     topic_tags, extraction_source, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(q_id) DO UPDATE SET
-                    question_text   = excluded.question_text,
-                    answer_text     = excluded.answer_text,
-                    difficulty      = excluded.difficulty,
-                    question_type   = excluded.question_type,
-                    source_platform = excluded.source_platform,
-                    source_url      = excluded.source_url,
-                    company         = excluded.company,
-                    position        = excluded.position,
-                    business_line   = excluded.business_line,
-                    topic_tags      = excluded.topic_tags,
-                    updated_at      = CURRENT_TIMESTAMP
-            """, (q_id, question_text, answer_text, difficulty, question_type,
-                  source_platform, source_url, company, position, business_line, tags_json))
+                
+            """, (question_text, answer_text, difficulty, question_type,
+                  source_platform, source_url, company, position, business_line, tags_json, extraction_source))
             conn.commit()
+            # 返回自动生成的 q_id
+            return cursor.lastrowid
 
     def filter_questions(self, company: str = None, position: str = None,
                          difficulty: str = None, question_type: str = None,

@@ -20,7 +20,7 @@ import logging
 from typing import Optional, Dict, Any
 
 from backend.tools.hunter_tools import CrawlerTool, TextSanitizer, ContentValidator, VisualExtractor
-from backend.tools.architect_tools import MetaExtractor
+from backend.tools.knowledge_manager_tools import MetaExtractor
 
 logger = logging.getLogger(__name__)
 

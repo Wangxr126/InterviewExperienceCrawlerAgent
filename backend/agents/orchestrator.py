@@ -11,7 +11,7 @@
 LLM 负责（通过 Agent）：
   • 自然对话（出题、解释、推荐策略）         → InterviewerAgent
   • 答案结构化评估（打分 + 遗漏点）          → _evaluate_answer_structured()
-  • 知识结构化（帖子 → 题目 JSON）           → KnowledgeArchitectAgent
+  • 知识结构化（帖子 → 题目 JSON）           → KnowledgeManager
 """
 
 from backend.utils.time_utils import now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
@@ -26,7 +26,7 @@ from functools import partial
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
-from backend.agents.architect_agent import KnowledgeArchitectAgent
+from backend.services.knowledge_manager import knowledge_manager
 from backend.agents.interviewer_agent import InterviewerAgent
 from backend.config.config import settings
 from backend.services.hunter_pipeline import run_hunter_pipeline
@@ -217,7 +217,7 @@ class InterviewSystemOrchestrator:
 
     职责边界：
     ─ 确定性流程（代码）─────────────────────────────────────
-      ingest()        : 调用 HunterPipeline（纯代码 ETL）+ ArchitectAgent
+      ingest()        : 调用 HunterPipeline（纯代码 ETL）+ KnowledgeManagerAgent
       submit_answer() : 评估→SM-2→记忆→推荐，全部在代码里完成
       end_session()   : 记忆整合 + 评估报告（代码触发）
 
@@ -228,7 +228,8 @@ class InterviewSystemOrchestrator:
     def __init__(self):
         logger.info("🔄 初始化面试系统编排器 v3.0...")
         try:
-            self.architect = KnowledgeArchitectAgent()
+            from backend.services.knowledge_manager import knowledge_manager
+            self.knowledge_manager = knowledge_manager
             self.interviewer = InterviewerAgent()
             # 按 user_id 缓存 MemoryTool（懒加载）
             self._user_memory_tools: Dict[str, Any] = {}
@@ -236,7 +237,7 @@ class InterviewSystemOrchestrator:
             self._session_weak_counts: Dict[str, Dict[str, Dict[str, int]]] = defaultdict(
                 lambda: defaultdict(lambda: defaultdict(int))
             )
-            logger.info("✅ 编排器初始化完成（KnowledgeArchitect + Interviewer）")
+            logger.info("✅ 编排器初始化完成（KnowledgeManager + Interviewer）")
         except Exception as e:
             logger.error(f"❌ 初始化失败: {e}")
             raise
@@ -350,8 +351,8 @@ class InterviewSystemOrchestrator:
                                        user_id: str = "",
                                        source_platform: str = "") -> str:
         """
-        Hunter 阶段（纯代码管道）+ Architect 阶段（LLM 结构化）。
-        HunterPipeline 的每一步由代码固定控制，Architect 只做语义理解。
+        Hunter 阶段（纯代码管道）+ KnowledgeManager 阶段（LLM 结构化）。
+        HunterPipeline 的每一步由代码固定控制，KnowledgeManager 只做语义理解。
         """
         logger.info(f"📡 [HunterPipeline] 开始处理: {url}")
 
@@ -363,9 +364,9 @@ class InterviewSystemOrchestrator:
             logger.info(f"⏭️  管道跳过: {reason}")
             return f"跳过（{reason}）"
 
-        logger.info(f"🏗️  [ArchitectAgent] 开始结构化入库 (文本长度 {len(pipeline_result.text)})...")
+        logger.info(f"🏗️  [KnowledgeManagerAgent] 开始结构化入库 (文本长度 {len(pipeline_result.text)})...")
 
-        # 将元信息附加到文本头，帮助 Architect 提取更准确
+        # 将元信息附加到文本头，帮助 KnowledgeManager 提取更准确
         meta_hint = ""
         if pipeline_result.meta:
             meta_hint = f"[元信息提示] {json.dumps(pipeline_result.meta, ensure_ascii=False)}\n\n"
@@ -374,7 +375,7 @@ class InterviewSystemOrchestrator:
         loop = asyncio.get_event_loop()
         report = await loop.run_in_executor(
             None,
-            self.architect.run,
+            self.knowledge_manager.run,
             f"请处理以下文本并存入数据库:\n\n{meta_hint}{pipeline_result.text[:5000]}"
         )
 

@@ -10,7 +10,7 @@ from typing import List, Dict, Any, Optional
 from hello_agents.tools import Tool, ToolParameter
 from backend.services.neo4j_service import neo4j_service
 from backend.services.sqlite_service import sqlite_service
-from backend.tools.architect_tools import generate_embedding
+from backend.tools.knowledge_manager_tools import generate_embedding
 from backend.agents.context import get_current_user_id
 
 logger = logging.getLogger(__name__)
