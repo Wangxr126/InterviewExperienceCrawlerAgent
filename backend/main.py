@@ -1,4 +1,4 @@
-"""
+﻿"""
 面经 Agent 后端 FastAPI 主入口
 启动：python run.py  或  uvicorn backend.main:app --reload
 API 文档：http://localhost:8000/docs
@@ -1220,7 +1220,19 @@ def get_crawl_tasks(
             params + [limit, offset]
         ).fetchall()
 
-    return {"total": total, "tasks": [dict(r) for r in rows]}
+    # 转换时间为北京时间
+    from backend.utils.time_utils import timestamp_to_beijing
+    tasks = []
+    for r in rows:
+        task = dict(r)
+        # 转换discovered_at和processed_at为北京时间
+        if task.get("discovered_at"):
+            task["discovered_at"] = timestamp_to_beijing(task["discovered_at"])
+        if task.get("processed_at"):
+            task["processed_at"] = timestamp_to_beijing(task["processed_at"])
+        tasks.append(task)
+
+    return {"total": total, "tasks": tasks}
 
 
 @app.get("/api/crawler/tasks/{task_id}/questions")

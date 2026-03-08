@@ -286,14 +286,125 @@ def _process_pending_tasks(batch_size: int = None):
                 f"      error={e}\n{traceback.format_exc()}"
             )
 
+# 递归重试逻辑（添加到scheduler.py的_process_pending_tasks函数末尾）
+
     logger.info(f"⚙️  本轮处理完成，入库题目 {processed} 道")
 
-    # ── Step 3: 重试失败的任务 ──────────────────────────────
-    retry_count = _retry_failed_tasks()
-    if retry_count > 0:
-        logger.info(f"🔄 重试成功 {retry_count} 个任务")
+    # ── Step 3: 递归重试失败的任务（直到全部成功或达到最大次数）──────────────────────────────
+    from backend.config.config import settings
+    max_recursive_retries = settings.crawler_recursive_retry_max
+    
+    retry_round = 0
+    while retry_round < max_recursive_retries:
+        # 检查是否还有error状态的任务
+        error_tasks = sqlite_service.get_tasks_by_status("error", limit=batch_size)
+        if not error_tasks:
+            logger.info(f"✅ 所有任务处理完成，无需重试")
+            break
+        
+        retry_round += 1
+        logger.info(f"🔄 第 {retry_round}/{max_recursive_retries} 轮递归重试，发现 {len(error_tasks)} 个失败任务...")
+        
+        # 重试这些失败任务
+        retry_success = 0
+        for task in error_tasks:
+            task_id = task["task_id"]
+            url = task["source_url"]
+            title = task["post_title"] or "无标题"
+            
+            try:
+                # 重新抓取详情页
+                from backend.services.crawler.nowcoder_crawler import NowcoderCrawler
+                from backend.services.crawler.image_utils import download_images
+                crawler = NowcoderCrawler(cookie=cfg.NOWCODER_COOKIE)
+                
+                logger.debug(f"  🔄 重试抓取: {title[:40]}... | {url[:60]}")
+                content, image_urls = crawler.fetch_post_content_full(url)
+                
+                if not content or len(content) < 100:
+                    logger.warning(f"    ⚠️ 重试失败：内容为空或过短")
+                    continue
+                
+                # 下载图片
+                image_paths = download_images(image_urls, task_id) if image_urls else []
+                
+                # 更新为fetched状态
+                sqlite_service.update_task_status(
+                    task_id, "fetched",
+                    raw_content=content,
+                    image_paths=image_paths,
+                )
+                
+                # 立即尝试提取
+                questions, status = extract_questions_from_post(
+                    content=content,
+                    platform=task["source_platform"],
+                    company=task["company"] or "",
+                    position=task["position"] or "",
+                    business_line=task["business_line"] or "",
+                    difficulty=task["difficulty"] or "",
+                    source_url=url,
+                    post_title=title,
+                    extraction_source="content",
+                )
+                
+                if questions:
+                    count = _save_questions(questions)
+                    sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source="content", raw_content=content)
+                    logger.info(f"    ✅ 重试成功: {title[:40]} | 提取 {count} 道题目")
+                    retry_success += 1
+                    processed += count
+                else:
+                    # 尝试OCR
+                    if image_paths:
+                        from backend.services.crawler.ocr_service_mcp import ocr_images_to_text
+                        logger.debug(f"    📷 尝试 OCR {len(image_paths)} 张图片...")
+                        ocr_text = ocr_images_to_text(image_paths, task_id)
+                        if ocr_text:
+                            content_with_ocr = content + "\n\n【图片 OCR 识别补充】\n" + ocr_text
+                            questions2, status2 = extract_questions_from_post(
+                                content=content_with_ocr,
+                                platform=task["source_platform"],
+                                company=task["company"] or "",
+                                position=task["position"] or "",
+                                business_line=task["business_line"] or "",
+                                difficulty=task["difficulty"] or "",
+                                source_url=url,
+                                post_title=title,
+                                extraction_source="image",
+                            )
+                            if questions2:
+                                count = _save_questions(questions2)
+                                sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source="image", raw_content=content)
+                                logger.info(f"    ✅ 重试成功(OCR): {title[:40]} | 提取 {count} 道题目")
+                                retry_success += 1
+                                processed += count
+                                continue
+                    
+                    # 仍然失败，保持error状态
+                    sqlite_service.update_task_status(task_id, "error", error_msg=f"第{retry_round}轮重试仍无法提取题目", raw_content=content)
+                    logger.warning(f"    ⚠️ 重试失败: {title[:40]} | 仍无法提取题目")
+                    
+            except Exception as e:
+                logger.error(f"    ❌ 重试异常: {title[:40]} | {e}")
+                sqlite_service.update_task_status(task_id, "error", error_msg=f"第{retry_round}轮重试异常: {str(e)[:150]}")
+        
+        logger.info(f"🔄 第 {retry_round} 轮重试完成：成功 {retry_success}/{len(error_tasks)} 个任务")
+        
+        # 如果本轮没有任何成功，提前退出
+        if retry_success == 0:
+            logger.warning(f"⚠️ 第 {retry_round} 轮重试无任何成功，停止递归重试")
+            break
+    
+    # 最终统计
+    final_error_count = len(sqlite_service.get_tasks_by_status("error", limit=1000))
+    if final_error_count > 0:
+        logger.warning(f"⚠️ 递归重试结束，仍有 {final_error_count} 个任务失败")
+    else:
+        logger.info(f"✅ 所有任务处理完成！")
 
     return processed
+
 
 
 def _get_embedding(text: str) -> Optional[List[float]]:
@@ -369,7 +480,38 @@ def _save_questions(questions: List[Dict]) -> int:
             saved += 1
         except Exception as e:
             logger.error(f"保存题目失败 {q.get('q_id', '?')}: {e}")
+    
+    # ── 更新crawl_tasks表中的公司信息（如果LLM提取到了）─────────
+    if saved > 0 and questions:
+        # 收集所有URL对应的公司信息
+        url_company_map = {}
+        for q in questions:
+            if isinstance(q, dict):
+                url = q.get("source_url", "")
+                company = q.get("company", "").strip()
+                # 只有当LLM提取到了公司信息，且不是"未知"时才更新
+                if url and company and company != "未知":
+                    url_company_map[url] = company
+        
+        # 批量更新crawl_tasks表
+        if url_company_map:
+            try:
+                with sqlite_service._get_conn() as conn:
+                    for url, company in url_company_map.items():
+                        # 只更新company字段为空或"未知"的记录
+                        conn.execute("""
+                            UPDATE crawl_tasks 
+                            SET company = ? 
+                            WHERE source_url = ? 
+                            AND (company IS NULL OR company = '' OR company = '未知')
+                        """, (company, url))
+                    conn.commit()
+                logger.debug(f"✅ 已更新 {len(url_company_map)} 个URL的公司信息")
+            except Exception as e:
+                logger.warning(f"更新crawl_tasks公司信息失败: {e}")
+    
     return saved
+
 
 
 # ══════════════════════════════════════════════════════════════

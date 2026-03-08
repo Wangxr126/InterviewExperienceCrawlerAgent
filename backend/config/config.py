@@ -1,4 +1,4 @@
-"""
+﻿"""
 配置管理 —— 纯环境变量读取器
 所有值均来自 .env 文件（项目根目录），不在此处硬编码。
 修改配置请直接编辑 /.env 文件。
@@ -551,6 +551,11 @@ class _Settings:
     def crawler_process_batch_max(self) -> int:
         """API 可传入的 batch_size 上限"""
         return _get_int("CRAWLER_PROCESS_BATCH_MAX", 200)
+
+    @property
+    def crawler_recursive_retry_max(self) -> int:
+        """爬取+提取失败任务的最大递归重试次数"""
+        return _get_int("CRAWLER_RECURSIVE_RETRY_MAX", 10)
 
     # ── 11. 对话与 Agent ──────────────────────────────────────────
     @property
