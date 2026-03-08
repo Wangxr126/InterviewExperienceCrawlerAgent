@@ -27,7 +27,7 @@ test_nowcoder_output/
 # 本地参考与思路（不上传）
 参考项目/
 思路/
-
+微调\llm_logs
 # ━━━ 前端构建与依赖 ━━━
 node_modules/
 frontend/dist/
@@ -76,3 +76,5 @@ docs/archive/
 # ━━━ 系统文件 ━━━
 .DS_Store
 Thumbs.db
+
+
