@@ -78,7 +78,13 @@ class InterviewerAgent(PlanAndSolveAgent):
             temperature=settings.interviewer_temperature,
             timeout=settings.llm_timeout
         )
-        logger.info(f"Interviewer LLM: provider={settings.llm_provider}, model={_model}, base={settings.interviewer_base_url or settings.llm_base_url}")
+        logger.info(f"✅ Interviewer Agent 初始化完成")
+        logger.info(f"   - Model: {_model}")
+        logger.info(f"   - Provider: {settings.llm_provider}")
+        logger.info(f"   - Base URL: {settings.interviewer_base_url or settings.llm_base_url}")
+        logger.info(f"   - Temperature: {settings.interviewer_temperature}")
+        logger.info(f"   - Max Tokens: {settings.interviewer_max_tokens or settings.llm_max_tokens}")
+        logger.info(f"   - Timeout: {settings.llm_timeout}s")
 
         registry = ToolRegistry()
 

@@ -77,6 +77,7 @@ def _call_llm_json(prompt: str, system: str = "") -> Any:
             "model": settings.architect_model,
             "messages": messages,
             "temperature": settings.architect_temperature,
+            "max_tokens": settings.architect_max_tokens,
             "response_format": {"type": "json_object"}
         }
         resp = requests.post(

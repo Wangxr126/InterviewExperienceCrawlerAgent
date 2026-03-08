@@ -1,4 +1,4 @@
-"""
+﻿"""
 面经爬取调度器
 职责：
   1. 定时发现新帖子（牛客 / 小红书）→ 写入 crawl_tasks 队列
@@ -30,6 +30,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 from backend.services.sqlite_service import sqlite_service
 from backend.services.neo4j_service import neo4j_service
 from backend.services.crawler.question_extractor import extract_questions_from_post
+from backend.services.knowledge_manager import knowledge_manager
+from backend.services.miner_agent import miner_agent
 from backend.config.config import settings
 
 logger = logging.getLogger(__name__)
@@ -172,12 +174,12 @@ def _process_pending_tasks(batch_size: int = None):
                     raw_content=content,
                     image_paths=image_paths,
                 )
-                logger.info(f"  ✅ 抓取详情成功 [{title[:40]}]: 正文{len(content)}字, 图片{len(image_paths)}张")
+                logger.info(f"✅抓取content成功 [{title[:40]}]: 正文{len(content)}字, 图片{len(image_paths)}张")
             else:
                 sqlite_service.update_task_status(task_id, "error", error_msg="正文内容为空或太短")
         except Exception as e:
             sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200])
-            logger.error(f"  ❌ 抓取详情失败 [{title[:40]}]: {e}")
+            logger.error(f"❌抓取详情失败 [{title[:40]}]: {e}")
 
     # ── Step 2: fetched → LLM 提取 → 写库 ────────────────────
     # 同时处理牛客和小红书（XHS 在 discover 时就已经 fetched）
@@ -492,9 +494,10 @@ def _retry_failed_tasks(max_retries: int = None, retry_delay: int = None) -> int
     failed_tasks = sqlite_service.get_tasks_by_status("error", limit=50)
     
     if not failed_tasks:
-        logger.info("✅ 没有需要重试的任务")
+        logger.info("   ✅ 没有error状态的任务")
         return 0
     
+    logger.info(f"   📋 发现 {len(failed_tasks)} 个error状态的任务，开始重试...")
     from backend.services.crawler.nowcoder_crawler import NowcoderCrawler
     crawler = NowcoderCrawler(cookie=cfg.NOWCODER_COOKIE)
     
@@ -576,3 +579,7 @@ def _retry_failed_tasks(max_retries: int = None, retry_delay: int = None) -> int
     
     logger.info(f"✅ 重试完成：成功 {success_count}/{len(failed_tasks)} 个任务")
     return success_count
+
+
+
+

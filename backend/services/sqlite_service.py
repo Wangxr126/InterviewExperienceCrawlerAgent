@@ -1156,7 +1156,7 @@ class SqliteService:
                 except Exception as e:
                     logger.warning(f"删除图片目录失败 {img_dir}: {e}")
 
-        logger.info(f"已删除 source_url 关联数据: {source_url[:60]}..., 题目 {deleted_questions} 道")
+        logger.info(f"🗑️已删除 source_url 关联数据，共 {deleted_questions} 道题目 | URL: {source_url[:80]}...")
         return deleted_questions
 
     def get_crawl_stats(self) -> Dict:

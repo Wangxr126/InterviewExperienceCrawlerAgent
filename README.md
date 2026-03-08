@@ -1,8 +1,24 @@
-# 面经 Agent
+﻿# 面经 Agent
 
 > 基于 [hello-agents](https://github.com/datawhalechina/hello-agents) 框架构建的智能面试复习助手。
 > 自动爬取牛客/小红书面经、构建知识图谱、用 SM-2 算法跟踪掌握程度，并提供 AI 面试对话练习。
 
+
+---
+
+## ⚙️ 运行环境
+
+**Conda环境：** `NewCoderAgent`
+
+```bash
+# 激活环境
+conda activate NewCoderAgent
+
+# 启动后端
+python run.py
+```
+
+**注意：** 所有Python命令都需要先激活此环境！
 ---
 
 ## 功能概览
@@ -232,3 +248,4 @@ python run.py --reload
 - [hello-agents](https://github.com/datawhalechina/hello-agents)：Agent 框架
 - [DataWhale](https://datawhale.club)：开源社区
 - 火山引擎 Doubao / 阿里云 DashScope：LLM & Embedding 服务
+

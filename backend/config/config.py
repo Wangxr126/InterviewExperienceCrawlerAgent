@@ -128,6 +128,11 @@ class _Settings:
         return _get_float("LLM_TEMPERATURE", 0.3)
 
     @property
+    def llm_max_tokens(self) -> int:
+        """最大输出token数，避免截断导致JSON解析错误"""
+        return _get_int("LLM_MAX_TOKENS", 4096)
+
+    @property
     def llm_warmup_enabled(self) -> bool:
         """启动时是否预热 LLM（解决 Ollama/云端 冷启动首请求慢或无响应）"""
         return _get_bool("LLM_WARMUP_ENABLED", True)
@@ -199,6 +204,10 @@ class _Settings:
     def architect_temperature(self) -> float:
         return _get_float("ARCHITECT_TEMPERATURE", 0.0)
 
+    @property
+    def architect_max_tokens(self) -> int:
+        return _get_int("ARCHITECT_MAX_TOKENS", 0) or self.llm_max_tokens
+
     # ── 4. Interviewer Agent ──────────────────────────────────────
     @property
     def interviewer_mode(self) -> str:
@@ -265,6 +274,10 @@ class _Settings:
     @property
     def interviewer_temperature(self) -> float:
         return _get_float("INTERVIEWER_TEMPERATURE", 0.6)
+
+    @property
+    def interviewer_max_tokens(self) -> int:
+        return _get_int("INTERVIEWER_MAX_TOKENS", 0) or self.llm_max_tokens
 
     # ── 4.5 微调辅助大模型 ────────────────────────────────────────
     @property
@@ -333,11 +346,20 @@ class _Settings:
     def finetune_llm_temperature(self) -> float:
         return _get_float("FINETUNE_LLM_TEMPERATURE", 0.1)
 
+    @property
+    def finetune_llm_max_tokens(self) -> int:
+        return _get_int("FINETUNE_LLM_MAX_TOKENS", 0) or self.llm_max_tokens
+
     # ── 4.6 爬虫/题目提取 ──────────────────────────────────────────
     @property
     def extractor_temperature(self) -> float:
         """面经题目提取 LLM 温度。结构化 JSON 输出建议 0.0~0.2，小模型可略高至 0.2 减少刻板错误。"""
         return _get_float("EXTRACTOR_TEMPERATURE", 0.2)
+
+    @property
+    def extractor_max_tokens(self) -> int:
+        """题目提取最大输出token数，避免截断导致JSON解析错误"""
+        return _get_int("EXTRACTOR_MAX_TOKENS", 0) or self.llm_max_tokens
 
     @property
     def extractor_max_retries(self) -> int:
@@ -523,7 +545,7 @@ class _Settings:
     @property
     def crawler_process_batch_size(self) -> int:
         """任务队列每批处理条数（定时任务、API 默认值均由此读取）"""
-        return _get_int("CRAWLER_PROCESS_BATCH_SIZE", 30)
+        return _get_int("CRAWLER_PROCESS_BATCH_SIZE", 100)
 
     @property
     def crawler_process_batch_max(self) -> int:

@@ -35,7 +35,7 @@ try:
     _loguru_logger.add(
         sys.stderr,
         colorize=True,
-        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
+        format="<green>{time:HH:mm:ss}</green> | <level>{level: <4}</level> | <level>{message}</level>",
         level="INFO",
     )
     _loguru_logger.add(
@@ -152,7 +152,7 @@ def _print_agent_llm_config():
     logger.info(f"  [Architect] model={am}, temperature={s.architect_temperature}, base={s.architect_base_url or s.llm_base_url or '(同全局)'}")
     im = s.interviewer_model or s.llm_model_id
     logger.info(f"  [Interviewer] model={im}, temperature={s.interviewer_temperature}, base={s.interviewer_base_url or s.llm_base_url or '(同全局)'}")
-    logger.info(f"  [爬虫/题目提取] model={s.llm_model_id or '(未设置)'}, temperature={s.extractor_temperature} (使用全局 base_url)")
+    logger.info(f"  [Miner Agent/题目提取] model={s.llm_model_id or '(未设置)'}, temperature={s.extractor_temperature}, max_tokens={s.extractor_max_tokens} (使用全局 base_url)")
     logger.info("=" * 60)
 
 

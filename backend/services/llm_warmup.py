@@ -4,6 +4,7 @@ Ollama 冷启动约 30s～数分钟，预热可避免首次提取超时。
 """
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -57,22 +58,27 @@ def _kill_ollama():
 
 
 def _start_ollama_serve():
-    """后台启动 ollama serve"""
+    """后台启动 ollama serve（设置OLLAMA_KEEP_ALIVE=-1保持模型常驻）"""
     try:
+        env = os.environ.copy()
+        env["OLLAMA_KEEP_ALIVE"] = "-1"  # 模型常驻显存，不自动卸载
+        
         if sys.platform == "win32":
             subprocess.Popen(
                 ["ollama", "serve"],
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=env,
             )
         else:
             subprocess.Popen(
                 ["ollama", "serve"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=env,
             )
-        logger.info("[LLM 预热] 已启动 ollama serve")
+        logger.info("[LLM 预热] 已启动 ollama serve（OLLAMA_KEEP_ALIVE=-1，模型常驻显存）")
     except Exception as e:
         logger.error("[LLM 预热] 启动 ollama serve 失败: {}", e)
         raise
