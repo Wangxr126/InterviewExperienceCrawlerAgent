@@ -55,6 +55,7 @@ ENV/
 # ━━━ IDE 与编辑器 ━━━
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 
@@ -67,6 +68,10 @@ debug_*.html
 *_stdout.log
 uvicorn_*.txt
 xhs_link_cache.txt
+
+# 临时脚本和归档
+scripts/temp/
+docs/archive/
 
 # ━━━ 系统文件 ━━━
 .DS_Store
