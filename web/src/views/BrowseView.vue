@@ -9,7 +9,7 @@
           <el-option v-for="t in (props.meta.question_types || ['技术题','算法题','系统设计','行为题','HR问题'])" :key="t" :label="t" :value="t" />
         </el-select>
         <el-select v-model="filters.company" placeholder="公司" clearable filterable>
-          <el-option v-for="c in props.meta.companies" :key="c" :label="c" :value="c" />
+          <el-option v-for="c in (props.meta.companies || []).filter(c => c)" :key="c" :label="c" :value="c" />
         </el-select>
         <el-select v-model="filters.difficulty" placeholder="难度" clearable>
           <el-option label="简单" value="easy" />
@@ -17,7 +17,7 @@
           <el-option label="困难" value="hard" />
         </el-select>
         <el-select v-model="filters.tag" placeholder="技术标签" clearable filterable>
-          <el-option v-for="t in props.meta.tags" :key="t" :label="t" :value="t" />
+          <el-option v-for="t in (props.meta.tags || []).filter(t => t)" :key="t" :label="t" :value="t" />
         </el-select>
         <el-input v-model="filters.keyword" placeholder="关键词搜索" clearable
                   @keyup.enter="loadQuestions" />
@@ -69,7 +69,7 @@
 
     <!-- 题目详情弹窗 -->
     <QuestionDialog v-model="dialogVisible" :question="selectedQ"
-                    @send-to-chat="$emit('send-to-chat', $event)" />
+                    @send-to-chat="handleSendToChat" />
   </div>
 </template>
 
@@ -131,6 +131,12 @@ const resetFilters = () => {
 const openDialog = (q) => {
   selectedQ.value = q
   dialogVisible.value = true
+}
+
+const handleSendToChat = (event) => {
+  console.log('🟢 BrowseView: 收到 send-to-chat 事件')
+  console.log('🟢 event:', event)
+  emit('send-to-chat', event)
 }
 
 onMounted(loadQuestions)

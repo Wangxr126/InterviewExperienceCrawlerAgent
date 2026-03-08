@@ -242,27 +242,89 @@
       <el-tab-pane label="📂 导入日志" name="logs">
         <div class="logs-container">
           <div class="section-title">微调/llm_logs/ 下的日志文件</div>
-          <el-table :data="logFiles" class="logs-table" @row-click="onLogRowClick">
+          <el-table :data="logFiles" class="logs-table">
             <el-table-column label="模型" prop="model" width="180" />
             <el-table-column label="文件名" prop="filename" />
             <el-table-column label="条数" prop="line_count" width="100" align="center" />
             <el-table-column label="修改时间" prop="mtime" width="200" />
-            <el-table-column label="操作" width="140" align="center">
+            <el-table-column label="操作" width="200" align="center">
               <template #default="{ row }">
+                <el-button size="large" @click.stop="previewLog(row)">查看</el-button>
                 <el-button size="large" type="primary" @click.stop="importLog(row)">导入</el-button>
               </template>
             </el-table-column>
           </el-table>
-          <div class="tip-text">💡 点击「导入」将该文件的记录写入数据库，重复记录自动跳过</div>
+          <div class="tip-text">💡 点击「查看」预览案例，点击「导入」将该文件的记录写入数据库，重复记录自动跳过</div>
         </div>
       </el-tab-pane>
     </el-tabs>
+
+    <!-- 日志预览对话框 -->
+    <el-dialog 
+      v-model="previewDialogVisible" 
+      :title="`日志预览：${previewLogFile?.filename || ''}`"
+      width="90%"
+      top="5vh"
+    >
+      <div v-if="previewLoading" class="preview-loading">
+        <el-icon class="is-loading"><Loading /></el-icon>
+        <span>加载中...</span>
+      </div>
+      <div v-else-if="previewData.samples && previewData.samples.length > 0" class="preview-container">
+        <div class="preview-stats">
+          显示前 {{ previewData.showing }} 条，共 {{ previewData.total }} 条记录
+        </div>
+        <div v-for="(sample, idx) in previewData.samples" :key="idx" class="preview-sample">
+          <div class="preview-sample-header">
+            <span class="preview-sample-index">案例 #{{ idx + 1 }}</span>
+            <span class="preview-sample-time">{{ sample.ts }}</span>
+          </div>
+          
+          <div class="preview-sample-title" v-if="sample.title">
+            📝 {{ sample.title }}
+          </div>
+          
+          <a 
+            v-if="sample.source_url" 
+            :href="sample.source_url" 
+            target="_blank" 
+            class="preview-sample-link"
+          >
+            🔗 查看原帖
+          </a>
+          
+          <div class="preview-section">
+            <div class="preview-section-title">原始面经内容</div>
+            <div class="preview-content">{{ sample.content }}</div>
+          </div>
+          
+          <div class="preview-section" v-if="sample.llm_raw_obj">
+            <div class="preview-section-title">
+              小模型提取结果
+              <span class="preview-question-count" v-if="Array.isArray(sample.llm_raw_obj)">
+                （{{ sample.llm_raw_obj.length }} 道题）
+              </span>
+            </div>
+            <vue-json-pretty 
+              :data="sample.llm_raw_obj"
+              :deep="99"
+              :showLength="false"
+              :showLine="false"
+              :showDoubleQuotes="false"
+              :highlightMouseoverNode="true"
+              :collapsedOnClickBrackets="true"
+            />
+          </div>
+        </div>
+      </div>
+      <el-empty v-else description="没有数据" />
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted, onActivated } from 'vue'
-import { Refresh } from '@element-plus/icons-vue'
+import { Refresh, Loading } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import VueJsonPretty from 'vue-json-pretty'
 import 'vue-json-pretty/lib/styles.css'
@@ -309,7 +371,37 @@ const importLog = async (row) => {
   await loadSamples(1)
   activeTab.value = 'list'
 }
-const onLogRowClick = (row) => importLog(row)
+
+// 日志预览
+const previewDialogVisible = ref(false)
+const previewLoading = ref(false)
+const previewLogFile = ref(null)
+const previewData = ref({ samples: [], total: 0, showing: 0 })
+
+const previewLog = async (row) => {
+  previewLogFile.value = row
+  previewDialogVisible.value = true
+  previewLoading.value = true
+  previewData.value = { samples: [], total: 0, showing: 0 }
+  
+  try {
+    const res = await api.post(`${BASE}/preview-log`, { 
+      log_path: row.path,
+      limit: row.line_count  // 使用文件的实际条数
+    })
+    if (res.error) {
+      ElMessage.error('预览失败：' + res.error)
+      previewDialogVisible.value = false
+    } else {
+      previewData.value = res
+    }
+  } catch (e) {
+    ElMessage.error('预览失败：' + e.message)
+    previewDialogVisible.value = false
+  } finally {
+    previewLoading.value = false
+  }
+}
 
 // 样本列表
 const samples = ref([])
@@ -518,6 +610,7 @@ const onTabChange = (tab) => {
 onMounted(async () => {
   await loadStats()
   await loadLogFiles()
+  await loadSamples()  // 添加：页面加载时获取样本列表
   // 不再自动导入，用户需要手动点击按钮导入
 })
 
@@ -926,5 +1019,205 @@ onActivated(async () => {
   background: #fef3c7;
   border-radius: 8px;
   border-left: 4px solid #f59e0b;
+}
+
+/* 日志预览对话框 */
+.preview-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px;
+  gap: 16px;
+  font-size: 16px;
+  color: #6b7280;
+}
+
+.preview-loading .el-icon {
+  font-size: 40px;
+  color: #3b82f6;
+}
+
+.preview-container {
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.preview-stats {
+  font-size: 15px;
+  color: #6b7280;
+  padding: 12px 16px;
+  background: #f0f9ff;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  text-align: center;
+  font-weight: 600;
+}
+
+.preview-sample {
+  background: #f9fafb;
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 20px;
+  border: 2px solid #e5e7eb;
+}
+
+.preview-sample-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 2px solid #e5e7eb;
+}
+
+.preview-sample-index {
+  font-size: 18px;
+  font-weight: 700;
+  color: #111827;
+}
+
+.preview-sample-time {
+  font-size: 14px;
+  color: #6b7280;
+}
+
+.preview-sample-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #1f2937;
+  margin-bottom: 8px;
+  padding: 12px;
+  background: #fffbeb;
+  border-radius: 6px;
+  border-left: 4px solid #f59e0b;
+}
+
+.preview-sample-link {
+  display: inline-block;
+  font-size: 14px;
+  color: #3b82f6;
+  text-decoration: none;
+  padding: 6px 12px;
+  border-radius: 6px;
+  background: white;
+  border: 1px solid #3b82f6;
+  margin-bottom: 16px;
+  transition: all 0.2s;
+}
+
+.preview-sample-link:hover {
+  background: #dbeafe;
+  color: #2563eb;
+}
+
+.preview-section {
+  margin-top: 16px;
+}
+
+.preview-section-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #374151;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.preview-question-count {
+  font-size: 13px;
+  color: #6b7280;
+  font-weight: 500;
+}
+
+.preview-content {
+  background: white;
+  border-radius: 8px;
+  padding: 16px;
+  font-size: 15px;
+  line-height: 1.8;
+  color: #1f2937;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
+  border: 1px solid #e5e7eb;
+}
+
+.preview-section .vjs-tree {
+  background: white;
+  border-radius: 8px;
+  padding: 16px;
+  border: 1px solid #e5e7eb;
+  max-height: 500px;
+  overflow-y: auto;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 14px;
+  line-height: 1.8;
+}
+
+/* 自定义 vue-json-pretty 样式 */
+.preview-section :deep(.vjs-tree) {
+  background: white !important;
+}
+
+.preview-section :deep(.vjs-tree .vjs-key) {
+  color: #059669;
+  font-weight: 600;
+}
+
+.preview-section :deep(.vjs-tree .vjs-value__string) {
+  color: #1f2937;
+  font-weight: 400;
+}
+
+.preview-section :deep(.vjs-tree .vjs-value__number) {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+.preview-section :deep(.vjs-tree .vjs-value__boolean) {
+  color: #7c3aed;
+  font-weight: 600;
+}
+
+.preview-section :deep(.vjs-tree .vjs-tree__brackets) {
+  color: #6b7280;
+  font-weight: 700;
+}
+
+.preview-section :deep(.vjs-tree .vjs-tree__content) {
+  padding-left: 20px;
+}
+
+.preview-section :deep(.vjs-tree .vjs-tree__node) {
+  padding: 4px 0;
+}
+
+.preview-section :deep(.vjs-tree .vjs-tree__node:hover) {
+  background: #f0f9ff;
+  border-radius: 4px;
+}
+
+.preview-section :deep(.vjs-tree .vjs-tree__indent) {
+  width: 20px;
+  border-left: 1px dashed #d1d5db;
+  margin-left: 8px;
+}
+
+/* 折叠/展开图标 */
+.preview-section :deep(.vjs-tree .vjs-tree__brackets-left),
+.preview-section :deep(.vjs-tree .vjs-tree__brackets-right) {
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.2s;
+}
+
+.preview-section :deep(.vjs-tree .vjs-tree__brackets-left:hover),
+.preview-section :deep(.vjs-tree .vjs-tree__brackets-right:hover) {
+  color: #3b82f6;
+  transform: scale(1.1);
 }
 </style>

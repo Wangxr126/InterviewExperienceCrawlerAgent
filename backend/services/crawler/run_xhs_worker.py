@@ -54,35 +54,29 @@ def main():
     headless  = args.headless.lower() == "true"
     do_process = args.process.lower() == "true"
 
-    logger.info(f"XHS worker 启动: keywords={keywords}, max_notes={max_notes}, headless={headless}")
+    logger.info(f"[小红书立即爬取] 启动: keywords={keywords}, max_notes={max_notes}, headless={headless}")
 
-    # 预热 LLM（子进程独立运行，需单独预热，避免首次提取超慢）
-    if do_process:
-        try:
-            from backend.services.llm_warmup import warmup_llm
-            warmup_llm(timeout=120)
-        except Exception as e:
-            logger.warning(f"LLM 预热跳过: {e}")
+    # LLM 已在 main.py 启动时预热，子进程无需重复预热
 
     from backend.services.crawler.xhs_crawler import XHSCrawler
     from backend.services.sqlite_service import sqlite_service
     from backend.services.crawler.crawl_helpers import save_xhs_post
 
     crawler = XHSCrawler(headless=headless)
-    posts = crawler.discover(keywords=keywords, max_notes_per_keyword=max_notes)
+    posts = crawler.discover(keywords=keywords, max_notes_per_keyword=max_notes, crawl_source="立即爬取")
 
     discovered = 0
     for p in posts:
         if save_xhs_post(p, sqlite_service, download_images_flag=True):
             discovered += 1
 
-    logger.info(f"XHS worker 发现完成: {len(posts)} 条原始帖, {discovered} 条新入队")
+    logger.info(f"[小红书立即爬取] 发现完成: {len(posts)} 条原始帖, {discovered} 条新入队")
 
     questions_added = 0
     if do_process and discovered > 0:
         from backend.services.scheduler import _process_pending_tasks
         questions_added = _process_pending_tasks(batch_size=discovered + 5)
-        logger.info(f"XHS worker 处理完成: {questions_added} 道题入库")
+        logger.info(f"[小红书立即爬取] 处理完成: {questions_added} 道题入库")
 
     # 最后一行输出 JSON 供父进程读取结果
     result = {"discovered": discovered, "questions_added": questions_added}

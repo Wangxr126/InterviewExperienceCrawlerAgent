@@ -37,6 +37,7 @@
         <IngestView  v-show="currentView === 'ingest'" :user-id="userId"
                      @ingested="loadMeta" />
         <CollectView v-show="currentView === 'collect'" />
+        <SchedulerView v-show="currentView === 'scheduler'" />
         <ReportView   v-show="currentView === 'report'"   :user-id="userId"
                       :is-active="currentView === 'report'" />
         <FinetuneView v-show="currentView === 'finetune'" />
@@ -57,6 +58,7 @@ import BrowseView   from './views/BrowseView.vue'
 import ChatView     from './views/ChatView.vue'
 import IngestView   from './views/IngestView.vue'
 import CollectView  from './views/CollectView.vue'
+import SchedulerView from './views/SchedulerView.vue'
 import ReportView   from './views/ReportView.vue'
 import FinetuneView from './views/FinetuneView.vue'
 import MasteryDialog from './components/MasteryDialog.vue'
@@ -78,6 +80,7 @@ const navItems = [
   { key: 'chat',     icon: '💬', label: '练习对话' },
   { key: 'ingest',   icon: '🔗', label: '收录面经' },
   { key: 'collect',  icon: '🕷️', label: '数据采集' },
+  { key: 'scheduler', icon: '⏰', label: '定时任务' },
   { key: 'report',   icon: '📊', label: '学习报告' },
   { key: 'finetune', icon: '🧪', label: '微调标注' },
 ]
@@ -101,10 +104,37 @@ const loadConfig = async () => {
 
 // 发送到对话：切换视图并预填消息
 const onSendToChat = ({ question }) => {
+  // 安全检查
+  if (!question) {
+    ElMessage.error('题目数据为空')
+    console.error('❌ question 为空')
+    return
+  }
+  
+  if (!question.question_text) {
+    ElMessage.error('题目内容缺失')
+    console.error('❌ question.question_text 不存在，question:', question)
+    return
+  }
+  
+  console.log('✅ 切换到对话页面，题目:', question.question_text.slice(0, 30))
   currentView.value = 'chat'
-  chatViewRef.value?.prefillAndSend(
-    `我想练习这道题：${question.question_text.slice(0, 50)}`
-  )
+  
+  // 使用 nextTick + setTimeout 确保 ChatView 已完全激活
+  nextTick(() => {
+    setTimeout(() => {
+      if (!chatViewRef.value) {
+        ElMessage.error('对话组件未就绪，请稍后再试')
+        console.error('❌ chatViewRef.value 为 null')
+        return
+      }
+      
+      console.log('✅ 调用 prefillAndSend')
+      chatViewRef.value.prefillAndSend(
+        `我想练习这道题：${question.question_text.slice(0, 50)}`
+      )
+    }, 200)
+  })
 }
 
 // 报告页推荐 → 跳转对话

@@ -39,7 +39,7 @@ class SqliteService:
             # ── 题目元数据补充表（与 Neo4j 双写，支持结构化过滤）──
             """
             CREATE TABLE IF NOT EXISTS questions (
-                q_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                q_id            TEXT PRIMARY KEY,
                 question_text   TEXT NOT NULL,
                 answer_text     TEXT,
                 difficulty      TEXT DEFAULT 'medium',
@@ -1053,6 +1053,20 @@ class SqliteService:
         """获取待处理任务"""
         where = "WHERE status = 'pending'"
         params = []
+        if platform:
+            where += " AND source_platform = ?"
+            params.append(platform)
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                f"SELECT * FROM crawl_tasks {where} ORDER BY discovered_at ASC LIMIT ?",
+                params + [limit]
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def get_tasks_by_status(self, status: str, platform: str = None, limit: int = 100) -> List[Dict]:
+        """根据状态获取任务"""
+        where = "WHERE status = ?"
+        params = [status]
         if platform:
             where += " AND source_platform = ?"
             params.append(platform)

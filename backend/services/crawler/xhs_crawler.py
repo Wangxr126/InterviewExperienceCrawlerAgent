@@ -251,7 +251,7 @@ def get_xhs_links_with_playwright(
                 if note_id not in processed_ids and note_id:
                     processed_ids.add(note_id)
                     results.append({"title": title, "link": current_url})
-                    logger.info(f"XHS 获取链接 [{len(results)}/{max_notes}]: {title[:25]}...")
+                    logger.info(f"XHS 获取链接 [{len(results)}/{max_notes}]: {title[:30]}")
 
                 try:
                     page.go_back(wait_until="domcontentloaded", timeout=10000)
@@ -354,6 +354,19 @@ async def _fetch_xhs_with_playwright(url: str, headless: bool = True) -> Dict | 
         logger.warning("Playwright 未安装，无法使用浏览器兜底抓取")
         return None
 
+    # Windows 必须使用 ProactorEventLoop 支持子进程
+    if os.name == "nt":
+        import sys
+        if sys.platform == "win32":
+            try:
+                loop = asyncio.get_running_loop()
+                # 如果当前 loop 不是 ProactorEventLoop，记录警告但继续
+                if not isinstance(loop, asyncio.ProactorEventLoop):
+                    logger.debug("当前 event loop 不是 ProactorEventLoop，Playwright 可能失败")
+            except RuntimeError:
+                # 没有运行中的 loop，设置策略
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
     user_data = _user_data_dir()
     os.makedirs(user_data, exist_ok=True)
     for lock_name in ("SingletonLock", "SingletonCookie", "lockfile"):
@@ -363,14 +376,6 @@ async def _fetch_xhs_with_playwright(url: str, headless: bool = True) -> Dict | 
                 os.remove(lock_path)
             except Exception:
                 pass
-
-    if os.name == "nt":
-        import sys
-        if sys.platform == "win32":
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
     async with async_playwright() as p:
         browser = await p.chromium.launch_persistent_context(
@@ -422,7 +427,7 @@ async def _fetch_xhs_with_playwright(url: str, headless: bool = True) -> Dict | 
                 await browser.close()
                 return {"title": (title or "").strip(), "content": (content or "").strip(), "image_urls": img_urls}
         except Exception as e:
-            logger.debug(f"Playwright 抓取失败 {url}: {e}")
+            logger.debug(f"Playwright 兜底抓取失败（可能是 event loop 问题）: {url[:60]}")
         await browser.close()
     return None
 
@@ -483,7 +488,7 @@ async def _async_fetch_details(links: List[str]) -> List[Dict]:
                 "source_url": url,
                 "source_platform": "xiaohongshu",
             })
-            logger.info(f"XHS [{idx}/{len(links)}] 详情: {clean_title[:20]}... ({len(content)}字)")
+            logger.info(f"XHS 获取详情 [{idx}/{len(links)}]: {clean_title[:30]} ({len(content)}字)")
             await asyncio.sleep(random.uniform(3, 6))
 
         except Exception as e:
@@ -560,10 +565,12 @@ class XHSCrawler:
         self,
         keywords: List[str] = None,
         max_notes_per_keyword: int = None,
+        crawl_source: str = "未知",
     ) -> List[Dict]:
         """
         搜索多个关键词，返回帖子（含详情内容）。
         keywords/max_notes_per_keyword 未传时从 .env 读取默认值。
+        crawl_source: 爬取来源标识，用于日志区分（如 "立即爬取"、"定时爬取"）
         """
         cfg = _cfg()
         keywords = keywords or cfg.xhs_keywords
@@ -573,7 +580,7 @@ class XHSCrawler:
         seen_urls: set = set()
 
         for kw in keywords:
-            logger.info(f"XHS 开始搜索关键词: {kw!r}")
+            logger.info(f"[小红书{crawl_source}] 开始搜索关键词: {kw!r}")
             link_list = get_xhs_links_with_playwright(
                 keyword=kw,
                 max_notes=max_notes,
@@ -596,5 +603,5 @@ class XHSCrawler:
                 p["discover_keyword"] = kw
                 all_posts.append(p)
 
-        logger.info(f"XHS 共获取 {len(all_posts)} 条帖子详情")
+        logger.info(f"[小红书{crawl_source}] 共获取 {len(all_posts)} 条帖子详情")
         return all_posts

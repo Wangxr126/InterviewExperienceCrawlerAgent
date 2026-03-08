@@ -178,14 +178,27 @@ const clearChat = () => {
 }
 
 const prefillAndSend = (text) => {
+  console.log('🟣 ChatView: prefillAndSend 被调用')
+  console.log('🟣 text:', text)
+  console.log('🟣 loading.value:', loading.value)
   inputText.value = text
-  nextTick(() => send())
+  console.log('🟣 inputText.value 已设置:', inputText.value)
+  nextTick(() => {
+    console.log('🟣 nextTick 中调用 send()')
+    send()
+  })
 }
 defineExpose({ prefillAndSend })
 
 const send = async () => {
+  console.log('🟣 send() 被调用')
   const text = inputText.value.trim()
-  if (!text || loading.value) return
+  console.log('🟣 text:', text)
+  console.log('🟣 loading.value:', loading.value)
+  if (!text || loading.value) {
+    console.log('🟣 send() 提前返回：text 为空或正在加载')
+    return
+  }
 
   inputText.value = ''
   messages.value.push({ role: 'user', content: text, thinking: [], thinkingOpen: false })
@@ -246,7 +259,9 @@ const send = async () => {
             } else if (payload.error) {
               aiMsg.content = `⚠️ ${payload.error}`
             }
-          } catch {
+          } catch (parseError) {
+            console.error('🔴 JSON 解析失败:', parseError)
+            console.error('🔴 原始数据:', trimmed.slice(6))
             aiMsg.content += trimmed.slice(6)
             scrollToBottom()
           }
@@ -258,8 +273,14 @@ const send = async () => {
     streamingMsg.value = null
 
   } catch (err) {
+    console.error('🔴 流式接口错误:', err)
+    console.error('🔴 错误类型:', err.name)
+    console.error('🔴 错误消息:', err.message)
+    console.error('🔴 错误堆栈:', err.stack)
+    
     if (err.name === 'AbortError') {
       // 用户中止
+      console.log('🟡 用户中止请求')
     } else {
       console.warn('流式接口失败，降级到普通接口', err)
       try {

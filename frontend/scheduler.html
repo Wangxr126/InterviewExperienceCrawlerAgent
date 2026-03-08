@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>定时任务管理</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            color: #333;
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .stat-card h3 {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+
+        .stat-card .value {
+            color: #333;
+            font-size: 32px;
+            font-weight: bold;
+        }
+
+        .actions {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 30px;
+            display: flex;
+            gap: 10px;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s;
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #5568d3;
+        }
+
+        .btn-success {
+            background: #48bb78;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #38a169;
+        }
+
+        .btn-danger {
+            background: #f56565;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #e53e3e;
+        }
+
+        .btn-secondary {
+            background: #718096;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #4a5568;
+        }
+
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+
+        .jobs-table {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        thead {
+            background: #f7fafc;
+        }
+
+        th {
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            color: #4a5568;
+            font-size: 14px;
+            border-bottom: 2px solid #e2e8f0;
+        }
+
+        td {
+            padding: 15px;
+            border-bottom: 1px solid #e2e8f0;
+            font-size: 14px;
+            color: #2d3748;
+        }
+
+        tbody tr:hover {
+            background: #f7fafc;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .status-enabled {
+            background: #c6f6d5;
+            color: #22543d;
+        }
+
+        .status-disabled {
+            background: #fed7d7;
+            color: #742a2a;
+        }
+
+        .status-success {
+            background: #c6f6d5;
+            color: #22543d;
+        }
+
+        .status-error {
+            background: #fed7d7;
+            color: #742a2a;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        .modal-content {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            max-width: 600px;
+            width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            margin-bottom: 20px;
+        }
+
+        .modal-header h2 {
+            color: #333;
+            font-size: 24px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #4a5568;
+            font-weight: 500;
+            font-size: 14px;
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        .form-group textarea {
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+
+        .modal-footer {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 30px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #718096;
+        }
+
+        .empty-state svg {
+            width: 80px;
+            height: 80px;
+            margin-bottom: 20px;
+            opacity: 0.5;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #718096;
+        }
+
+        .job-type-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 500;
+            background: #e6fffa;
+            color: #234e52;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- 头部 -->
+        <div class="header">
+            <h1>⏰ 定时任务管理</h1>
+            <p>管理面经爬取的定时任务，支持动态增删改查</p>
+        </div>
+
+        <!-- 统计卡片 -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>总任务数</h3>
+                <div class="value" id="stat-total">-</div>
+            </div>
+            <div class="stat-card">
+                <h3>启用中</h3>
+                <div class="value" id="stat-enabled">-</div>
+            </div>
+            <div class="stat-card">
+                <h3>已禁用</h3>
+                <div class="value" id="stat-disabled">-</div>
+            </div>
+            <div class="stat-card">
+                <h3>调度器状态</h3>
+                <div class="value" id="stat-running">-</div>
+            </div>
+        </div>
+
+        <!-- 操作按钮 -->
+        <div class="actions">
+            <button class="btn btn-primary" onclick="openCreateModal()">
+                ➕ 创建新任务
+            </button>
+            <button class="btn btn-secondary" onclick="reloadJobs()">
+                🔄 重新加载
+            </button>
+            <button class="btn btn-secondary" onclick="loadJobs()">
+                🔍 刷新列表
+            </button>
+        </div>
+
+        <!-- 任务列表 -->
+        <div class="jobs-table">
+            <table>
+                <thead>
+                    <tr>
+                        <th>任务名称</th>
+                        <th>类型</th>
+                        <th>调度配置</th>
+                        <th>状态</th>
+                        <th>下次运行</th>
+                        <th>运行次数</th>
+                        <th>上次状态</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="jobs-tbody">
+                    <tr>
+                        <td colspan="8" class="loading">加载中...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- 创建/编辑任务模态框 -->
+    <div class="modal" id="job-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-title">创建新任务</h2>
+            </div>
+            <form id="job-form">
+                <div class="form-group">
+                    <label>任务名称 *</label>
+                    <input type="text" id="job-name" required>
+                </div>
+
+                <div class="form-group">
+                    <label>任务类型 *</label>
+                    <select id="job-type" required onchange="updateJobParams()">
+                        <option value="">请选择</option>
+                        <option value="nowcoder_discovery">牛客面经发现</option>
+                        <option value="xhs_discovery">小红书面经发现</option>
+                        <option value="process_tasks">任务队列处理</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>调度类型 *</label>
+                    <select id="schedule-type" required onchange="updateScheduleConfig()">
+                        <option value="cron">Cron 表达式</option>
+                        <option value="interval">间隔时间</option>
+                    </select>
+                </div>
+
+                <div id="schedule-config-cron">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>小时</label>
+                            <input type="text" id="cron-hour" placeholder="如: 2,14 或 *">
+                        </div>
+                        <div class="form-group">
+                            <label>分钟</label>
+                            <input type="text" id="cron-minute" placeholder="如: 0 或 */30">
+                        </div>
+                    </div>
+                </div>
+
+                <div id="schedule-config-interval" style="display: none;">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>小时</label>
+                            <input type="number" id="interval-hours" min="0" value="0">
+                        </div>
+                        <div class="form-group">
+                            <label>分钟</label>
+                            <input type="number" id="interval-minutes" min="0" value="0">
+                        </div>
+                    </div>
+                </div>
+
+                <div id="job-params-container"></div>
+
+                <div class="form-group">
+                    <label>任务描述</label>
+                    <textarea id="job-description"></textarea>
+                </div>
+
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="job-enabled" checked>
+                        启用任务
+                    </label>
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button>
+                    <button type="submit" class="btn btn-primary">保存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        let currentEditJobId = null;
+
+        // 页面加载时初始化
+        document.addEventListener('DOMContentLoaded', () => {
+            loadJobs();
+            loadStats();
+        });
+
+        // 加载任务列表
+        async function loadJobs() {
+            try {
+                const response = await fetch('/api/scheduler/jobs');
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    renderJobs(result.data);
+                }
+            } catch (error) {
+                console.error('加载任务失败:', error);
+                document.getElementById('jobs-tbody').innerHTML = `
+                    <tr><td colspan="8" class="empty-state">加载失败: ${error.message}</td></tr>
+                `;
+            }
+        }
+
+        // 加载统计信息
+        async function loadStats() {
+            try {
+                const response = await fetch('/api/scheduler/stats');
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    const stats = result.data;
+                    document.getElementById('stat-total').textContent = stats.total_jobs;
+                    document.getElementById('stat-enabled').textContent = stats.enabled_jobs;
+                    document.getElementById('stat-disabled').textContent = stats.disabled_jobs;
+                    document.getElementById('stat-running').textContent = stats.running ? '运行中' : '已停止';
+                }
+            } catch (error) {
+                console.error('加载统计失败:', error);
+            }
+        }
+
+        // 渲染任务列表
+        function renderJobs(jobs) {
+            const tbody = document.getElementById('jobs-tbody');
+            
+            if (jobs.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="8" class="empty-state">
+                            <div>暂无定时任务</div>
+                            <div style="margin-top: 10px;">
+                                <button class="btn btn-primary" onclick="openCreateModal()">创建第一个任务</button>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+
+            tbody.innerHTML = jobs.map(job => `
+                <tr>
+                    <td>
+                        <strong>${job.job_name}</strong>
+                        ${job.description ? `<br><small style="color: #718096;">${job.description}</small>` : ''}
+                    </td>
+                    <td>
+                        <span class="job-type-badge">${getJobTypeLabel(job.job_type)}</span>
+                    </td>
+                    <td>${formatSchedule(job)}</td>
+                    <td>
+                        <span class="status-badge ${job.enabled ? 'status-enabled' : 'status-disabled'}">
+                            ${job.enabled ? '启用' : '禁用'}
+                        </span>
+                    </td>
+                    <td>${job.next_run_at ? new Date(job.next_run_at).toLocaleString('zh-CN') : '-'}</td>
+                    <td>${job.run_count}</td>
+                    <td>
+                        ${job.last_status ? `
+                            <span class="status-badge status-${job.last_status}">
+                                ${job.last_status === 'success' ? '成功' : '失败'}
+                            </span>
+                        ` : '-'}
+                    </td>
+                    <td>
+                        <button class="btn btn-success btn-sm" onclick="triggerJob('${job.job_id}')">▶️ 运行</button>
+                        <button class="btn btn-primary btn-sm" onclick="editJob('${job.job_id}')">✏️ 编辑</button>
+                        ${job.enabled ? 
+                            `<button class="btn btn-secondary btn-sm" onclick="toggleJob('${job.job_id}', false)">⏸️ 禁用</button>` :
+                            `<button class="btn btn-success btn-sm" onclick="toggleJob('${job.job_id}', true)">▶️ 启用</button>`
+                        }
+                        <button class="btn btn-danger btn-sm" onclick="deleteJob('${job.job_id}')">🗑️ 删除</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        // 格式化调度配置
+        function formatSchedule(job) {
+            if (job.schedule_type === 'cron') {
+                const config = job.schedule_config;
+                return `Cron: ${config.minute || '*'} ${config.hour || '*'} ${config.day || '*'} ${config.month || '*'} ${config.day_of_week || '*'}`;
+            } else {
+                const config = job.schedule_config;
+                const parts = [];
+                if (config.hours) parts.push(`${config.hours}小时`);
+                if (config.minutes) parts.push(`${config.minutes}分钟`);
+                if (config.seconds) parts.push(`${config.seconds}秒`);
+                return `间隔: ${parts.join(' ')}`;
+            }
+        }
+
+        // 获取任务类型标签
+        function getJobTypeLabel(type) {
+            const labels = {
+                'nowcoder_discovery': '牛客发现',
+                'xhs_discovery': '小红书发现',
+                'process_tasks': '任务处理'
+            };
+            return labels[type] || type;
+        }
+
+        // 打开创建模态框
+        function openCreateModal() {
+            currentEditJobId = null;
+            document.getElementById('modal-title').textContent = '创建新任务';
+            document.getElementById('job-form').reset();
+            document.getElementById('job-modal').classList.add('active');
+            updateScheduleConfig();
+            updateJobParams();
+        }
+
+        // 编辑任务
+        async function editJob(jobId) {
+            try {
+                const response = await fetch(`/api/scheduler/jobs/${jobId}`);
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    const job = result.data;
+                    currentEditJobId = jobId;
+                    
+                    document.getElementById('modal-title').textContent = '编辑任务';
+                    document.getElementById('job-name').value = job.job_name;
+                    document.getElementById('job-type').value = job.job_type;
+                    document.getElementById('schedule-type').value = job.schedule_type;
+                    document.getElementById('job-description').value = job.description || '';
+                    document.getElementById('job-enabled').checked = job.enabled;
+                    
+                    // 填充调度配置
+                    if (job.schedule_type === 'cron') {
+                        document.getElementById('cron-hour').value = job.schedule_config.hour || '*';
+                        document.getElementById('cron-minute').value = job.schedule_config.minute || '*';
+                    } else {
+                        document.getElementById('interval-hours').value = job.schedule_config.hours || 0;
+                        document.getElementById('interval-minutes').value = job.schedule_config.minutes || 0;
+                    }
+                    
+                    updateScheduleConfig();
+                    updateJobParams();
+                    
+                    // 填充任务参数
+                    fillJobParams(job.job_type, job.job_params);
+                    
+                    document.getElementById('job-modal').classList.add('active');
+                }
+            } catch (error) {
+                alert('加载任务失败: ' + error.message);
+            }
+        }
+
+        // 填充任务参数
+        function fillJobParams(jobType, params) {
+            if (jobType === 'nowcoder_discovery') {
+                document.getElementById('nowcoder-keywords').value = params.keywords?.join(', ') || '';
+                document.getElementById('nowcoder-max-pages').value = params.max_pages || 2;
+            } else if (jobType === 'xhs_discovery') {
+                document.getElementById('xhs-keywords').value = params.keywords?.join(', ') || '';
+                document.getElementById('xhs-max-notes').value = params.max_notes_per_keyword || 10;
+                document.getElementById('xhs-headless').checked = params.headless !== false;
+            } else if (jobType === 'process_tasks') {
+                document.getElementById('process-batch-size').value = params.batch_size || 10;
+            }
+        }
+
+        // 关闭模态框
+        function closeModal() {
+            document.getElementById('job-modal').classList.remove('active');
+        }
+
+        // 更新调度配置显示
+        function updateScheduleConfig() {
+            const scheduleType = document.getElementById('schedule-type').value;
+            document.getElementById('schedule-config-cron').style.display = scheduleType === 'cron' ? 'block' : 'none';
+            document.getElementById('schedule-config-interval').style.display = scheduleType === 'interval' ? 'block' : 'none';
+        }
+
+        // 更新任务参数显示
+        function updateJobParams() {
+            const jobType = document.getElementById('job-type').value;
+            const container = document.getElementById('job-params-container');
+            
+            if (jobType === 'nowcoder_discovery') {
+                container.innerHTML = `
+                    <div class="form-group">
+                        <label>关键词（逗号分隔）*</label>
+                        <input type="text" id="nowcoder-keywords" placeholder="如: Java后端, Python后端" required>
+                    </div>
+                    <div class="form-group">
+                        <label>最大页数 *</label>
+                        <input type="number" id="nowcoder-max-pages" min="1" value="2" required>
+                    </div>
+                `;
+            } else if (jobType === 'xhs_discovery') {
+                container.innerHTML = `
+                    <div class="form-group">
+                        <label>关键词（逗号分隔）*</label>
+                        <input type="text" id="xhs-keywords" placeholder="如: Java面经, Python面经" required>
+                    </div>
+                    <div class="form-group">
+                        <label>每个关键词最大笔记数 *</label>
+                        <input type="number" id="xhs-max-notes" min="1" value="10" required>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="xhs-headless" checked>
+                            无头模式（需已登录）
+                        </label>
+                    </div>
+                `;
+            } else if (jobType === 'process_tasks') {
+                container.innerHTML = `
+                    <div class="form-group">
+                        <label>批处理大小 *</label>
+                        <input type="number" id="process-batch-size" min="1" value="10" required>
+                    </div>
+                `;
+            } else {
+                container.innerHTML = '';
+            }
+        }
+
+        // 提交表单
+        document.getElementById('job-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const jobType = document.getElementById('job-type').value;
+            const scheduleType = document.getElementById('schedule-type').value;
+            
+            // 构建调度配置
+            let scheduleConfig = {};
+            if (scheduleType === 'cron') {
+                scheduleConfig = {
+                    hour: document.getElementById('cron-hour').value || '*',
+                    minute: document.getElementById('cron-minute').value || '*',
+                    day: '*',
+                    month: '*',
+                    day_of_week: '*'
+                };
+            } else {
+                scheduleConfig = {
+                    hours: parseInt(document.getElementById('interval-hours').value) || 0,
+                    minutes: parseInt(document.getElementById('interval-minutes').value) || 0,
+                    seconds: 0
+                };
+            }
+            
+            // 构建任务参数
+            let jobParams = {};
+            if (jobType === 'nowcoder_discovery') {
+                jobParams = {
+                    keywords: document.getElementById('nowcoder-keywords').value.split(',').map(k => k.trim()),
+                    max_pages: parseInt(document.getElementById('nowcoder-max-pages').value)
+                };
+            } else if (jobType === 'xhs_discovery') {
+                jobParams = {
+                    keywords: document.getElementById('xhs-keywords').value.split(',').map(k => k.trim()),
+                    max_notes_per_keyword: parseInt(document.getElementById('xhs-max-notes').value),
+                    headless: document.getElementById('xhs-headless').checked
+                };
+            } else if (jobType === 'process_tasks') {
+                jobParams = {
+                    batch_size: parseInt(document.getElementById('process-batch-size').value)
+                };
+            }
+            
+            const data = {
+                job_name: document.getElementById('job-name').value,
+                job_type: jobType,
+                schedule_type: scheduleType,
+                schedule_config: scheduleConfig,
+                job_params: jobParams,
+                enabled: document.getElementById('job-enabled').checked,
+                description: document.getElementById('job-description').value
+            };
+            
+            try {
+                let response;
+                if (currentEditJobId) {
+                    response = await fetch(`/api/scheduler/jobs/${currentEditJobId}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(data)
+                    });
+                } else {
+                    response = await fetch('/api/scheduler/jobs', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(data)
+                    });
+                }
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    alert(currentEditJobId ? '任务更新成功' : '任务创建成功');
+                    closeModal();
+                    loadJobs();
+                    loadStats();
+                } else {
+                    alert('操作失败: ' + (result.detail || '未知错误'));
+                }
+            } catch (error) {
+                alert('操作失败: ' + error.message);
+            }
+        });
+
+        // 触发任务
+        async function triggerJob(jobId) {
+            if (!confirm('确定要立即运行此任务吗？')) return;
+            
+            try {
+                const response = await fetch(`/api/scheduler/jobs/${jobId}/trigger`, {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    alert('任务已触发，请查看日志了解执行结果');
+                    loadJobs();
+                } else {
+                    alert('触发失败: ' + (result.detail || '未知错误'));
+                }
+            } catch (error) {
+                alert('触发失败: ' + error.message);
+            }
+        }
+
+        // 切换任务状态
+        async function toggleJob(jobId, enable) {
+            try {
+                const endpoint = enable ? 'enable' : 'disable';
+                const response = await fetch(`/api/scheduler/jobs/${jobId}/${endpoint}`, {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    loadJobs();
+                    loadStats();
+                } else {
+                    alert('操作失败: ' + (result.detail || '未知错误'));
+                }
+            } catch (error) {
+                alert('操作失败: ' + error.message);
+            }
+        }
+
+        // 删除任务
+        async function deleteJob(jobId) {
+            if (!confirm('确定要删除此任务吗？此操作不可恢复！')) return;
+            
+            try {
+                const response = await fetch(`/api/scheduler/jobs/${jobId}`, {
+                    method: 'DELETE'
+                });
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    alert('任务已删除');
+                    loadJobs();
+                    loadStats();
+                } else {
+                    alert('删除失败: ' + (result.detail || '未知错误'));
+                }
+            } catch (error) {
+                alert('删除失败: ' + error.message);
+            }
+        }
+
+        // 重新加载任务
+        async function reloadJobs() {
+            try {
+                const response = await fetch('/api/scheduler/reload', {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    alert('任务已重新加载');
+                    loadJobs();
+                } else {
+                    alert('重新加载失败: ' + (result.detail || '未知错误'));
+                }
+            } catch (error) {
+                alert('重新加载失败: ' + error.message);
+            }
+        }
+    </script>
+</body>
+</html>

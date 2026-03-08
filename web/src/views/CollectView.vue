@@ -133,7 +133,7 @@
           <el-button type="warning" :loading="retryLoading" @click.prevent="retryErrors">重试失败项</el-button>
         </el-tooltip>
         <el-tooltip content="将「已完成」或「失败」且有正文的帖子全部重新提取（删除旧题目后用 LLM 重新提取）" placement="top">
-          <el-button type="info" :loading="reExtractLoading" @click.prevent="reExtractAll">重新提取所有</el-button>
+          <el-button type="info" :loading="reExtractLoading" @click.prevent="showReExtractDialog = true">重新提取所有</el-button>
         </el-tooltip>
         <el-tooltip content="先抓取「待抓取」帖子的正文，再对「待提取」的做 LLM 提取，同步等待完成" placement="top">
           <el-button type="success" :loading="processLoading" @click.prevent="processQueue">抓取正文并提取</el-button>
@@ -194,6 +194,7 @@
         </div>
       </div>
       <el-table :data="tasks" size="small" class="post-table" stripe>
+        <el-table-column label="ID" prop="id" width="60" align="center" />
         <el-table-column label="关键词" prop="discover_keyword" width="88" show-overflow-tooltip>
           <template #default="{ row }">{{ row.discover_keyword || '—' }}</template>
         </el-table-column>
@@ -256,6 +257,36 @@
         />
       </div>
     </div>
+
+    <!-- 重新提取所有确认弹窗 -->
+    <el-dialog v-model="showReExtractDialog" width="440px" align-center class="clear-all-dialog"
+               :close-on-click-modal="false" :show-close="true">
+      <template #header>
+        <div class="clear-all-header">
+          <div class="clear-all-icon-wrap">
+            <el-icon class="warn-icon"><WarningFilled /></el-icon>
+          </div>
+          <h3 class="clear-all-title">重新提取所有题目</h3>
+        </div>
+      </template>
+      <div class="clear-all-body">
+        <p class="clear-all-desc">此操作将对所有有正文的帖子重新调用 LLM 提取面试题：</p>
+        <div class="clear-all-items">
+          <div class="clear-all-item">删除所有已提取的面试题</div>
+          <div class="clear-all-item">重置所有帖子状态为「待提取」</div>
+          <div class="clear-all-item">重新调用 LLM 提取所有题目</div>
+        </div>
+        <p class="clear-all-tip">此操作会清除所有已提取的题目信息，请谨慎操作。</p>
+      </div>
+      <template #footer>
+        <div class="clear-all-footer">
+          <el-button size="large" @click="showReExtractDialog = false">取消</el-button>
+          <el-button type="warning" size="large" :loading="reExtractLoading" @click="confirmReExtractAll">
+            确认重新提取
+          </el-button>
+        </div>
+      </template>
+    </el-dialog>
 
     <!-- 清除所有确认弹窗 -->
     <el-dialog v-model="showClearAllDialog" width="440px" align-center class="clear-all-dialog"
@@ -356,6 +387,7 @@ const contentDialogTitle    = ref('')
 const contentDialogText     = ref('')
 const contentLoading        = ref(false)
 const showClearAllDialog    = ref(false)
+const showReExtractDialog   = ref(false)
 const clearAllLoading       = ref(false)
 const crawlPolling          = ref(false)
 const crawlDiscovered       = ref(0)
@@ -736,6 +768,29 @@ const reExtractAll = async () => {
     await loadTasks()
   } catch {
     extractMsg.value = { ok: false, text: '重新提取请求失败，请确认后端已运行' }
+  } finally {
+    reExtractLoading.value = false
+  }
+}
+
+const confirmReExtractAll = async () => {
+  reExtractLoading.value = true
+  extractMsg.value = null
+  extractPolling.value = false
+  try {
+    await loadStats()
+    const d = await api.reExtractAll(50)
+    showReExtractDialog.value = false
+    extractMsg.value = { ok: true, text: `🔄 ${d.message}` }
+    if ((d.reset ?? 0) > 0) {
+      extractPolling.value = true
+    }
+    await loadStats()
+    await loadTasks()
+    ElMessage.success(d.message || '已开始重新提取')
+  } catch {
+    extractMsg.value = { ok: false, text: '重新提取请求失败，请确认后端已运行' }
+    ElMessage.error('重新提取失败')
   } finally {
     reExtractLoading.value = false
   }

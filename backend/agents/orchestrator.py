@@ -602,6 +602,40 @@ class InterviewSystemOrchestrator:
             session_id=session_id
         )
 
+
+        # ── 📝 记录详细的交互日志（推理过程、工具调用等）──
+        try:
+            from backend.services.interviewer_logger import get_interviewer_logger
+            interviewer_logger = get_interviewer_logger()
+            
+            # 记录完整对话
+            interviewer_logger.log_chat(
+                user_id=user_id,
+                session_id=session_id,
+                user_message=message,
+                ai_response=response,
+                thinking_steps=thinking_steps,
+                metadata={
+                    "has_resume": bool(resume),
+                    "resume_length": len(resume) if resume else 0,
+                    "memory_context": memory_context[:200] if memory_context else None,
+                    "full_input_length": len(full_input)
+                }
+            )
+            
+            # 记录详细推理过程
+            if thinking_steps:
+                interviewer_logger.log_thinking(
+                    user_id=user_id,
+                    session_id=session_id,
+                    user_message=message,
+                    thinking_steps=thinking_steps
+                )
+            
+            logger.debug(f"Log saved to interviewer_logs/")
+        except Exception as log_err:
+            logger.warning(f"Failed to save log: {log_err}")
+
         return response, thinking_steps
 
     # ===========================================================

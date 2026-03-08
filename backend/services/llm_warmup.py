@@ -66,6 +66,11 @@ def _start_ollama_serve():
         env = os.environ.copy()
         env["OLLAMA_KEEP_ALIVE"] = "-1"  # 模型常驻显存，不自动卸载
         
+        # 设置 UTF-8 编码（Windows）
+        if sys.platform == "win32":
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUTF8"] = "1"
+        
         if sys.platform == "win32":
             subprocess.Popen(
                 ["ollama", "serve"],

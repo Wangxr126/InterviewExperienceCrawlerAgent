@@ -476,70 +476,93 @@ def _collect_image_urls_from_dom(soup: BeautifulSoup) -> List[str]:
 
 def _collect_image_urls_from_json(html: str) -> List[str]:
     """
-    从 __INITIAL_STATE__ 中提取图片URL（参考test4.py的正确实现）
-    牛客网的图片数据存储在页面的JSON中，不在HTML标签里
+    从 __INITIAL_STATE__ 中提取图片URL
+    关键发现：用户上传的图片存储在 imgMoment 数组中，不在 content 文本里！
     """
     images = []
     
-    # 查找 __INITIAL_STATE__ 的JSON数据
-    match = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});', html, re.DOTALL)
+    # 查找 __INITIAL_STATE__ 的JSON数据（使用手动解析，避免正则匹配问题）
+    match = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{)', html)
     if not match:
         return images
     
-    try:
-        data = json.loads(match.group(1))
-        
-        # feed页面：prefetchData 可能是字典或数组，需要遍历找到 ssrCommonData.contentData
-        prefetch = data.get('prefetchData')
-        if prefetch:
-            # 如果是字典，转为列表
-            if isinstance(prefetch, dict):
-                prefetch = list(prefetch.values())
-            
-            # 遍历查找 contentData
-            if isinstance(prefetch, list):
-                for item in prefetch:
-                    if not isinstance(item, dict):
-                        continue
-                    
-                    # 查找 ssrCommonData.contentData
-                    ssr = item.get('ssrCommonData') or item.get('ssrData')
-                    if isinstance(ssr, dict):
-                        content_data = ssr.get('contentData')
-                        if isinstance(content_data, dict):
-                            content = content_data.get('content', '')
-                            if content:
-                                # 从content字段中提取图片URL
-                                # 格式1: ![](https://...)
-                                img_urls = re.findall(r'!\[.*?\]\((https?://[^\)]+)\)', content)
-                                images.extend(img_urls)
-                                
-                                # 格式2: <img src="https://...">
-                                img_urls = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', content)
-                                images.extend(img_urls)
-                                
-                                # 格式3: 直接的图片URL
-                                img_urls = re.findall(r'(https://uploadfiles\.nowcoder\.com/[^\s\)"\'\]]+)', content)
-                                images.extend(img_urls)
-        
-        # discuss页面：postDetail.content
-        if 'postDetail' in data and data['postDetail']:
-            content = data['postDetail'].get('content', '')
-            
-            # 格式1: ![](https://...)
-            img_urls = re.findall(r'!\[.*?\]\((https?://[^\)]+)\)', content)
-            images.extend(img_urls)
-            
-            # 格式2: <img src="https://...">
-            img_urls = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', content)
-            images.extend(img_urls)
-            
-            # 格式3: 直接的图片URL
-            img_urls = re.findall(r'(https://uploadfiles\.nowcoder\.com/[^\s\)"\'\]]+)', content)
-            images.extend(img_urls)
+    # 手动解析JSON（处理未闭合的字符串）
+    start = match.start(1)
+    depth = 0
+    i = start
+    in_str = None
+    escape = False
     
-    except Exception as e:
-        logger.warning(f"解析__INITIAL_STATE__图片失败: {e}")
+    while i < len(html) and i < start + 200000:  # 限制搜索范围
+        c = html[i]
+        
+        if in_str:
+            if escape:
+                escape = False
+            elif c == '\\':
+                escape = True
+            elif c == in_str:
+                in_str = None
+            i += 1
+            continue
+        
+        if c in ('"', "'"):
+            in_str = c
+        elif c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                json_str = html[start:i + 1]
+                try:
+                    data = json.loads(json_str)
+                    
+                    # feed页面：prefetchData.X.ssrCommonData.contentData.imgMoment
+                    prefetch = data.get('prefetchData')
+                    if prefetch:
+                        # 如果是字典，转为列表
+                        if isinstance(prefetch, dict):
+                            prefetch = list(prefetch.values())
+                        
+                        # 遍历查找 contentData
+                        if isinstance(prefetch, list):
+                            for item in prefetch:
+                                if not isinstance(item, dict):
+                                    continue
+                                
+                                # 查找 ssrCommonData.contentData
+                                ssr = item.get('ssrCommonData') or item.get('ssrData')
+                                if isinstance(ssr, dict):
+                                    content_data = ssr.get('contentData')
+                                    if isinstance(content_data, dict):
+                                        # 关键：从 imgMoment 数组提取图片
+                                        img_moment = content_data.get('imgMoment', [])
+                                        if isinstance(img_moment, list):
+                                            for img_item in img_moment:
+                                                if isinstance(img_item, dict):
+                                                    src = img_item.get('src', '')
+                                                    if src and _is_user_content_image_url(src):
+                                                        images.append(src)
+                                                elif isinstance(img_item, str) and _is_user_content_image_url(img_item):
+                                                    images.append(img_item)
+                    
+                    # discuss页面：postDetail.imgMoment
+                    if 'postDetail' in data and data['postDetail']:
+                        post_detail = data['postDetail']
+                        img_moment = post_detail.get('imgMoment', [])
+                        if isinstance(img_moment, list):
+                            for img_item in img_moment:
+                                if isinstance(img_item, dict):
+                                    src = img_item.get('src', '')
+                                    if src and _is_user_content_image_url(src):
+                                        images.append(src)
+                                elif isinstance(img_item, str) and _is_user_content_image_url(img_item):
+                                    images.append(img_item)
+                
+                except Exception as e:
+                    logger.warning(f"解析__INITIAL_STATE__图片失败: {e}")
+                break
+        i += 1
     
     # 去重并过滤表情包
     unique_images = []
@@ -876,10 +899,12 @@ class NowcoderCrawler:
         keywords: List[str] = None,
         max_pages: int = 3,
         check_db_dedup: bool = True,
+        crawl_source: str = "未知",
     ) -> List[Dict]:
         """
         批量发现面经帖子。
         check_db_dedup=True 时对已爬取链接去重。
+        crawl_source: 爬取来源标识，用于日志区分（如 "立即爬取"、"定时爬取"）
         """
         keywords = keywords or ["面经"]
         all_posts: List[Dict] = []
@@ -911,10 +936,10 @@ class NowcoderCrawler:
                         continue
                     all_posts.append(p)
                 if new_in_page == 0:
-                    logger.info(f"牛客 keyword={kw!r} page={page} 无新链接（全部重复），提前终止翻页")
+                    logger.info(f"[牛客{crawl_source}] keyword={kw!r} page={page} 无新链接（全部重复），提前终止翻页")
                     break
             time.sleep(random.uniform(1, 2))
 
         if skipped_db:
-            logger.info(f"牛客去重：数据库已有 {skipped_db} 条，本次新增 {len(all_posts)} 条")
+            logger.info(f"[牛客{crawl_source}] 去重：数据库已有 {skipped_db} 条，本次新增 {len(all_posts)} 条")
         return all_posts

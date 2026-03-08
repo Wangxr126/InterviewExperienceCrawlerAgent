@@ -1,4 +1,4 @@
-﻿"""
+"""
 面经爬取调度器
 职责：
   1. 定时发现新帖子（牛客 / 小红书）→ 写入 crawl_tasks 队列
@@ -87,11 +87,15 @@ def _run_nowcoder_discovery(keywords: List[str] = None, max_pages: int = None) -
     """牛客面经发现任务（keywords/max_pages 不传时从 .env 读取）。返回 (新增数, 发现列表)"""
     _keywords = keywords or cfg.NOWCODER_KEYWORDS
     _max_pages = max_pages if max_pages is not None else cfg.NOWCODER_MAX_PAGES
-    logger.info(f"🔍 牛客发现任务开始（关键词={_keywords}, 最大页数={_max_pages}）...")
+    logger.info(f"[牛客定时爬取] 开始（关键词={_keywords}, 最大页数={_max_pages}）...")
     try:
         from backend.services.crawler.nowcoder_crawler import NowcoderCrawler
         crawler = NowcoderCrawler(cookie=cfg.NOWCODER_COOKIE)
-        posts = crawler.discover(keywords=_keywords, max_pages=_max_pages)
+        posts = crawler.discover(
+            keywords=_keywords,
+            max_pages=_max_pages,
+            crawl_source="定时爬取"
+        )
 
         added = 0
         discovered = []
@@ -111,34 +115,45 @@ def _run_nowcoder_discovery(keywords: List[str] = None, max_pages: int = None) -
                 added += 1
             discovered.append({"title": p.get("title", "")[:50], "url": p.get("source_url", "")})
 
-        logger.info(f"✅ 牛客发现任务完成：发现 {len(posts)} 条，新增队列 {added} 条")
+        logger.info(f"[牛客定时爬取] 发现完成：发现 {len(posts)} 条，新增队列 {added} 条")
         return added, discovered
     except Exception as e:
-        logger.error(f"❌ 牛客发现任务失败: {e}", exc_info=True)
+        logger.error(f"[牛客定时爬取] 失败: {e}", exc_info=True)
         return 0, []
 
 
-def _run_xhs_discovery(headless: bool = True):
+def _run_xhs_discovery(keywords: List[str] = None, max_notes: int = None, headless: bool = True):
     """小红书面经发现任务（定时任务默认 headless=True，依赖已保存的登录状态）"""
-    logger.info("🔍 小红书发现任务开始...")
+    _keywords = keywords or cfg.XHS_KEYWORDS
+    _max_notes = max_notes if max_notes is not None else cfg.XHS_MAX_NOTES_PER_KEYWORD
+    logger.info(f"[小红书定时爬取] 开始（关键词={_keywords}, 最大帖子数={_max_notes}）...")
     try:
         from backend.services.crawler.xhs_crawler import XHSCrawler
+        from backend.services.crawler.crawl_helpers import save_xhs_post
+        
         crawler = XHSCrawler(headless=headless)
         posts = crawler.discover(
-            keywords=cfg.XHS_KEYWORDS,
-            max_notes_per_keyword=cfg.XHS_MAX_NOTES_PER_KEYWORD,
+            keywords=_keywords,
+            max_notes_per_keyword=_max_notes,
+            crawl_source="定时爬取"
         )
 
-        from backend.services.crawler.crawl_helpers import save_xhs_post
-        added = 0
+        discovered = 0
         for p in posts:
             if save_xhs_post(p, sqlite_service, download_images_flag=True):
-                added += 1
+                discovered += 1
 
-        logger.info(f"✅ XHS 发现任务完成：发现 {len(posts)} 条，新增队列 {added} 条")
-        return added
+        logger.info(f"[小红书定时爬取] 发现完成: {len(posts)} 条原始帖, {discovered} 条新入队")
+        
+        # 立即处理新发现的任务
+        questions_added = 0
+        if discovered > 0:
+            questions_added = _process_pending_tasks(batch_size=discovered + 5)
+            logger.info(f"[小红书定时爬取] 处理完成: {questions_added} 道题入库")
+        
+        return discovered
     except Exception as e:
-        logger.error(f"❌ XHS 发现任务失败: {e}", exc_info=True)
+        logger.error(f"[小红书定时爬取] 失败: {e}", exc_info=True)
         return 0
 
 
@@ -149,14 +164,14 @@ def _process_pending_tasks(batch_size: int = None):
       fetched  → LLM 提取题目 → done / error
     """
     batch_size = batch_size or cfg.PROCESS_BATCH_SIZE
-    logger.info(f"⚙️  开始处理任务队列（最多 {batch_size} 条）...")
+    logger.info(f"[定时任务] ⚙️  开始处理任务队列（最多 {batch_size} 条）...")
 
     processed = 0
 
     # ── Step 1: pending → 抓取详情（仅牛客）──────────────────
     pending = sqlite_service.get_pending_tasks(platform="nowcoder", limit=batch_size)
     if pending:
-        logger.info(f"📥 开始抓取详情，本批 {len(pending)} 条 pending 任务")
+        logger.info(f"[定时任务] 📥 开始抓取详情，本批 {len(pending)} 条 pending 任务")
     for task in pending:
         task_id = task["task_id"]
         url = task["source_url"]
@@ -173,12 +188,12 @@ def _process_pending_tasks(batch_size: int = None):
                     raw_content=content,
                     image_paths=image_paths,
                 )
-                logger.info(f"✅抓取content成功 [{title[:40]}]: 正文{len(content)}字, 图片{len(image_paths)}张")
+                logger.info(f"[定时任务] ✅抓取content成功 [{title[:40]}]: 正文{len(content)}字, 图片{len(image_paths)}张")
             else:
                 sqlite_service.update_task_status(task_id, "error", error_msg="正文内容为空或太短")
         except Exception as e:
             sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200])
-            logger.error(f"❌抓取详情失败 [{title[:40]}]: {e}")
+            logger.error(f"[定时任务] ❌抓取详情失败 [{title[:40]}]: {e}")
 
     # ── Step 2: fetched → LLM 提取 → 写库 ────────────────────
     # 同时处理牛客和小红书（XHS 在 discover 时就已经 fetched）
@@ -189,7 +204,7 @@ def _process_pending_tasks(batch_size: int = None):
         ).fetchall()
 
     if fetched_rows:
-        logger.info(f"📋 开始 LLM 提取，本批 {len(fetched_rows)} 条 fetched 帖子")
+        logger.info(f"[定时任务] 📋 开始 LLM 提取，本批 {len(fetched_rows)} 条 fetched 帖子")
 
     for row in fetched_rows:
         task_id = row["task_id"]
@@ -287,7 +302,7 @@ def _process_pending_tasks(batch_size: int = None):
 
 # 递归重试逻辑（添加到scheduler.py的_process_pending_tasks函数末尾）
 
-    logger.info(f"⚙️  本轮处理完成，入库题目 {processed} 道")
+    logger.info(f"[定时任务] ⚙️  本轮处理完成，入库题目 {processed} 道")
 
     # ── Step 3: 递归重试失败的任务（直到全部成功或达到最大次数）──────────────────────────────
     from backend.config.config import settings
@@ -298,11 +313,11 @@ def _process_pending_tasks(batch_size: int = None):
         # 检查是否还有error状态的任务
         error_tasks = sqlite_service.get_tasks_by_status("error", limit=batch_size)
         if not error_tasks:
-            logger.info(f"✅ 所有任务处理完成，无需重试")
+            logger.info(f"[定时任务] ✅ 所有任务处理完成，无需重试")
             break
         
         retry_round += 1
-        logger.info(f"🔄 第 {retry_round}/{max_recursive_retries} 轮递归重试，发现 {len(error_tasks)} 个失败任务...")
+        logger.info(f"[定时任务] 🔄 第 {retry_round}/{max_recursive_retries} 轮递归重试，发现 {len(error_tasks)} 个失败任务...")
         
         # 重试这些失败任务
         retry_success = 0
@@ -388,19 +403,19 @@ def _process_pending_tasks(batch_size: int = None):
                 logger.error(f"    ❌ 重试异常: {title[:40]} | {e}")
                 sqlite_service.update_task_status(task_id, "error", error_msg=f"第{retry_round}轮重试异常: {str(e)[:150]}")
         
-        logger.info(f"🔄 第 {retry_round} 轮重试完成：成功 {retry_success}/{len(error_tasks)} 个任务")
+        logger.info(f"[定时任务] 🔄 第 {retry_round} 轮重试完成：成功 {retry_success}/{len(error_tasks)} 个任务")
         
         # 如果本轮没有任何成功，提前退出
         if retry_success == 0:
-            logger.warning(f"⚠️ 第 {retry_round} 轮重试无任何成功，停止递归重试")
+            logger.warning(f"[定时任务] ⚠️ 第 {retry_round} 轮重试无任何成功，停止递归重试")
             break
     
     # 最终统计
     final_error_count = len(sqlite_service.get_tasks_by_status("error", limit=1000))
     if final_error_count > 0:
-        logger.warning(f"⚠️ 递归重试结束，仍有 {final_error_count} 个任务失败")
+        logger.warning(f"[定时任务] ⚠️ 递归重试结束，仍有 {final_error_count} 个任务失败")
     else:
-        logger.info(f"✅ 所有任务处理完成！")
+        logger.info(f"[定时任务] ✅ 所有任务处理完成！")
 
     return processed
 
@@ -505,7 +520,7 @@ def _save_questions(questions: List[Dict]) -> int:
                             AND (company IS NULL OR company = '' OR company = '未知')
                         """, (company, url))
                     conn.commit()
-                logger.debug(f"✅ 已更新 {len(url_company_map)} 个URL的公司信息")
+                logger.debug(f"[定时任务] ✅ 已更新 {len(url_company_map)} 个URL的公司信息")
             except Exception as e:
                 logger.warning(f"更新crawl_tasks公司信息失败: {e}")
     
@@ -542,6 +557,17 @@ class CrawlScheduler:
                 misfire_grace_time=3600,
             )
 
+        # ── 小红书发现任务（每天凌晨3点）──────────────────────
+        if cfg.ENABLE_XHS:
+            self._scheduler.add_job(
+                _run_xhs_discovery,
+                CronTrigger(hour=3, minute=0),
+                id="xhs_discovery",
+                name="小红书面经发现",
+                replace_existing=True,
+                misfire_grace_time=3600,
+            )
+
         # ── 任务处理器（cron 分钟从 .env 读取）────────────────
         self._scheduler.add_job(
             _process_pending_tasks,
@@ -554,10 +580,111 @@ class CrawlScheduler:
 
         self._scheduler.start()
         self._running = True
+        
+        # 从数据库加载动态配置的任务
+        from backend.services.scheduler_service import scheduler_service
+        db_jobs = scheduler_service.list_jobs(enabled_only=True)
+        
+        # 加载数据库任务
+        for job in db_jobs:
+            try:
+                job_id = f"db_{job['job_id']}"
+                job_type = job['job_type']
+                schedule_type = job['schedule_type']
+                schedule_config = job['schedule_config']
+                job_params = job['job_params']
+                
+                # 构建触发器
+                if schedule_type == "cron":
+                    trigger = CronTrigger(
+                        hour=schedule_config.get('hour'),
+                        minute=schedule_config.get('minute'),
+                        day=schedule_config.get('day'),
+                        month=schedule_config.get('month'),
+                        day_of_week=schedule_config.get('day_of_week'),
+                        timezone="Asia/Shanghai"
+                    )
+                elif schedule_type == "interval":
+                    # 确保至少有一个间隔参数不为 None
+                    interval_kwargs = {}
+                    if schedule_config.get('interval_seconds'):
+                        interval_kwargs['seconds'] = schedule_config.get('interval_seconds')
+                    if schedule_config.get('interval_minutes'):
+                        interval_kwargs['minutes'] = schedule_config.get('interval_minutes')
+                    if schedule_config.get('interval_hours'):
+                        interval_kwargs['hours'] = schedule_config.get('interval_hours')
+                    
+                    if not interval_kwargs:
+                        logger.warning(f"任务 {job['job_name']} 的间隔配置为空，跳过")
+                        continue
+                    
+                    trigger = IntervalTrigger(
+                        **interval_kwargs,
+                        timezone="Asia/Shanghai"
+                    )
+                else:
+                    continue
+                
+                # 根据任务类型选择执行函数
+                if job_type == "nowcoder_discovery":
+                    func = lambda jp=job_params: _run_nowcoder_discovery(
+                        keywords=jp.get('nowcoder_keywords'),
+                        max_pages=jp.get('nowcoder_max_pages')
+                    )
+                elif job_type == "xhs_discovery":
+                    func = lambda jp=job_params: _run_xhs_discovery(
+                        keywords=jp.get('xhs_keywords'),
+                        max_notes=jp.get('xhs_max_notes'),
+                        headless=jp.get('xhs_headless', True)
+                    )
+                elif job_type == "process_tasks":
+                    func = lambda jp=job_params: _process_pending_tasks(
+                        batch_size=jp.get('process_batch_size')
+                    )
+                else:
+                    continue
+                
+                # 添加任务到调度器
+                self._scheduler.add_job(
+                    func,
+                    trigger,
+                    id=job_id,
+                    name=job['job_name'],
+                    replace_existing=True,
+                    misfire_grace_time=3600
+                )
+            except Exception as e:
+                logger.error(f"加载数据库任务失败 {job.get('job_name', '?')}: {e}")
+        
+        # 显示实际加载的任务信息
         logger.info("✅ 面经爬取调度器已启动")
-        logger.info(f"   - 牛客发现：{'每天 ' + nowcoder_hours.replace(',', '/') + ':00' if cfg.ENABLE_NOWCODER else '已关闭（SCHEDULER_ENABLE_NOWCODER=false）'}")
-        logger.info(f"   - XHS 发现：{'已开启（每天 03:00）' if cfg.ENABLE_XHS else '手动触发（SCHEDULER_ENABLE_XHS=false）'}")
-        logger.info(f"   - 任务处理：每小时第 {process_minute} 分钟，每批最多 {cfg.PROCESS_BATCH_SIZE} 条（CRAWLER_PROCESS_BATCH_SIZE）")
+        all_jobs = self._scheduler.get_jobs()
+        
+        # 按类型分组显示
+        nowcoder_jobs = [j for j in all_jobs if 'nowcoder' in j.id.lower()]
+        xhs_jobs = [j for j in all_jobs if 'xhs' in j.id.lower()]
+        process_jobs = [j for j in all_jobs if 'process' in j.id.lower() or 'task' in j.id.lower()]
+        
+        if nowcoder_jobs:
+            for job in nowcoder_jobs:
+                next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S") if job.next_run_time else "N/A"
+                logger.info(f"   - {job.name}：下次运行 {next_run}")
+        else:
+            logger.info(f"   - 牛客发现：未配置")
+        
+        if xhs_jobs:
+            for job in xhs_jobs:
+                next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S") if job.next_run_time else "N/A"
+                logger.info(f"   - {job.name}：下次运行 {next_run}")
+        else:
+            logger.info(f"   - XHS 发现：未配置")
+        
+        if process_jobs:
+            for job in process_jobs:
+                next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S") if job.next_run_time else "N/A"
+                logger.info(f"   - {job.name}：下次运行 {next_run}")
+        else:
+            logger.info(f"   - 任务处理：未配置")
 
     def stop(self):
         if self._running:
@@ -572,14 +699,14 @@ class CrawlScheduler:
         logger.info("手动触发牛客发现任务...")
         return _run_nowcoder_discovery(keywords=keywords, max_pages=max_pages)
 
-    def trigger_xhs_discovery(self, keywords: List[str] = None, headless: bool = True) -> int:
+    def trigger_xhs_discovery(self, keywords: List[str] = None, max_notes: int = None, headless: bool = True) -> int:
         """
         手动触发小红书发现任务。
         headless=True：无头运行（需已登录），适合 API 触发
         headless=False：弹出浏览器（自动等待扫码），适合首次运行
         """
         logger.info(f"手动触发 XHS 发现任务 headless={headless}...")
-        return _run_xhs_discovery(headless=headless)
+        return _run_xhs_discovery(keywords=keywords, max_notes=max_notes, headless=headless)
 
     def trigger_process_tasks(self, batch_size: int = None) -> int:
         """手动触发任务处理（立即提取题目），batch_size 不传时从 env CRAWLER_PROCESS_BATCH_SIZE 读取"""
@@ -607,8 +734,107 @@ class CrawlScheduler:
         }
 
 
+
+    def reload_jobs(self):
+        """从数据库重新加载定时任务配置"""
+        from backend.services.scheduler_service import scheduler_service
+        
+        if not self._running:
+            logger.warning("调度器未运行，无法重新加载任务")
+            return
+        
+        logger.info("开始重新加载定时任务...")
+        
+        # 移除所有现有的数据库任务（保留代码中定义的默认任务）
+        for job in self._scheduler.get_jobs():
+            if job.id.startswith("db_"):  # 数据库任务的 ID 前缀
+                self._scheduler.remove_job(job.id)
+        
+        # 从数据库加载启用的任务
+        jobs = scheduler_service.list_jobs(enabled_only=True)
+        
+        for job in jobs:
+            try:
+                job_id = f"db_{job['job_id']}"
+                job_type = job['job_type']
+                schedule_type = job['schedule_type']
+                schedule_config = job['schedule_config']
+                job_params = job['job_params']
+                
+                # 构建触发器
+                if schedule_type == "cron":
+                    trigger = CronTrigger(
+                        hour=schedule_config.get('hour'),
+                        minute=schedule_config.get('minute'),
+                        day=schedule_config.get('day'),
+                        month=schedule_config.get('month'),
+                        day_of_week=schedule_config.get('day_of_week'),
+                        timezone="Asia/Shanghai"
+                    )
+                elif schedule_type == "interval":
+                    # 确保至少有一个间隔参数不为 None
+                    interval_kwargs = {}
+                    if schedule_config.get('interval_seconds'):
+                        interval_kwargs['seconds'] = schedule_config.get('interval_seconds')
+                    if schedule_config.get('interval_minutes'):
+                        interval_kwargs['minutes'] = schedule_config.get('interval_minutes')
+                    if schedule_config.get('interval_hours'):
+                        interval_kwargs['hours'] = schedule_config.get('interval_hours')
+                    
+                    if not interval_kwargs:
+                        logger.warning(f"任务 {job['job_name']} 的间隔配置为空，跳过")
+                        continue
+                    
+                    trigger = IntervalTrigger(
+                        **interval_kwargs,
+                        timezone="Asia/Shanghai"
+                    )
+                else:
+                    logger.warning(f"未知的调度类型: {schedule_type}")
+                    continue
+                
+                # 根据任务类型选择执行函数
+                if job_type == "nowcoder_discovery":
+                    func = lambda jp=job_params: _run_nowcoder_discovery(
+                        keywords=jp.get('nowcoder_keywords'),
+                        max_pages=jp.get('nowcoder_max_pages')
+                    )
+                elif job_type == "xhs_discovery":
+                    func = lambda jp=job_params: _run_xhs_discovery(
+                        keywords=jp.get('xhs_keywords'),
+                        max_notes=jp.get('xhs_max_notes'),
+                        headless=jp.get('xhs_headless', True)
+                    )
+                elif job_type == "process_tasks":
+                    func = lambda jp=job_params: _process_pending_tasks(
+                        batch_size=jp.get('process_batch_size')
+                    )
+                else:
+                    logger.warning(f"未知的任务类型: {job_type}")
+                    continue
+                
+                # 添加任务到调度器
+                self._scheduler.add_job(
+                    func,
+                    trigger,
+                    id=job_id,
+                    name=job['job_name'],
+                    replace_existing=True,
+                    misfire_grace_time=3600
+                )
+                
+                logger.info(f"✅ 已加载任务: {job['job_name']} ({job_type})")
+                
+            except Exception as e:
+                logger.error(f"加载任务失败 {job.get('job_name', '?')}: {e}", exc_info=True)
+        
+        logger.info(f"定时任务重新加载完成，当前共 {len(self._scheduler.get_jobs())} 个任务")
+
+
 # ── 全局单例 ─────────────────────────────────────────────────
 crawl_scheduler = CrawlScheduler()
+# 为了兼容性，提供别名
+scheduler = crawl_scheduler
 
 
 
@@ -629,7 +855,7 @@ def _retry_failed_tasks(max_retries: int = None, retry_delay: int = None) -> int
     _max_retries = max_retries if max_retries is not None else settings.crawler_fetch_max_retries
     _retry_delay = retry_delay if retry_delay is not None else settings.crawler_retry_delay
     
-    logger.info(f"🔄 开始重试失败任务（最大重试{_max_retries}次，间隔{_retry_delay}秒）...")
+    logger.info(f"[定时任务] 🔄 开始重试失败任务（最大重试{_max_retries}次，间隔{_retry_delay}秒）...")
     
     # 查询需要重试的任务（状态为error的）
     failed_tasks = sqlite_service.get_tasks_by_status("error", limit=50)
@@ -718,7 +944,7 @@ def _retry_failed_tasks(max_retries: int = None, retry_delay: int = None) -> int
         # 每个任务之间稍微延迟
         time.sleep(2)
     
-    logger.info(f"✅ 重试完成：成功 {success_count}/{len(failed_tasks)} 个任务")
+    logger.info(f"[定时任务] ✅ 重试完成：成功 {success_count}/{len(failed_tasks)} 个任务")
     return success_count
 
 

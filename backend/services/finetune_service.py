@@ -126,11 +126,11 @@ def import_from_log_file(log_path: str, skip_existing: bool = True) -> Dict[str,
                 continue
             try:
                 rec = json.loads(line)
-                content = rec.get("content", "").strip()
+                content = (rec.get("user_content", "") or rec.get("content", "")).strip()
                 title = rec.get("title", "")
                 source_url = rec.get("source_url", "")
-                llm_raw = rec.get("llm_raw", "")
-                ts = rec.get("ts", now_beijing_str().isoformat(timespec="seconds"))
+                llm_raw = rec.get("llm_response", "") or rec.get("llm_raw", "")
+                ts = rec.get("ts", now_beijing_str())
                 if not content:
                     continue
                 if skip_existing:
@@ -380,3 +380,50 @@ def get_stats() -> Dict:
         "modified": modified,
         "log_files": len(list_log_files()),
     }
+
+
+def preview_log_file(log_path: str, limit: int = 10) -> Dict:
+    """
+    预览日志文件前N条记录
+    返回 {"samples": [...], "total": N}
+    """
+    p = Path(log_path)
+    if not p.exists():
+        return {"error": "文件不存在", "samples": [], "total": 0}
+    
+    samples = []
+    total = 0
+    
+    try:
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            total += 1
+            if len(samples) < limit:
+                try:
+                    rec = json.loads(line)
+                    # 解析 llm_raw 为对象
+                    llm_raw_obj = None
+                    if rec.get("llm_raw"):
+                        try:
+                            llm_raw_obj = json.loads(rec["llm_raw"])
+                        except:
+                            llm_raw_obj = {"error": "无效JSON", "raw": rec["llm_raw"]}
+                    
+                    samples.append({
+                        "content": rec.get("content", ""),
+                        "title": rec.get("title", ""),
+                        "source_url": rec.get("source_url", ""),
+                        "llm_raw": rec.get("llm_raw", ""),
+                        "llm_raw_obj": llm_raw_obj,
+                        "ts": rec.get("ts", ""),
+                    })
+                except Exception as e:
+                    logger.warning("解析日志行失败: %s", e)
+                    continue
+    except Exception as e:
+        logger.error("读取日志文件失败: %s", e)
+        return {"error": str(e), "samples": [], "total": 0}
+    
+    return {"samples": samples, "total": total, "showing": len(samples)}

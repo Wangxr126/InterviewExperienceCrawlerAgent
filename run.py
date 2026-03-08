@@ -13,10 +13,13 @@ import os
 import subprocess
 import sys
 
+# 禁用 requests/urllib3 版本兼容性警告
+os.environ['PYTHONWARNINGS'] = 'ignore::requests.exceptions.RequestsDependencyWarning'
+
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("run")
 
-# ── 固定使用 NewCoderAgent conda 环境 ──────────────────────────
+# ── 固定使用 NewCoderAgent conda 环境 ──────────────────────────────
 CONDA_ENV_PYTHON = r"C:\Users\Wangxr\.conda\envs\NewCoderAgent\python.exe"
 
 # 如果当前解释器不是目标环境，用目标环境重新启动本脚本
@@ -30,7 +33,7 @@ if os.path.abspath(sys.executable).lower() != os.path.abspath(CONDA_ENV_PYTHON).
         "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
     sys.exit(result.returncode)
 
-# ── 已在正确环境中运行 ──────────────────────────────────────────
+# ── 已在正确环境中运行 ──────────────────────────────────────────────
 # Windows GBK 终端 emoji 兼容
 os.environ["PYTHONUTF8"] = "1"
 os.environ["PYTHONIOENCODING"] = "utf-8"
@@ -82,18 +85,18 @@ def main():
     check_neo4j()
 
     logger.info("""
-╔══════════════════════════════════════════════════════╗
-║            面经 Agent 后端已启动                      ║
-╠══════════════════════════════════════════════════════╣
-║  Python 环境：NewCoderAgent                          ║
-║  API 地址  ：http://localhost:%s
-║  API 文档  ：http://localhost:%s/docs
-║  前端-生产  ：http://localhost:%s
-║  前端-开发  ：cd web && npm run dev  → localhost:5173
-║  Neo4j 管理：http://localhost:7474
-║  Ollama LLM ：http://localhost:11434
-║  退出      ：Ctrl+C
-╚══════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════╗
+║           面经 Agent 后端已启动                           ║
+╠═══════════════════════════════════════════════════════════╣
+║ Python 环境：NewCoderAgent                                ║
+║ API 地址  ：http://localhost:%s
+║ API 文档  ：http://localhost:%s/docs
+║ 前端-生产  ：http://localhost:%s
+║ 前端-开发  ：cd web && npm run dev  → localhost:5173
+║ Neo4j 管理：http://localhost:7474
+║ Ollama LLM ：http://localhost:11434
+║ 退出      ：Ctrl+C
+╚═══════════════════════════════════════════════════════════╝
 """, port, port, port)
 
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}

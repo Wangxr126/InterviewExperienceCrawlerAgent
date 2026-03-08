@@ -1,4 +1,4 @@
-﻿"""
+"""
 面经内容 → 独立题目 提取器（LLM 驱动）
 
 输入：一篇面经原文（可能包含 10~30 道面试题混在叙述文字中）
@@ -507,8 +507,13 @@ def extract_questions_from_post(
         final_position = item_position or post_position or ""
         item_difficulty = str(item.get("difficulty", "")).strip()
         difficulty_val = _normalize_difficulty(item_difficulty) if item_difficulty else ""
-        # q_id 由数据库自动生成（INTEGER PRIMARY KEY AUTOINCREMENT）
+        
+        # 生成唯一的 q_id（UUID）
+        import uuid
+        q_id = str(uuid.uuid4())
+        
         questions.append({
+            "q_id": q_id,  # 添加 q_id 字段
             "question_text": q_text,
             "answer_text": str(item.get("answer_text", "")).strip(),
             "difficulty": difficulty_val,

@@ -44,11 +44,11 @@
       <el-button 
         v-if="question.source_url" 
         type="warning" 
-        @click="window.open(question.source_url, '_blank')"
+        @click="openSourceUrl"
       >
         🔗 查看原帖
       </el-button>
-      <el-button type="info" @click="$emit('send-to-chat', { question })">💬 去对话练习</el-button>
+      <el-button type="info" @click.stop="handleSendToChat">💬 去对话练习</el-button>
       <el-button type="primary" :loading="submitting" @click="submit">提交作答</el-button>
     </template>
   </el-dialog>
@@ -110,6 +110,25 @@ const submit = async () => {
   } finally {
     submitting.value = false
   }
+}
+
+const openSourceUrl = () => {
+  if (props.question?.source_url) {
+    window.open(props.question.source_url, '_blank')
+  }
+}
+
+const handleSendToChat = () => {
+  console.log('🔵 QuestionDialog: 触发 send-to-chat 事件')
+  console.log('🔵 question:', props.question)
+  
+  // 先关闭当前对话框
+  visible.value = false
+  
+  // 延迟触发事件，确保对话框已关闭
+  setTimeout(() => {
+    emit('send-to-chat', { question: props.question })
+  }, 100)
 }
 </script>
 

@@ -99,36 +99,41 @@ export const api = {
     return r.json()
   },
 
-  async processQueue(batchSize = 20) {
-    const r = await fetch(`${BASE}/api/crawler/process?batch_size=${batchSize}`, {
+  async processQueue(batchSize = null) {
+    const url = batchSize ? `${BASE}/api/crawler/process?batch_size=${batchSize}` : `${BASE}/api/crawler/process`
+    const r = await fetch(url, {
       method: 'POST',
     })
     return r.json()
   },
 
-  async extractPending(batchSize = 30) {
-    const r = await fetch(`${BASE}/api/crawler/extract-pending?batch_size=${batchSize}`, {
+  async extractPending(batchSize = null) {
+    const url = batchSize ? `${BASE}/api/crawler/extract-pending?batch_size=${batchSize}` : `${BASE}/api/crawler/extract-pending`
+    const r = await fetch(url, {
       method: 'POST',
     })
     return r.json()
   },
 
-  async retryErrors(batchSize = 30) {
-    const r = await fetch(`${BASE}/api/crawler/retry-errors?batch_size=${batchSize}`, {
+  async retryErrors(batchSize = null) {
+    const url = batchSize ? `${BASE}/api/crawler/retry-errors?batch_size=${batchSize}` : `${BASE}/api/crawler/retry-errors`
+    const r = await fetch(url, {
       method: 'POST',
     })
     return r.json()
   },
 
-  async reExtractAll(batchSize = 50) {
-    const r = await fetch(`${BASE}/api/crawler/re-extract-all?batch_size=${batchSize}`, {
+  async reExtractAll(batchSize = null) {
+    const url = batchSize ? `${BASE}/api/crawler/re-extract-all?batch_size=${batchSize}` : `${BASE}/api/crawler/re-extract-all`
+    const r = await fetch(url, {
       method: 'POST',
     })
     return r.json()
   },
 
-  async cleanData(batchSize = 50) {
-    const r = await fetch(`${BASE}/api/crawler/clean-data?batch_size=${batchSize}`, {
+  async cleanData(batchSize = null) {
+    const url = batchSize ? `${BASE}/api/crawler/clean-data?batch_size=${batchSize}` : `${BASE}/api/crawler/clean-data`
+    const r = await fetch(url, {
       method: 'POST',
     })
     return r.json()
@@ -179,6 +184,73 @@ export const api = {
     const r = await fetch(`${BASE}/api/crawler/refetch-xhs-body?task_id=${encodeURIComponent(taskId)}`, {
       method: 'POST',
     })
+    return r.json()
+  },
+
+  // ── 定时任务管理 ──────────────────────────────────────
+  async getSchedulerJobs(params = '') {
+    const r = await fetch(`${BASE}/api/scheduler/jobs${params}`)
+    return r.json()
+  },
+
+  async getSchedulerJob(jobId) {
+    const r = await fetch(`${BASE}/api/scheduler/jobs/${jobId}`)
+    return r.json()
+  },
+
+  async createSchedulerJob(payload) {
+    const r = await fetch(`${BASE}/api/scheduler/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    return r.json()
+  },
+
+  async updateSchedulerJob(jobId, payload) {
+    const r = await fetch(`${BASE}/api/scheduler/jobs/${jobId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    return r.json()
+  },
+
+  async deleteSchedulerJob(jobId) {
+    const r = await fetch(`${BASE}/api/scheduler/jobs/${jobId}`, {
+      method: 'DELETE',
+    })
+    return r.json()
+  },
+
+  async enableSchedulerJob(jobId) {
+    const r = await fetch(`${BASE}/api/scheduler/jobs/${jobId}/enable`, {
+      method: 'POST',
+    })
+    return r.json()
+  },
+
+  async disableSchedulerJob(jobId) {
+    const r = await fetch(`${BASE}/api/scheduler/jobs/${jobId}/disable`, {
+      method: 'POST',
+    })
+    return r.json()
+  },
+
+  async runSchedulerJob(jobId) {
+    const r = await fetch(`${BASE}/api/scheduler/jobs/${jobId}/run`, {
+      method: 'POST',
+    })
+    return r.json()
+  },
+
+  async getJobTypes() {
+    const r = await fetch(`${BASE}/api/scheduler/job-types`)
+    return r.json()
+  },
+
+  async getScheduleExamples() {
+    const r = await fetch(`${BASE}/api/scheduler/schedule-examples`)
     return r.json()
   },
 }

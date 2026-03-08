@@ -1,4 +1,4 @@
-﻿# 面经 Agent
+# 面经 Agent
 
 > 基于 [hello-agents](https://github.com/datawhalechina/hello-agents) 框架构建的智能面试复习助手。
 > 自动爬取牛客/小红书面经、构建知识图谱、用 SM-2 算法跟踪掌握程度，并提供 AI 面试对话练习。
