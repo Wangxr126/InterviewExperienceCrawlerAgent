@@ -21,12 +21,15 @@ WARMUP_TIMEOUT = 120
 
 
 def _get_warmup_models():
-    """从 config 读取需预热的模型（全局 + Architect + Interviewer，去重）"""
+    """从 config 读取需预热的模型（Miner + Architect + Interviewer，去重）"""
     try:
         from backend.config.config import settings
         models = [
+            # Miner（题目提取器）- 使用全局 LLM 配置
             settings.llm_model_id,
-            settings.architect_model,
+            # Knowledge Manager（知识管理器）
+            settings.knowledge_manager_model,
+            # Interviewer（面试官）
             settings.interviewer_model,
         ]
         seen = set()
@@ -35,9 +38,9 @@ def _get_warmup_models():
             if m and m.strip() and m not in seen:
                 seen.add(m)
                 out.append(m.strip())
-        return out if out else [settings.llm_model_id or "gemma3:4b"]
+        return out if out else [settings.llm_model_id or "qwen3.5:4b"]
     except Exception:
-        return ["gemma3:4b"]
+        return ["qwen3.5:4b"]
 
 
 def _kill_ollama():

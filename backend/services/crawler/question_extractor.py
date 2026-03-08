@@ -155,17 +155,29 @@ def _append_llm_log_to_csv(user_prompt: str, llm_response: str, response_time_se
     content = _extract_content_for_log(user_prompt)
     llm_raw = (llm_response or "")
 
-    # ── 1. 旧路径（调试用，保持不变）──
+    # ── 1. 旧路径（调试用，使用模型名子目录）──
     try:
         from backend.config.config import settings
         path = settings.llm_prompt_log_csv
         if path:
             p = Path(path)
-            p.parent.mkdir(parents=True, exist_ok=True)
+            # 使用模型名子目录
+            _PROJECT_ROOT = Path(__file__).resolve().parents[3]
+            model_name = (settings.llm_model_id or "unknown").replace(":", "_").replace(" ", "_")
+            log_dir = _PROJECT_ROOT / "微调" / "llm_logs" / model_name
+            log_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 获取原始文件名
             if str(p).lower().endswith(".csv"):
-                p = p.with_suffix(".jsonl")
+                filename = p.stem + ".jsonl"
+            else:
+                filename = p.name
+            
             if _llm_log_run_suffix:
-                p = p.parent / f"{p.stem}_{_llm_log_run_suffix}{p.suffix}"
+                filename = f"{Path(filename).stem}_{_llm_log_run_suffix}{Path(filename).suffix}"
+            
+            p = log_dir / filename
+            
             record = {
                 "原始": content[:_MAX_LOG_INPUT_PREVIEW],
                 "输出": llm_raw[:_MAX_LOG_OUTPUT],
@@ -176,13 +188,20 @@ def _append_llm_log_to_csv(user_prompt: str, llm_response: str, response_time_se
     except Exception as e:
         logger.debug("LLM 调试日志写入失败: %s", e)
 
-    # ── 2. 微调日志（按模型+来源+日期分文件）──
+    # ── 2. 微调日志（按模型+来源+日期分文件，包含完整 system prompt）──
     try:
+        from backend.config.config import settings
         ft_path = _get_finetune_log_path(source)
         ft_record = {
-            "ts": now_beijing_str().isoformat(timespec="seconds"),
-            "content": content,
-            "llm_raw": llm_raw,
+            "ts": now_beijing_str(),
+            "model": settings.llm_model_id or "unknown",
+            "source": source,
+            "title": title[:100] if title else "",
+            "source_url": source_url,
+            "system_prompt": get_miner_prompt(),  # 完整的 system prompt（不含标题和正文）
+            "user_content": content,  # 提取的原始内容
+            "llm_response": llm_raw,
+            "response_time_sec": round(response_time_sec, 2) if response_time_sec is not None else None,
         }
         with open(ft_path, "a", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(ft_record, ensure_ascii=False) + "\n")
@@ -488,9 +507,9 @@ def extract_questions_from_post(
         final_position = item_position or post_position or ""
         item_difficulty = str(item.get("difficulty", "")).strip()
         difficulty_val = _normalize_difficulty(item_difficulty) if item_difficulty else ""
+        # q_id 由数据库自动生成（INTEGER PRIMARY KEY AUTOINCREMENT）
         questions.append({
-            # q_id 由数据库自动生成（INTEGER PRIMARY KEY AUTOINCREMENT）
-                        "question_text": q_text,
+            "question_text": q_text,
             "answer_text": str(item.get("answer_text", "")).strip(),
             "difficulty": difficulty_val,
             "question_type": str(item.get("question_type", "技术题")),
