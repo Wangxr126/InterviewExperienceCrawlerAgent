@@ -48,6 +48,7 @@ fake-useragent==1.5.1
 # ── 图像处理（OCR 本地识别，不依赖 LLM）──────────────────────
 pillow==10.4.0
 easyocr>=1.7.0            # 本地 OCR，支持中英文，无需 Vision API
+anthropic>=0.39.0         # Anthropic Claude API（用于 Claude Vision OCR）
 
 # ── 日志（终端彩色：INFO 绿 / WARNING 黄 / ERROR 红）────────────────
 loguru>=0.7.0

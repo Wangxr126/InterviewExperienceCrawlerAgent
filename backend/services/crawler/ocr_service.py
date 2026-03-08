@@ -20,9 +20,15 @@ def _get_reader():
     if _reader is None:
         try:
             import easyocr
+            logger.info("正在初始化 EasyOCR（首次运行会下载模型，约 100MB）...")
             _reader = easyocr.Reader(["ch_sim", "en"], gpu=False, verbose=False)
+            logger.info("✅ EasyOCR 初始化成功")
+        except ImportError as e:
+            logger.error(f"❌ EasyOCR 模块未安装: {e}")
+            logger.error("   请在当前 Python 环境中安装: pip install easyocr")
+            raise
         except Exception as e:
-            logger.error(f"EasyOCR 初始化失败: {e}，请确保已安装: pip install easyocr")
+            logger.error(f"❌ EasyOCR 初始化失败: {e}")
             raise
     return _reader
 
@@ -46,7 +52,8 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
 
     try:
         reader = _get_reader()
-    except Exception:
+    except Exception as e:
+        logger.error(f"❌ OCR 初始化失败，跳过图片识别: {e}")
         return ""
 
     for idx, rel_path in enumerate(image_paths):

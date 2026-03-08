@@ -2,6 +2,7 @@
 牛客网面经爬虫（严格对齐 思路/爬虫工具/1、牛客网爬虫.py）
 职责：列表页发现帖子 + 详情页抓取正文，解析逻辑与参考实现一致
 """
+from backend.utils.time_utils import now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
 import time
 import re
 import json
@@ -239,62 +240,47 @@ def _dig_content_fields(obj, depth=0, max_depth=14) -> list:
 
 def _extract_content_from_initial_state_feed(html: str) -> Tuple[str, str]:
     """
-    牛客 feed 页面：从 __INITIAL_STATE__ 的 prefetchData.ssrCommonData.contentData 提取主帖正文。
-    meta/og:description 会被截断，完整内容在 prefetchData 中。返回 (title, body)。
+    从 window.__INITIAL_STATE__ JSON中提取完整正文内容
+    严格按照test4.py的逻辑实现
     """
-    m = re.search(r"__INITIAL_STATE__\s*=\s*(\{)", html)
-    if not m:
+    # 使用正则表达式提取JSON（与test4.py完全一致）
+    match = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});', html, re.DOTALL)
+    if not match:
         return "", ""
-    start = m.start(1)
-    depth, i, in_str, escape = 0, start, None, False
-    while i < len(html):
-        c = html[i]
-        if in_str:
-            escape = c == "\\" and not escape
-            if not escape and c == in_str:
-                in_str = None
-            i += 1
-            continue
-        if c in ('"', "'"):
-            in_str = c
-        elif c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    d = json.loads(html[start : i + 1])
-                except json.JSONDecodeError:
-                    return "", ""
-                break
-        i += 1
-    else:
-        return "", ""
-
-    prefetch = d.get("prefetchData") or d.get("prefetch")
-    if isinstance(prefetch, dict):
-        prefetch = list(prefetch.values())
-    if not isinstance(prefetch, list):
-        return "", ""
-
-    title, body = "", ""
-    for item in prefetch:
-        if not isinstance(item, dict):
-            continue
-        ssr = item.get("ssrCommonData") or item.get("ssrData")
-        if not isinstance(ssr, dict):
-            continue
-        content_data = ssr.get("contentData")
-        if isinstance(content_data, dict):
-            c = content_data.get("content") or content_data.get("text") or ""
-            if isinstance(c, str) and len(c) > 100:
-                if "<" in c and ">" in c:
-                    c = _html_to_text(c)
-                body = c.strip()
-                title = (content_data.get("title") or content_data.get("subject") or "").strip()
-                break
-    return title, body
-
+    
+    try:
+        data = json.loads(match.group(1))
+        
+        # 策略1：Feed页面 - prefetchData.contentData
+        if 'prefetchData' in data and data['prefetchData']:
+            content_data = data['prefetchData'].get('contentData', {})
+            title = content_data.get('title', '')
+            content = content_data.get('content', '')
+            
+            if content:
+                # 清理Markdown和HTML标签（与test4.py一致）
+                content = re.sub(r'!\[.*?\]\([^\)]+\)', '', content)  # 移除图片标记
+                content = re.sub(r'<[^>]+>', '', content)  # 移除HTML标签
+                content = re.sub(r'\n{3,}', '\n\n', content)  # 压缩多余换行
+                
+                return title.strip(), content.strip()
+        
+        # 策略2：Discuss页面 - postDetail
+        if 'postDetail' in data and data['postDetail']:
+            title = data['postDetail'].get('title', '')
+            content = data['postDetail'].get('content', '')
+            
+            if content:
+                content = re.sub(r'!\[.*?\]\([^\)]+\)', '', content)
+                content = re.sub(r'<[^>]+>', '', content)
+                content = re.sub(r'\n{3,}', '\n\n', content)
+                
+                return title.strip(), content.strip()
+    
+    except Exception as e:
+        logger.warning(f"解析__INITIAL_STATE__失败: {e}")
+    
+    return "", ""
 
 def _extract_content_from_json(html: str) -> str:
     """从 JSON 块中提取正文（SPA 兜底）。用 HTML 解析取文本，不依赖关键词打分。"""
@@ -329,35 +315,48 @@ def _fetch_post_content_full_impl(
     html: str, soup: BeautifulSoup, url: str = ""
 ) -> Tuple[str, str, List[str]]:
     """
-    四级提取策略，返回 (title, body, image_urls)。
-    feed 页优先从 __INITIAL_STATE__ 取完整正文（meta 会截断），再 DOM → meta → JSON。
+    按照test3.py的方式提取内容：使用BeautifulSoup模糊匹配class名称
     """
     title, body = "", ""
-    # 0. feed 页：__INITIAL_STATE__.prefetchData.contentData（完整内容，meta 会截断）
-    if "/feed/main/detail/" in url:
-        title, body = _extract_content_from_initial_state_feed(html)
-    if body:
-        image_urls = _collect_image_urls(soup, html)
-        return title, body, image_urls
+    
+    # === 🎯 史诗级增强：精准定位正文容器（完全按照test3.py） ===
+    # 牛客网的前端经常用带随机哈希的 class 名 (如 feed-content_1a2b3)
+    # 我们用模糊匹配，只要 class 包含下面这些关键词，就把它抓出来！
+    possible_classes = [
+        'nc-post-content', 'post-topic-des', 'article-content',
+        'feed-detail-content', 'post-detail', 'detail-content',
+        'feed-content', 'post-detail-content-box'
+    ]
 
-    # 1. DOM 解析（主策略）
-    title, body = _extract_content_from_dom(soup)
-    if body:
-        image_urls = _collect_image_urls(soup, html)
-        return title, body, image_urls
+    content_container = None
+    for cls in possible_classes:
+        # 模糊匹配 class 名称
+        container = soup.find('div', class_=lambda c: c and cls in c)
+        if container:
+            content_container = container
+            logger.info(f"找到正文容器: class包含'{cls}'")
+            break
 
-    # 2. meta 兜底（可能被截断）
-    title, body = _extract_content_from_meta(soup)
-    if body:
-        image_urls = _collect_image_urls(soup, html)
-        return title, body, image_urls
+    if not content_container:
+        logger.warning(f"未能定位到正文内容: {url[:80]}")
+        return "", "", []
 
-    # 3. JSON 块（SPA 页面，HTML 用 BeautifulSoup 解析）
-    body = _extract_content_from_json(html)
+    # 1. 提取完整的纯文本正文 (保留换行符)
+    body = content_container.get_text(separator='\n', strip=True)
+    
+    # 2. 提取标题（从soup中查找）
+    for tag, attrs in _TITLE_SELECTORS:
+        el = soup.find(tag, attrs) if attrs else soup.find(tag)
+        if el:
+            t = el.get_text(strip=True)
+            if t and len(t) < 200:
+                title = t.replace("_牛客网", "").strip()
+                break
+    
+    # 3. 提取图片
     image_urls = _collect_image_urls(soup, html) if body else []
+    
     return title, body, image_urls
-
-
 # 图片提取：与 test_nowcoder_fetch.py 完全一致（DOM + JSON/imgMoment）
 _BASE_URL = "https://www.nowcoder.com"
 _CONTENT_CLASSES_FOR_IMG = [
@@ -476,21 +475,96 @@ def _collect_image_urls_from_dom(soup: BeautifulSoup) -> List[str]:
 
 
 def _collect_image_urls_from_json(html: str) -> List[str]:
-    """从 JSON 收集用户上传图。仅从主帖 content（最长的块）提取，排除相关推荐等。"""
-    urls = []
-    for block in _extract_json_scripts(html):
-        for u in _dig_image_urls_from_main_post_only(block):
-            if u not in urls:
-                urls.append(u)
-    return urls
+    """
+    从 __INITIAL_STATE__ 中提取图片URL（参考test4.py的正确实现）
+    牛客网的图片数据存储在页面的JSON中，不在HTML标签里
+    """
+    images = []
+    
+    # 查找 __INITIAL_STATE__ 的JSON数据
+    match = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});', html, re.DOTALL)
+    if not match:
+        return images
+    
+    try:
+        data = json.loads(match.group(1))
+        
+        # feed页面：prefetchData 可能是字典或数组，需要遍历找到 ssrCommonData.contentData
+        prefetch = data.get('prefetchData')
+        if prefetch:
+            # 如果是字典，转为列表
+            if isinstance(prefetch, dict):
+                prefetch = list(prefetch.values())
+            
+            # 遍历查找 contentData
+            if isinstance(prefetch, list):
+                for item in prefetch:
+                    if not isinstance(item, dict):
+                        continue
+                    
+                    # 查找 ssrCommonData.contentData
+                    ssr = item.get('ssrCommonData') or item.get('ssrData')
+                    if isinstance(ssr, dict):
+                        content_data = ssr.get('contentData')
+                        if isinstance(content_data, dict):
+                            content = content_data.get('content', '')
+                            if content:
+                                # 从content字段中提取图片URL
+                                # 格式1: ![](https://...)
+                                img_urls = re.findall(r'!\[.*?\]\((https?://[^\)]+)\)', content)
+                                images.extend(img_urls)
+                                
+                                # 格式2: <img src="https://...">
+                                img_urls = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', content)
+                                images.extend(img_urls)
+                                
+                                # 格式3: 直接的图片URL
+                                img_urls = re.findall(r'(https://uploadfiles\.nowcoder\.com/[^\s\)"\'\]]+)', content)
+                                images.extend(img_urls)
+        
+        # discuss页面：postDetail.content
+        if 'postDetail' in data and data['postDetail']:
+            content = data['postDetail'].get('content', '')
+            
+            # 格式1: ![](https://...)
+            img_urls = re.findall(r'!\[.*?\]\((https?://[^\)]+)\)', content)
+            images.extend(img_urls)
+            
+            # 格式2: <img src="https://...">
+            img_urls = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', content)
+            images.extend(img_urls)
+            
+            # 格式3: 直接的图片URL
+            img_urls = re.findall(r'(https://uploadfiles\.nowcoder\.com/[^\s\)"\'\]]+)', content)
+            images.extend(img_urls)
+    
+    except Exception as e:
+        logger.warning(f"解析__INITIAL_STATE__图片失败: {e}")
+    
+    # 去重并过滤表情包
+    unique_images = []
+    seen = set()
+    for img in images:
+        if img not in seen and 'emoticon' not in img and img.startswith('http'):
+            seen.add(img)
+            unique_images.append(img)
+    
+    return unique_images
 
 
-def _collect_image_urls(soup: BeautifulSoup, html: str = "") -> List[str]:
-    """从 DOM 和 JSON 收集图片 URL（feed 页面图片多在 JSON 中），与 test_nowcoder_fetch 一致"""
-    urls = _collect_image_urls_from_dom(soup)
-    if not urls and html:
-        urls = _collect_image_urls_from_json(html)
-    return urls
+def _collect_image_urls(soup: BeautifulSoup, html: str) -> List[str]:
+    """
+    收集图片URL（整合DOM和JSON两种方式）
+    优先使用JSON方式（test4.py验证可用），DOM方式作为兜底
+    """
+    # 优先使用JSON方式提取图片（test4.py中验证可用）
+    images = _collect_image_urls_from_json(html)
+    
+    # 如果JSON方式没有提取到图片，尝试DOM方式
+    if not images:
+        images = _collect_image_urls_from_dom(soup)
+    
+    return images
 
 
 # ══════════════════════════════════════════════════════════════
@@ -616,87 +690,186 @@ class NowcoderCrawler:
     # ── 列表页发现（严格按参考 parse_list_page）──────────────────────────────
 
     def discover_page(self, keyword: str, page: int) -> List[Dict]:
-        """爬取一页搜索结果，返回帖子元数据列表"""
-        list_url = f"{self.BASE_URL}/search/all?query={keyword}&type=all&searchType=顶部搜索栏&page={page}"
+        """
+        爬取一页搜索结果，返回帖子元数据列表
+        修复：统一使用POST API接口（参考test4.py的正确实现）
+        """
         try:
-            logger.info(f"牛客 请求列表页: keyword={keyword!r}, page={page}")
+            logger.debug(f"牛客 请求列表页: keyword={keyword!r}, page={page}")
             time.sleep(random.uniform(2, 4))
             self._update_headers()
-            resp = self.session.get(list_url, timeout=20)
-            if resp.status_code != 200:
-                logger.warning(f"列表页请求失败 {resp.status_code} page={page}")
-                return []
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            # 定位帖子卡片（与参考一致：tw-bg-white + tw-mt-3 + tw-rounded-xl）
-            post_cards = soup.find_all(
-                "div",
-                class_=lambda x: x and "tw-bg-white" in x and "tw-mt-3" in x and "tw-rounded-xl" in x,
-            )
-            if not post_cards:
-                logger.info(f"第 {page} 页未找到数据（检查 Cookie 或是否末页）")
-                return []
-
-            results = []
-            total = len(post_cards)
-            for idx, card in enumerate(post_cards, 1):
-                try:
-                    # 标题
-                    title_tag = card.find(
-                        "div",
-                        class_=lambda x: x and "tw-font-bold" in x and "tw-text-lg" in x,
-                    )
-                    if not title_tag:
-                        continue
-                    title = title_tag.get_text(strip=True) or "无标题"
-
-                    # 链接
-                    link_tag = title_tag.find("a")
-                    if not link_tag:
-                        continue
-                    href = link_tag.get("href", "")
-                    post_url = urljoin(self.BASE_URL, href.split("?")[0]) if href else ""
-
-                    # 发布时间
-                    time_tag = card.find("div", class_=lambda x: x and "show-time" in x)
-                    pub_time = time_tag.get_text(strip=True) if time_tag else ""
-
-                    # 作者
-                    author_tag = card.find("div", class_="user-nickname")
-                    author = author_tag.get_text(strip=True) if author_tag else "匿名"
-
-                    # 核心：从整个卡片文本解析（与参考一致）
-                    full_card_text = card.get_text(separator=" ", strip=True)
-                    preview_div = card.find("div", class_="placeholder-text")
-                    preview_content = preview_div.get_text(strip=True) if preview_div else ""
-
-                    analysis = _extract_meta_info(title, full_card_text)
-
-                    results.append({
-                        "title": title,
-                        "source_url": post_url,
-                        "source_platform": "nowcoder",
-                        "company": analysis["company"],
-                        "position": analysis["role"],
-                        "business_line": analysis["business"],
-                        "difficulty": analysis["difficulty"],
-                        "post_type": analysis["post_type"],
-                        "discover_keyword": keyword,
-                    })
-                    logger.info(
-                        f"牛客 [{idx}/{total}] 列表页发现: {title[:30]}... | {post_url[:60]}"
-                    )
-                except Exception as e:
-                    logger.warning(f"牛客 列表页解析单条出错 [{idx}/{total}]: {e}")
-                    continue
-
-            logger.info(f"牛客 keyword={keyword} page={page} 发现 {len(results)} 条")
-            return results
-
+            
+            # 统一使用POST API接口（test4.py验证可用）
+            return self._discover_page_ajax(keyword, page)
+                
         except Exception as e:
-            logger.error(f"列表页异常 {list_url}: {e}")
+            logger.error(f"列表页爬取失败 keyword={keyword!r} page={page}: {e}")
             return []
+    
+
+    def _discover_page_ajax(self, keyword: str, page: int) -> List[Dict]:
+        """调用AJAX接口（使用POST请求，参考test4.py）"""
+        from urllib.parse import quote
+        current_timestamp = int(time.time() * 1000)
+        api_url = f"https://gw-c.nowcoder.com/api/sparta/pc/search?_={current_timestamp}"
+        
+        payload = {
+            "type": "all",
+            "query": keyword,
+            "page": page,
+            "tag": [],
+            "order": "",
+            "gioParams": {
+                "logid_var": "208c8a30-1a3b-11f1-9ba9-5947654d7ac0",
+                "sessionID_var": "100_1772897667667_9590",
+                "searchFrom_var": "历史搜索",
+                "searchEnter_var": "主站"
+            }
+        }
+        
+        # 添加必要的headers（Referer中的中文需要URL编码）
+        safe_keyword = quote(keyword)
+        headers = self.session.headers.copy()
+        headers.update({
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"https://www.nowcoder.com/search/all?query={safe_keyword}&type=all",
+            "Origin": "https://www.nowcoder.com",
+            "Accept": "application/json, text/plain, */*",
+        })
+        
+        resp = self.session.post(api_url, json=payload, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            logger.warning(f"AJAX接口请求失败 {resp.status_code} page={page}")
+            return []
+        
+        try:
+            data = resp.json()
+            records = data.get("data", {}).get("records", [])
+            
+            if not records:
+                logger.warning(f"第 {page} 页未找到数据")
+                return []
+            
+            logger.debug(f"牛客 [{page}/20] 列表页发现: 本页 {len(records)} 条")
+            
+            return self._parse_records_from_json(records, keyword)
+            
+        except Exception as e:
+            logger.error(f"解析AJAX响应失败: {e}")
+            return []
+    
+    def _parse_records_from_json(self, records: List[Dict], keyword: str) -> List[Dict]:
+        """解析JSON格式的帖子记录"""
+        results = []
+        
+        for idx, rec in enumerate(records, 1):
+            try:
+                data = rec.get("data", {})
+                moment = data.get("momentData", {})
+                
+                # 提取关键信息
+                content_id = moment.get("id") or data.get("contentId")
+                uuid = moment.get("uuid", "")
+                title = moment.get("title", "")
+                content = moment.get("content", "")
+                
+                if not content_id or not uuid:
+                    continue
+                
+                # 构造详情页URL
+                post_url = f"{self.BASE_URL}/feed/main/detail/{uuid}"
+                
+                # 提取用户信息
+                user_brief = data.get("userBrief", {})
+                author = user_brief.get("nickname", "匿名")
+                
+                # 提取时间（使用北京时间 UTC+8）
+                created_at = moment.get("createdAt", 0)
+                pub_time = timestamp_ms_to_beijing(created_at) if created_at else ""
+                
+                # 元数据分析
+                full_text = f"{title} {content}"
+                analysis = _extract_meta_info(title, full_text)
+                
+                results.append({
+                    "title": title,
+                    "source_url": post_url,
+                    "source_platform": "nowcoder",
+                    "company": analysis["company"],
+                    "position": analysis["role"],
+                    "business_line": analysis["business"],
+                    "difficulty": analysis["difficulty"],
+                    "post_type": analysis["post_type"],
+                    "discover_keyword": keyword,
+                })
+                
+                logger.debug(f"牛客 [{idx}/{len(records)}] 列表页发现: {title[:30]}... | {post_url}")
+                
+            except Exception as e:
+                logger.warning(f"解析单条记录失败: {e}")
+                continue
+        
+        logger.debug(f"牛客 keyword={keyword!r} 发现 {len(results)} 条")
+        return results
+    
+    def _discover_page_dom_fallback(self, html: str, keyword: str, page: int) -> List[Dict]:
+        """DOM解析兜底方案（当JSON解析失败时）"""
+        soup = BeautifulSoup(html, "html.parser")
+        
+        # 定位帖子卡片（与参考一致：tw-bg-white + tw-mt-3 + tw-rounded-xl）
+        post_cards = soup.find_all(
+            "div",
+            class_=lambda x: x and "tw-bg-white" in x and "tw-mt-3" in x and "tw-rounded-xl" in x,
+        )
+        if not post_cards:
+            logger.info(f"第 {page} 页未找到数据（检查 Cookie 或是否末页）")
+            return []
+
+        results = []
+        total = len(post_cards)
+        for idx, card in enumerate(post_cards, 1):
+            try:
+                # 标题
+                title_tag = card.find(
+                    "div",
+                    class_=lambda x: x and "tw-font-bold" in x and "tw-text-lg" in x,
+                )
+                if not title_tag:
+                    continue
+                title = title_tag.get_text(strip=True) or "无标题"
+
+                # 链接
+                link_tag = title_tag.find("a")
+                if not link_tag:
+                    continue
+                href = link_tag.get("href", "")
+                post_url = urljoin(self.BASE_URL, href.split("?")[0]) if href else ""
+
+                # 核心：从整个卡片文本解析（与参考一致）
+                full_card_text = card.get_text(separator=" ", strip=True)
+                analysis = _extract_meta_info(title, full_card_text)
+
+                results.append({
+                    "title": title,
+                    "source_url": post_url,
+                    "source_platform": "nowcoder",
+                    "company": analysis["company"],
+                    "position": analysis["role"],
+                    "business_line": analysis["business"],
+                    "difficulty": analysis["difficulty"],
+                    "post_type": analysis["post_type"],
+                    "discover_keyword": keyword,
+                })
+                logger.info(
+                    f"牛客 [{idx}/{total}] 列表页发现: {title[:30]}... | {post_url[:60]}"
+                )
+            except Exception as e:
+                logger.warning(f"牛客 列表页解析单条出错 [{idx}/{total}]: {e}")
+                continue
+
+        logger.debug(f"牛客 keyword={keyword} page={page} 发现 {len(results)} 条")
+        return results
 
     def discover(
         self,

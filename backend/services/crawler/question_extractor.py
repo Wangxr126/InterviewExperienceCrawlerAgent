@@ -14,6 +14,7 @@
   - source_platform  来源平台
   - source_url       原帖链接
 """
+from backend.utils.time_utils import now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
 import json
 import logging
 import re
@@ -36,55 +37,58 @@ MAX_CONTENT_CHARS = 6000
 # 重新提取所有时使用的时间戳后缀，写入独立文件；None 则用默认路径
 _llm_log_run_suffix: Optional[str] = None
 
-EXTRACT_SYSTEM_PROMPT = """你是面经结构化专家，从面经原文中精准提取所有面试题，输出严格的 JSON 数组。
+EXTRACT_SYSTEM_PROMPT = """你是面经提取专家，从面经原文中提取所有面试题，输出 JSON 数组。
 
-## 核心规则
-- 必须且仅从「面经原文」中提取，不编造、不输出原文不存在的题目
-- 从叙述句中挖掘题目（如「问了 RAG 原理」→ 提取为「请介绍 RAG 的原理」）
-- 从叙述句中提取答案片段（如「我说了 RDB 和 AOF」→ answer_text 填 "RDB、AOF"）
-- 开放性问题若原文无答案，可基于知识给出实质性参考答案
+**重要：所有回答必须使用中文！题目、答案、分类等所有字段内容都必须用中文表达。**
 
-## 题目边界识别
-以下形式均表示独立面试题，必须逐条提取：
-- **编号**：1. 2. ① ② 一、二、（1）（2）等
-- **换行**：每行描述一个独立知识点或问题时，单独提取
-- **分号**：「；」或「;」连接的多个问题，逐个拆分（如「问了 RAG；CoT 是什么；聊了 LoRA」→ 3 道题）
-- **关键词**：「问了」「手写」「手撕」「聊了」「介绍一下」后跟的内容
+## 提取规则
+1. 只提取原文中的题目，不编造
+2. 口语化题目改写为标准问题（如「聊了Redis」→「请介绍Redis的应用场景」）
+3. 从叙述中提取答案片段（如「我说了RDB和AOF」→ answer_text填"RDB、AOF"）
+4. 无答案的开放题可给出参考答案
 
-## 无效内容过滤（一律不提取）
-- 纯过渡语：「然后」「接下来」「还有」「另外」「问了一些」「聊了会儿」
-- 情绪感叹：「好难啊」「麻了」「凉了」「还不错」「没答上来」
-- 流程描述：「整体难度...」「面试官很和善」「共面了 XX 分钟」
-- 少于 8 字且不含技术词汇的片段
-- 不能独立作答的半截句子或上下文过渡
+## 题目识别
+- 编号：1. 2. ① ② 一、二、
+- 关键词：「问了」「手写」「手撕」「聊了」「介绍」
+- 分号分隔：「问了RAG；CoT是什么」→ 2道题
 
-## answer_text 格式
-分条列点，每条「1. 」「2. 」开头，换行分隔。示例：1. RDB 快照\\n2. AOF 日志追加
+## 过滤无效内容
+- 过渡语：「然后」「接下来」「还有」
+- 情绪：「好难」「麻了」「凉了」
+- 流程：「面试官很和善」「共XX分钟」
+- 少于8字且无技术词汇
+
+## question_type分类
+算法类：DP编程题、回溯编程题、贪心编程题、图算法题、树算法题、链表题、数组题、其他算法题
+AI/ML：LLM原理题、LLM算法题、模型结构题、模型训练题、RAG题、Agent题、CV题、NLP题
+工程类：系统设计题、数据库题、缓存题、消息队列题、微服务题、性能优化题、并发编程题
+基础类：操作系统题、计算机网络题、数据结构题、编程语言题
+软技能：项目经验题、行为题、HR题
 
 ## 输出格式
-- 仅输出 JSON，不加 markdown 代码块或任何解释
-- 完全无关帖子（纯吐槽/广告）输出 {\"reason\":\"帖子与面经无关\"}
-- 有题目时输出数组，无题目但内容相关时输出 []
-- question_type 只能是：技术题 / 算法题 / 行为题 / 系统设计 / HR问题
-- topic_tags：从题目中抽取 2～6 个具体技术标签，不要空数组
-- company / position / difficulty：原文明确提及才填，否则填空字符串"""
+直接输出JSON数组，不加markdown代码块。**所有字段内容必须用中文。**
+格式：[{"question_text":"题目（中文）","answer_text":"答案（中文）","difficulty":"easy/medium/hard","question_type":"分类","topic_tags":["标签"],"company":"","position":""}]
 
-EXTRACT_FORMAT_HINT = """
-## JSON 格式提示
-数组元素：{{"question_text":"题目","answer_text":"答案或空","difficulty":"easy/medium/hard或空","question_type":"技术题/算法题/行为题/系统设计/HR问题","topic_tags":["标签"],"company":"","position":""}}"""
+特殊情况：
+- 完全无关帖子（广告/吐槽）：{"reason":"帖子与面经无关"}
+- 无题目但相关：[]（空数组，不要返回空对象{}）"""
 
-EXTRACT_PROMPT_TEMPLATE = """## 帖子信息
-- 平台：{platform}
-- 公司：{company}
-- 岗位：{position}
-- 难度：{difficulty}
 
-## 面经原文（必须且仅从此处提取）
+EXTRACT_PROMPT_TEMPLATE = """## 面经原文
 {content}
 
 ## 任务
-请从上面的「面经原文」中提取所有面试题，输出 JSON 数组。只输出原文中实际出现的题目。{format_hint}
-"""
+从上面原文提取所有面试题，输出JSON数组。
+
+**重要信息**：
+- 公司：{company}
+- 岗位：{position}
+
+**要求**：
+1. 每道题目的company字段必须填写：{company}
+2. 每道题目的position字段必须填写：{position}
+3. 如果原文中提到其他公司或岗位，以原文为准
+4. 所有内容必须用中文"""
 
 
 def _extract_content_for_log(user_prompt: str) -> str:
@@ -109,14 +113,14 @@ def _get_finetune_log_path(source: str = "nowcoder") -> Path:
     from backend.config.config import settings
     _PROJECT_ROOT = Path(__file__).resolve().parents[3]
     model_name = (settings.llm_model_id or "unknown").replace(":", "_").replace(" ", "_")
-    date_str = datetime.now().strftime("%Y%m%d")
+    date_str = now_beijing_str("%Y%m%d")
     log_dir = _PROJECT_ROOT / "微调" / "llm_logs" / model_name
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir / f"{source}_{date_str}.jsonl"
 
 
 def _append_llm_log_to_csv(user_prompt: str, llm_response: str, response_time_sec: float = None,
-                            source: str = "nowcoder") -> None:
+                            source: str = "nowcoder", title: str = "", source_url: str = "") -> None:
     """
     将 LLM 交互写入两个位置：
     1. 旧路径（LLM_PROMPT_LOG_CSV）—— 兼容现有调试查看
@@ -150,7 +154,7 @@ def _append_llm_log_to_csv(user_prompt: str, llm_response: str, response_time_se
     try:
         ft_path = _get_finetune_log_path(source)
         ft_record = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
+            "ts": now_beijing_str().isoformat(timespec="seconds"),
             "content": content,
             "llm_raw": llm_raw,
         }
@@ -222,11 +226,16 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
     # 去掉 markdown 代码块（```json ... ``` 或 ``` ... ```）
     text = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`").strip()
 
-    # 0. 检测「帖子与面经无关」
+    # 0. 检测「帖子与面经无关」或空对象
     try:
         data = json.loads(text)
-        if isinstance(data, dict) and data.get("reason") == "帖子与面经无关":
-            return [], "unrelated"
+        if isinstance(data, dict):
+            if data.get("reason") == "帖子与面经无关":
+                return [], "unrelated"
+            # 处理空对象 {} 的情况（LLM有时返回空对象表示无题目）
+            if not data:
+                logger.info("LLM 返回空对象 {}，判定为无题目")
+                return [], "empty"
     except json.JSONDecodeError:
         pass
 
@@ -370,7 +379,9 @@ def extract_questions_from_post(
     从面经原文中用 LLM 提取结构化题目列表。
 
     content 过长时自动截断（6000 字符，约 3000 token）。
-    返回 (questions, status)，status 为 ok/unrelated/empty。
+    返回 (questions, status)，status 为 ok/unrelated/empty/parse_error。
+    
+    支持重试机制：当返回为空或解析失败时，自动重试（最大次数由 EXTRACTOR_MAX_RETRIES 配置）。
     """
     if not content or len(content.strip()) < 50:
         logger.warning(f"内容过短，跳过提取: {source_url}")
@@ -382,31 +393,46 @@ def extract_questions_from_post(
         logger.info(f"内容截断: {len(content)} → {MAX_CONTENT_CHARS} chars")
 
     user_prompt = EXTRACT_PROMPT_TEMPLATE.format(
-        platform="牛客网" if platform == "nowcoder" else "小红书",
         company=company or "未知",
         position=position or "未知",
-        difficulty=difficulty or "适中",
         content=truncated,
-        format_hint=EXTRACT_FORMAT_HINT,
     )
 
-    t0 = time.perf_counter()
-    raw = _call_llm(user_prompt)
-    llm_response_time_sec = time.perf_counter() - t0
+    from backend.config.config import settings
+    max_retries = settings.extractor_max_retries
+    
+    # 重试循环
+    for attempt in range(1, max_retries + 1):
+        t0 = time.perf_counter()
+        raw = _call_llm(user_prompt)
+        llm_response_time_sec = time.perf_counter() - t0
 
-    items, status = _parse_json_from_llm(raw, user_prompt_for_debug=user_prompt)
+        items, status = _parse_json_from_llm(raw, user_prompt_for_debug=user_prompt)
 
-    _append_llm_log_to_csv(user_prompt, raw or "", llm_response_time_sec, source=platform)
+        _append_llm_log_to_csv(user_prompt, raw or "", llm_response_time_sec, source=platform, 
+                               title=post_title, source_url=source_url)
 
-    if status == "unrelated":
-        logger.info(f"LLM 判定帖子与面经无关: {source_url}")
-        return [], "unrelated"
-
-    if not items:
-        logger.warning(f"LLM 未提取到题目: {source_url}")
-        if raw:
-            logger.info(f"LLM 原始返回（前500字）: {raw[:500]}")
-        return [], "empty"
+        # 成功或明确判定为无关，直接返回
+        if status == "unrelated":
+            logger.info(f"LLM 判定帖子与面经无关: {source_url}")
+            return [], "unrelated"
+        
+        if status == "ok" and items:
+            if attempt > 1:
+                logger.info(f"重试成功（第 {attempt} 次）: 提取到 {len(items)} 道题目")
+            break
+        
+        # 需要重试的情况：empty 或 parse_error
+        if attempt < max_retries:
+            logger.warning(f"提取失败（第 {attempt} 次，状态: {status}），{max_retries - attempt} 次重试机会剩余")
+            time.sleep(1)  # 短暂延迟避免频繁请求
+        else:
+            logger.error(f"提取失败，已达最大重试次数 {max_retries}: {source_url}")
+            if not items:
+                logger.warning(f"LLM 未提取到题目: {source_url}")
+                if raw:
+                    logger.info(f"LLM 原始返回（前500字）: {raw[:500]}")
+                return [], status
 
     questions: List[Dict] = []
     for item in items:

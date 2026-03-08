@@ -41,6 +41,13 @@
           {{ showAnswer ? '隐藏答案' : '📋 标准答案' }}
         </el-button>
       </el-tooltip>
+      <el-button 
+        v-if="question.source_url" 
+        type="warning" 
+        @click="window.open(question.source_url, '_blank')"
+      >
+        🔗 查看原帖
+      </el-button>
       <el-button type="info" @click="$emit('send-to-chat', { question })">💬 去对话练习</el-button>
       <el-button type="primary" :loading="submitting" @click="submit">提交作答</el-button>
     </template>

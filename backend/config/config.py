@@ -54,25 +54,74 @@ class _Settings:
     """运行时只读配置对象（属性懒加载，确保 load_dotenv 先执行）"""
 
     # ── 1. 全局 LLM ──────────────────────────────────────────────
+    # 使用模式：LOCAL（本地Ollama）或 REMOTE（云端API）
+    @property
+    def llm_mode(self) -> str:
+        """LLM使用模式：local（本地）或 remote（远程），默认local"""
+        return _get("LLM_MODE", "local").lower()
+
+    # ── 1.1 本地配置（Ollama）──
+    @property
+    def llm_local_provider(self) -> str:
+        return _get("LLM_LOCAL_PROVIDER", "ollama")
+
+    @property
+    def llm_local_model(self) -> str:
+        return _get("LLM_LOCAL_MODEL", "qwen3:4b")
+
+    @property
+    def llm_local_api_key(self) -> str:
+        return _get("LLM_LOCAL_API_KEY", "ollama")
+
+    @property
+    def llm_local_base_url(self) -> str:
+        return _get("LLM_LOCAL_BASE_URL", "http://localhost:11434/v1")
+
+    @property
+    def llm_local_timeout(self) -> int:
+        return _get_int("LLM_LOCAL_TIMEOUT", 60)
+
+    # ── 1.2 远程配置（云端API）──
+    @property
+    def llm_remote_provider(self) -> str:
+        return _get("LLM_REMOTE_PROVIDER", "volcengine")
+
+    @property
+    def llm_remote_model(self) -> str:
+        return _get("LLM_REMOTE_MODEL")
+
+    @property
+    def llm_remote_api_key(self) -> str:
+        return _get("LLM_REMOTE_API_KEY")
+
+    @property
+    def llm_remote_base_url(self) -> str:
+        return _get("LLM_REMOTE_BASE_URL")
+
+    @property
+    def llm_remote_timeout(self) -> int:
+        return _get_int("LLM_REMOTE_TIMEOUT", 300)
+
+    # ── 1.3 当前使用的配置（根据mode自动选择）──
     @property
     def llm_provider(self) -> str:
-        return _get("LLM_PROVIDER", "volcengine")
+        return self.llm_local_provider if self.llm_mode == "local" else self.llm_remote_provider
 
     @property
     def llm_model_id(self) -> str:
-        return _get("LLM_MODEL_ID")
+        return self.llm_local_model if self.llm_mode == "local" else self.llm_remote_model
 
     @property
     def llm_api_key(self) -> str:
-        return _get("LLM_API_KEY")
+        return self.llm_local_api_key if self.llm_mode == "local" else self.llm_remote_api_key
 
     @property
     def llm_base_url(self) -> str:
-        return _get("LLM_BASE_URL")
+        return self.llm_local_base_url if self.llm_mode == "local" else self.llm_remote_base_url
 
     @property
     def llm_timeout(self) -> int:
-        return _get_int("LLM_TIMEOUT", 180)
+        return self.llm_local_timeout if self.llm_mode == "local" else self.llm_remote_timeout
 
     @property
     def llm_temperature(self) -> float:
@@ -83,35 +132,68 @@ class _Settings:
         """启动时是否预热 LLM（解决 Ollama/云端 冷启动首请求慢或无响应）"""
         return _get_bool("LLM_WARMUP_ENABLED", True)
 
-    # ── 2. Hunter Agent ───────────────────────────────────────────
-    @property
-    def hunter_model(self) -> str:
-        return _get("HUNTER_MODEL") or self.llm_model_id
-
-    @property
-    def hunter_api_key(self) -> str:
-        return _get("HUNTER_API_KEY") or self.llm_api_key
-
-    @property
-    def hunter_base_url(self) -> str:
-        return _get("HUNTER_BASE_URL") or self.llm_base_url
-
-    @property
-    def hunter_temperature(self) -> float:
-        return _get_float("HUNTER_TEMPERATURE", 0.1)
-
     # ── 3. Architect Agent ────────────────────────────────────────
     @property
+    def architect_mode(self) -> str:
+        """Architect使用模式：local/remote，留空则使用全局LLM_MODE"""
+        return _get("ARCHITECT_MODE") or self.llm_mode
+
+    # 本地配置
+    @property
+    def architect_local_provider(self) -> str:
+        return _get("ARCHITECT_LOCAL_PROVIDER") or self.llm_local_provider
+
+    @property
+    def architect_local_model(self) -> str:
+        return _get("ARCHITECT_LOCAL_MODEL") or self.llm_local_model
+
+    @property
+    def architect_local_base_url(self) -> str:
+        return _get("ARCHITECT_LOCAL_BASE_URL") or self.llm_local_base_url
+
+    @property
+    def architect_local_timeout(self) -> int:
+        return _get_int("ARCHITECT_LOCAL_TIMEOUT", 0) or self.llm_local_timeout
+
+    # 远程配置
+    @property
+    def architect_remote_provider(self) -> str:
+        return _get("ARCHITECT_REMOTE_PROVIDER") or self.llm_remote_provider
+
+    @property
+    def architect_remote_model(self) -> str:
+        return _get("ARCHITECT_REMOTE_MODEL") or self.llm_remote_model
+
+    @property
+    def architect_remote_base_url(self) -> str:
+        return _get("ARCHITECT_REMOTE_BASE_URL") or self.llm_remote_base_url
+
+    @property
+    def architect_remote_timeout(self) -> int:
+        return _get_int("ARCHITECT_REMOTE_TIMEOUT", 0) or self.llm_remote_timeout
+
+    # 当前使用的配置（根据mode选择）
+    @property
+    def architect_provider(self) -> str:
+        return self.architect_local_provider if self.architect_mode == "local" else self.architect_remote_provider
+
+    @property
     def architect_model(self) -> str:
-        return _get("ARCHITECT_MODEL") or self.llm_model_id
+        return self.architect_local_model if self.architect_mode == "local" else self.architect_remote_model
 
     @property
     def architect_api_key(self) -> str:
-        return _get("ARCHITECT_API_KEY") or self.llm_api_key
+        local_key = _get("ARCHITECT_LOCAL_API_KEY") or self.llm_local_api_key
+        remote_key = _get("ARCHITECT_REMOTE_API_KEY") or self.llm_remote_api_key
+        return local_key if self.architect_mode == "local" else remote_key
 
     @property
     def architect_base_url(self) -> str:
-        return _get("ARCHITECT_BASE_URL") or self.llm_base_url
+        return self.architect_local_base_url if self.architect_mode == "local" else self.architect_remote_base_url
+
+    @property
+    def architect_timeout(self) -> int:
+        return self.architect_local_timeout if self.architect_mode == "local" else self.architect_remote_timeout
 
     @property
     def architect_temperature(self) -> float:
@@ -119,16 +201,66 @@ class _Settings:
 
     # ── 4. Interviewer Agent ──────────────────────────────────────
     @property
+    def interviewer_mode(self) -> str:
+        """Interviewer使用模式：local/remote，留空则使用全局LLM_MODE"""
+        return _get("INTERVIEWER_MODE") or self.llm_mode
+
+    # 本地配置
+    @property
+    def interviewer_local_provider(self) -> str:
+        return _get("INTERVIEWER_LOCAL_PROVIDER") or self.llm_local_provider
+
+    @property
+    def interviewer_local_model(self) -> str:
+        return _get("INTERVIEWER_LOCAL_MODEL") or self.llm_local_model
+
+    @property
+    def interviewer_local_base_url(self) -> str:
+        return _get("INTERVIEWER_LOCAL_BASE_URL") or self.llm_local_base_url
+
+    @property
+    def interviewer_local_timeout(self) -> int:
+        return _get_int("INTERVIEWER_LOCAL_TIMEOUT", 0) or self.llm_local_timeout
+
+    # 远程配置
+    @property
+    def interviewer_remote_provider(self) -> str:
+        return _get("INTERVIEWER_REMOTE_PROVIDER") or self.llm_remote_provider
+
+    @property
+    def interviewer_remote_model(self) -> str:
+        return _get("INTERVIEWER_REMOTE_MODEL") or self.llm_remote_model
+
+    @property
+    def interviewer_remote_base_url(self) -> str:
+        return _get("INTERVIEWER_REMOTE_BASE_URL") or self.llm_remote_base_url
+
+    @property
+    def interviewer_remote_timeout(self) -> int:
+        return _get_int("INTERVIEWER_REMOTE_TIMEOUT", 0) or self.llm_remote_timeout
+
+    # 当前使用的配置（根据mode选择）
+    @property
+    def interviewer_provider(self) -> str:
+        return self.interviewer_local_provider if self.interviewer_mode == "local" else self.interviewer_remote_provider
+
+    @property
     def interviewer_model(self) -> str:
-        return _get("INTERVIEWER_MODEL") or self.llm_model_id
+        return self.interviewer_local_model if self.interviewer_mode == "local" else self.interviewer_remote_model
 
     @property
     def interviewer_api_key(self) -> str:
-        return _get("INTERVIEWER_API_KEY") or self.llm_api_key
+        local_key = _get("INTERVIEWER_LOCAL_API_KEY") or self.llm_local_api_key
+        remote_key = _get("INTERVIEWER_REMOTE_API_KEY") or self.llm_remote_api_key
+        return local_key if self.interviewer_mode == "local" else remote_key
 
     @property
     def interviewer_base_url(self) -> str:
-        return _get("INTERVIEWER_BASE_URL") or self.llm_base_url
+        return self.interviewer_local_base_url if self.interviewer_mode == "local" else self.interviewer_remote_base_url
+
+    @property
+    def interviewer_timeout(self) -> int:
+        return self.interviewer_local_timeout if self.interviewer_mode == "local" else self.interviewer_remote_timeout
 
     @property
     def interviewer_temperature(self) -> float:
@@ -136,16 +268,66 @@ class _Settings:
 
     # ── 4.5 微调辅助大模型 ────────────────────────────────────────
     @property
+    def finetune_mode(self) -> str:
+        """Finetune使用模式：local/remote，留空则使用全局LLM_MODE"""
+        return _get("FINETUNE_MODE") or self.llm_mode
+
+    # 本地配置
+    @property
+    def finetune_local_provider(self) -> str:
+        return _get("FINETUNE_LOCAL_PROVIDER") or self.llm_local_provider
+
+    @property
+    def finetune_local_model(self) -> str:
+        return _get("FINETUNE_LOCAL_MODEL") or self.llm_local_model
+
+    @property
+    def finetune_local_base_url(self) -> str:
+        return _get("FINETUNE_LOCAL_BASE_URL") or self.llm_local_base_url
+
+    @property
+    def finetune_local_timeout(self) -> int:
+        return _get_int("FINETUNE_LOCAL_TIMEOUT", 0) or self.llm_local_timeout
+
+    # 远程配置
+    @property
+    def finetune_remote_provider(self) -> str:
+        return _get("FINETUNE_REMOTE_PROVIDER") or self.llm_remote_provider
+
+    @property
+    def finetune_remote_model(self) -> str:
+        return _get("FINETUNE_REMOTE_MODEL") or self.llm_remote_model
+
+    @property
+    def finetune_remote_base_url(self) -> str:
+        return _get("FINETUNE_REMOTE_BASE_URL") or self.llm_remote_base_url
+
+    @property
+    def finetune_remote_timeout(self) -> int:
+        return _get_int("FINETUNE_REMOTE_TIMEOUT", 0) or self.llm_remote_timeout
+
+    # 当前使用的配置（根据mode选择）
+    @property
+    def finetune_llm_provider(self) -> str:
+        return self.finetune_local_provider if self.finetune_mode == "local" else self.finetune_remote_provider
+
+    @property
     def finetune_llm_model(self) -> str:
-        return _get("FINETUNE_LLM_MODEL") or self.llm_model_id
+        return self.finetune_local_model if self.finetune_mode == "local" else self.finetune_remote_model
 
     @property
     def finetune_llm_api_key(self) -> str:
-        return _get("FINETUNE_LLM_API_KEY") or self.llm_api_key
+        local_key = _get("FINETUNE_LOCAL_API_KEY") or self.llm_local_api_key
+        remote_key = _get("FINETUNE_REMOTE_API_KEY") or self.llm_remote_api_key
+        return local_key if self.finetune_mode == "local" else remote_key
 
     @property
     def finetune_llm_base_url(self) -> str:
-        return _get("FINETUNE_LLM_BASE_URL") or self.llm_base_url
+        return self.finetune_local_base_url if self.finetune_mode == "local" else self.finetune_remote_base_url
+
+    @property
+    def finetune_llm_timeout(self) -> int:
+        return self.finetune_local_timeout if self.finetune_mode == "local" else self.finetune_remote_timeout
 
     @property
     def finetune_llm_temperature(self) -> float:
@@ -156,6 +338,21 @@ class _Settings:
     def extractor_temperature(self) -> float:
         """面经题目提取 LLM 温度。结构化 JSON 输出建议 0.0~0.2，小模型可略高至 0.2 减少刻板错误。"""
         return _get_float("EXTRACTOR_TEMPERATURE", 0.2)
+
+    @property
+    def extractor_max_retries(self) -> int:
+        """题目提取失败时的最大重试次数（返回空或格式错误时重试）"""
+        return _get_int("EXTRACTOR_MAX_RETRIES", 3)
+
+    @property
+    def crawler_fetch_max_retries(self) -> int:
+        """爬取详情页失败时的最大重试次数"""
+        return _get_int("CRAWLER_FETCH_MAX_RETRIES", 3)
+    
+    @property
+    def crawler_retry_delay(self) -> int:
+        """爬取重试间隔（秒）"""
+        return _get_int("CRAWLER_RETRY_DELAY", 5)
 
     # ── 5. Embedding ──────────────────────────────────────────────
     @property
@@ -232,6 +429,22 @@ class _Settings:
     def post_images_dir(self) -> Path:
         """帖子图片存储目录：backend/data/post_images/{task_id}/"""
         return self.backend_data_dir / "post_images"
+
+    # ── OCR 配置 ──────────────────────────────────────────────
+    @property
+    def ocr_method(self) -> str:
+        """OCR 方法：claude_vision（默认）或 mcp"""
+        return _get("OCR_METHOD", "claude_vision")
+
+    @property
+    def mcp_ocr_server(self) -> str:
+        """MCP OCR 服务器名称"""
+        return _get("MCP_OCR_SERVER", "ocr-server")
+
+    @property
+    def anthropic_api_key(self) -> str:
+        """Anthropic API Key（用于 Claude Vision OCR）"""
+        return _get("ANTHROPIC_API_KEY", "")
 
     @property
     def nowcoder_output_dir(self) -> Path:

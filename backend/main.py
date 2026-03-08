@@ -4,6 +4,7 @@
 API 文档：http://localhost:8000/docs
 """
 # ── 必须最先执行：加载项目 .env，确保 hello_agents 能读到正确的数据库/embedding 配置 ──
+from backend.utils.time_utils import now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
 import os
 import logging
 import sys
@@ -1002,7 +1003,7 @@ async def re_extract_all_posts(batch_size: int | None = Query(default=None, ge=1
     # 本次重新提取使用独立日志文件（按时间戳）
     from datetime import datetime
     from backend.services.crawler import question_extractor
-    _run_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _run_suffix = now_beijing_str("%Y%m%d_%H%M%S")
     question_extractor._llm_log_run_suffix = _run_suffix
     logger.info(f"[API] 重新提取 LLM 日志将写入: llm_prompt_log_{_run_suffix}.jsonl")
 
@@ -1084,24 +1085,8 @@ async def clear_all_crawl_data():
                 except Exception as e:
                     logger.warning(f"删除图片目录失败 {d}: {e}")
 
-    # 清除 LLM 相关日志与缓存
+    # 清除小红书链接缓存（保留 LLM 交互日志，用户可能需要用于微调）
     log_cleared = []
-    llm_log_path = settings.llm_prompt_log_csv
-    if llm_log_path:
-        p = Path(llm_log_path)
-        for fp in [p, p.with_suffix(".jsonl"), p.with_suffix(".csv")]:
-            if fp.exists():
-                fp.write_text("", encoding="utf-8")
-        if p.exists() or p.with_suffix(".jsonl").exists() or p.with_suffix(".csv").exists():
-            log_cleared.append("LLM 交互日志")
-    failures_dir = settings.logs_dir / "llm_failures"
-    if failures_dir.exists():
-        for f in failures_dir.glob("*.jsonl"):
-            try:
-                f.unlink()
-            except Exception as e:
-                logger.warning(f"删除 llm_failures 失败 {f}: {e}")
-        log_cleared.append("LLM 解析失败记录")
     xhs_path = Path(settings.xhs_link_cache_path)
     if xhs_path.exists():
         xhs_path.write_text("", encoding="utf-8")
@@ -1322,9 +1307,10 @@ async def finetune_samples(
     status: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    order: str = Query("asc", regex="^(asc|desc)$"),
 ):
     """分页查询微调样本列表"""
-    return _ft.list_samples(status=status, page=page, page_size=page_size)
+    return _ft.list_samples(status=status, page=page, page_size=page_size, order=order)
 
 
 @app.get("/api/finetune/samples/{sample_id}")
@@ -1346,11 +1332,15 @@ async def finetune_assist(body: dict):
     import asyncio
     sample_id = body.get("sample_id")
     content = body.get("content", "")
+    title = body.get("title", "")
+    
     if sample_id and not content:
         s = _ft.get_sample(int(sample_id))
         if not s:
             raise HTTPException(status_code=404, detail="样本不存在")
         content = s["content"]
+        title = s.get("title", "")
+    
     if not content:
         raise HTTPException(status_code=400, detail="content 不能为空")
 
@@ -1358,6 +1348,7 @@ async def finetune_assist(body: dict):
         None,
         lambda: _ft.assist_generate(
             content=content,
+            title=title,
             model=body.get("model"),
             api_key=body.get("api_key"),
             base_url=body.get("base_url"),

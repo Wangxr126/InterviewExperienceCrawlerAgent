@@ -6,10 +6,12 @@ SQLite 服务层 v2.0
   - Episodic Memory → study_records + interview_sessions
   - Semantic Memory → user_profiles + user_tag_mastery
 """
+from backend.utils.time_utils import now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
 import sqlite3
 import logging
 import json
 import uuid
+import re
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from backend.config.config import settings
@@ -174,6 +176,8 @@ class SqliteService:
             CREATE TABLE IF NOT EXISTS finetune_samples (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 content         TEXT NOT NULL,
+                title           TEXT,
+                source_url      TEXT,
                 llm_raw         TEXT,
                 assist_output   TEXT,
                 final_output    TEXT,
@@ -235,11 +239,40 @@ class SqliteService:
     # ===========================================================
     # questions 表操作
     # ===========================================================
+    
+    @staticmethod
+    def _clean_question_text(text: str) -> str:
+        """清洗题目文本，去除开头的标号"""
+        if not text:
+            return text
+        # 去除开头的各种标号格式：
+        # 1. 数字+点：1. 2. 10. 
+        # 2. 数字+括号：1) 2) (1) (2)
+        # 3. 中文数字：一、二、三、
+        # 4. 圆圈数字：① ② ③
+        # 5. 字母：a. b. A. B.
+        patterns = [
+            r'^\d+[\.\)、]\s*',           # 1. 2) 3、
+            r'^\(\d+\)\s*',               # (1) (2)
+            r'^[一二三四五六七八九十]+[、\.]\s*',  # 一、二、
+            r'^[①②③④⑤⑥⑦⑧⑨⑩]+\s*',      # ① ②
+            r'^[a-zA-Z][\.\)]\s*',        # a. b) A. B)
+        ]
+        
+        cleaned = text
+        for pattern in patterns:
+            cleaned = re.sub(pattern, '', cleaned)
+        
+        return cleaned.strip()
+    
     def upsert_question(self, q_id: str, question_text: str, answer_text: str,
                         difficulty: str = "medium", question_type: str = "技术题",
                         source_platform: str = "", source_url: str = "",
                         company: str = "", position: str = "", business_line: str = "",
                         topic_tags: List[str] = None):
+        # 清洗题目文本，去除标号
+        question_text = self._clean_question_text(question_text)
+        
         tags_json = json.dumps(topic_tags or [], ensure_ascii=False)
         with self._get_conn() as conn:
             conn.execute("""
@@ -480,7 +513,7 @@ class SqliteService:
             1.3,
             easiness_factor + 0.1 - (5 - score) * (0.08 + (5 - score) * 0.02)
         )
-        next_review_at = datetime.now() + timedelta(days=interval_days)
+        next_review_at = now_beijing_str() + timedelta(days=interval_days)
         return easiness_factor, repetitions, interval_days, next_review_at
 
     def add_study_record(self, user_id: str, question_id: str, score: int,
@@ -531,7 +564,7 @@ class SqliteService:
 
     def get_due_reviews(self, user_id: str, limit: int = 10) -> List[Dict]:
         """获取到期需要复习的题目（遗忘曲线到期）"""
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = now_beijing_str("%Y-%m-%d %H:%M:%S")
         with self._get_conn() as conn:
             cursor = conn.execute("""
                 SELECT sr.question_id, sr.score, sr.next_review_at,
@@ -585,7 +618,7 @@ class SqliteService:
                 return
 
             history = json.loads(row["conversation_history"] or "[]")
-            msg = {"role": role, "content": content, "ts": datetime.now().isoformat()}
+            msg = {"role": role, "content": content, "ts": now_beijing_str().isoformat()}
             if reasoning:
                 msg["reasoning"] = reasoning
             history.append(msg)

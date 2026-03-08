@@ -4,7 +4,7 @@
     <div class="card stats-section">
       <div class="section-header">
         <h2 class="section-title">数据采集</h2>
-        <el-button size="small" :loading="statsLoading" @click="async () => { await loadStats(); taskPage.value=1; await loadTasks() }">刷新</el-button>
+        <el-button size="small" :loading="statsLoading" @click="async () => { await loadStats(); await loadTasks() }">刷新</el-button>
       </div>
       <div v-if="statsList.length" class="stats-row">
         <div v-for="item in statsList" :key="item.status" class="stat-card" :style="{ borderLeftColor: item.color }">
@@ -73,16 +73,37 @@
       </div>
       <!-- 抓取进度：牛客/小红书获取帖子后轮询显示 -->
       <div v-if="crawlPolling" class="progress-bar-wrap">
-        <el-progress v-if="crawlDiscovered < 999" :percentage="crawlProgressPct" :status="crawlProgressPct >= 100 ? 'success' : undefined" />
-        <el-icon v-else class="is-loading" style="font-size:24px;color:var(--primary)"><Loading /></el-icon>
-        <span class="progress-text">{{ crawlProgressText }}</span>
+        <!-- 待抓取进度条 -->
+        <div class="progress-item">
+          <div class="progress-header">
+            <span class="progress-label">📥 待抓取</span>
+            <span class="progress-count">{{ pendingCount }} 条</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-fill pending" :style="{ width: pendingProgressPct + '%' }"></div>
+          </div>
+        </div>
+        <!-- 待提取进度条 -->
+        <div class="progress-item">
+          <div class="progress-header">
+            <span class="progress-label">🤖 待提取</span>
+            <span class="progress-count">{{ fetchedCount }} 条</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-fill fetched" :style="{ width: fetchedProgressPct + '%' }"></div>
+          </div>
+        </div>
+        <!-- 已完成统计 -->
+        <div class="progress-summary">
+          已完成 {{ doneCount }} 条 · 失败 {{ errorCount }} 条
+        </div>
       </div>
       <div v-else-if="ncResult || xhsMsg" class="result-msg" :class="(ncResult || xhsMsg)?.ok ? 'ok' : 'err'">
         {{ ncResult?.msg || xhsMsg?.msg }}
       </div>
       <!-- 牛客发现链接日志 -->
       <div v-if="ncCrawlLog.length" class="crawl-log-wrap">
-        <div class="crawl-log-title">牛客发现 {{ ncCrawlLog.length }} 条链接：</div>
+        <div class="crawl-log-title">牛客发现 {{ ncCrawlLog.length }} 条非重复链接：</div>
         <div class="crawl-log-list">
           <div v-for="(item, i) in ncCrawlLog" :key="i" class="crawl-log-item">
             <span class="crawl-log-num">{{ i + 1 }}.</span>
@@ -168,7 +189,7 @@
             <el-option v-for="kw in keywordOptions" :key="kw" :label="kw" :value="kw" />
           </el-select>
           <el-button size="small" @click="taskPage=1;loadTasks()">查询</el-button>
-          <el-button size="small" @click="taskPage=1;loadStats();loadTasks()">刷新</el-button>
+          <el-button size="small" @click="async () => { await loadStats(); await loadTasks() }">刷新</el-button>
           <el-button size="small" type="danger" plain @click="showClearAllDialog = true">清除所有</el-button>
         </div>
       </div>
@@ -297,7 +318,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted, onActivated } from 'vue'
 import { ElMessage } from 'element-plus'
 import { WarningFilled, Loading, QuestionFilled } from '@element-plus/icons-vue'
 import { api } from '../api.js'
@@ -399,6 +420,28 @@ const doneCount = computed(() => {
   return typeof v === 'object' ? (v.count ?? 0) : (v ?? 0)
 })
 
+const pendingCount = computed(() => {
+  const v = rawStats.value['pending']
+  return typeof v === 'object' ? (v.count ?? 0) : (v ?? 0)
+})
+
+const crawlInitialPending = ref(0)
+const crawlInitialFetched = ref(0)
+
+const pendingProgressPct = computed(() => {
+  if (!crawlPolling.value || crawlInitialPending.value <= 0) return 0
+  const current = pendingCount.value
+  const processed = Math.max(0, crawlInitialPending.value - current)
+  return Math.min(100, Math.round((processed / crawlInitialPending.value) * 100))
+})
+
+const fetchedProgressPct = computed(() => {
+  if (!crawlPolling.value || crawlInitialFetched.value <= 0) return 0
+  const current = fetchedCount.value
+  const processed = Math.max(0, crawlInitialFetched.value - current)
+  return Math.min(100, Math.round((processed / crawlInitialFetched.value) * 100))
+})
+
 const crawlProgressPct = computed(() => {
   if (!crawlPolling.value || crawlDiscovered.value <= 0) return 0
   const delta = Math.max(0, doneCount.value - crawlInitialDone.value)
@@ -478,6 +521,8 @@ const crawlBoth = async () => {
   try {
     await loadStats()
     crawlInitialDone.value = doneCount.value
+    crawlInitialPending.value = pendingCount.value
+    crawlInitialFetched.value = fetchedCount.value
     const kws = form.keywords.trim()
       ? form.keywords.split(',').map(k => k.trim()).filter(Boolean)
       : null
@@ -533,6 +578,8 @@ const crawl = async (platform) => {
     try {
       await loadStats()
       crawlInitialDone.value = doneCount.value
+      crawlInitialPending.value = pendingCount.value
+      crawlInitialFetched.value = fetchedCount.value
       const d = await api.triggerCrawl(body)
       xhsMsg.value = { ok: true, msg: d.message || '✅ 小红书爬取已在后台启动，请查看弹出的浏览器完成扫码' }
       crawlDiscovered.value = 999
@@ -560,6 +607,8 @@ const crawl = async (platform) => {
       await loadStats()
       crawlDiscovered.value = d.discovered
       crawlInitialDone.value = doneCount.value
+      crawlInitialPending.value = pendingCount.value
+      crawlInitialFetched.value = fetchedCount.value
       crawlPolling.value = true
       await loadTasks()
     } else if (d.status === 'ok') {
@@ -771,6 +820,13 @@ onMounted(async () => {
     // 忽略
   }
 })
+
+// 页面激活时重新加载数据（解决删除后切换页面数据不刷新的问题）
+onActivated(async () => {
+  await loadStats()
+  await loadTasks()
+})
+
 onUnmounted(() => { stopExtractPolling(); stopCrawlPolling() })
 
 // 提取进行中时轮询显示进度（不自动刷新表格，避免体验差）
@@ -977,17 +1033,61 @@ watch(crawlPolling, (polling) => {
   opacity: 0.9;
 }
 
-/* 进度条 */
+/* 进度条 - 简洁双条样式 */
 .crawl-section .progress-bar-wrap {
   margin-top: 20px;
-  padding: 16px 20px;
-  background: rgba(91, 110, 245, 0.06);
+  padding: 20px 24px;
+  background: linear-gradient(135deg, rgba(91, 110, 245, 0.05) 0%, rgba(91, 110, 245, 0.02) 100%);
   border-radius: 12px;
   border: 1px solid rgba(91, 110, 245, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
-.progress-bar-wrap { display: flex; align-items: center; gap: 16px; }
-.progress-bar-wrap .el-progress { flex: 1; }
-.progress-text { font-size: 13px; color: var(--text-sub); white-space: nowrap; font-weight: 500; }
+.progress-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.progress-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+.progress-count {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-sub);
+}
+.progress-track {
+  height: 8px;
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 8px;
+  transition: width 0.4s ease;
+}
+.progress-fill.pending {
+  background: linear-gradient(90deg, #f59e0b 0%, #fbbf24 100%);
+}
+.progress-fill.fetched {
+  background: linear-gradient(90deg, #3b82f6 0%, #60a5fa 100%);
+}
+.progress-summary {
+  font-size: 13px;
+  color: var(--text-sub);
+  text-align: center;
+  padding-top: 4px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
 .crawl-section .result-msg { margin-top: 20px; border-radius: 12px; }
 
 /* 3. LLM 提取 */

@@ -14,6 +14,7 @@ LLM 负责（通过 Agent）：
   • 知识结构化（帖子 → 题目 JSON）           → KnowledgeArchitectAgent
 """
 
+from backend.utils.time_utils import now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
 import asyncio
 import json
 import logging
@@ -283,7 +284,7 @@ class InterviewSystemOrchestrator:
         try:
             mt.execute("add", content=content, memory_type="working",
                        importance=importance, session_id=session_id,
-                       timestamp=datetime.now().isoformat())
+                       timestamp=now_beijing_str().isoformat())
         except Exception as e:
             logger.warning(f"写工作记忆失败: {e}")
 

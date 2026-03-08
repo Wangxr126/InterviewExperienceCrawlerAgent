@@ -74,13 +74,14 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api.js'
 import QuestionDialog from '../components/QuestionDialog.vue'
 
 const props = defineProps({
-  meta: { type: Object, default: () => ({}) }
+  meta: { type: Object, default: () => ({}) },
+  isActive: { type: Boolean, default: false }
 })
 const emit = defineEmits(['send-to-chat'])
 
@@ -133,6 +134,14 @@ const openDialog = (q) => {
 }
 
 onMounted(loadQuestions)
+
+// 监听isActive变化，当页面激活时重新加载数据
+watch(() => props.isActive, (newVal, oldVal) => {
+  if (newVal && !oldVal) {
+    // 从非激活变为激活，重新加载数据
+    loadQuestions()
+  }
+})
 </script>
 
 <style scoped>

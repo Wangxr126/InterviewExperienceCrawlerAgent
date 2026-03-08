@@ -5,6 +5,7 @@ LLM 解析失败记录服务
 存储路径：backend/data/logs/llm_failures/{source}.jsonl
 每行一个 JSON 对象，便于追加和批量处理。
 """
+from backend.utils.time_utils import now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
 import json
 import logging
 from datetime import datetime
@@ -63,7 +64,7 @@ def save_failure(
     raw_output = (raw_output or "")[:8000]
 
     record = {
-        "ts": datetime.now().isoformat(),
+        "ts": now_beijing_str().isoformat(),
         "source": source,
         "input_preview": input_preview,
         "raw_output": raw_output,

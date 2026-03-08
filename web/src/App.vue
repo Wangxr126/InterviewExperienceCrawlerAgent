@@ -30,6 +30,7 @@
       <main class="content">
         <!-- 使用 v-show 保持各视图状态，避免切换时重新挂载 -->
         <BrowseView  v-show="currentView === 'browse'" :meta="meta"
+                     :is-active="currentView === 'browse'"
                      @send-to-chat="onSendToChat" />
         <ChatView    v-show="currentView === 'chat'"   ref="chatViewRef"
                      :user-id="userId" :is-active="currentView === 'chat'" />
@@ -61,10 +62,16 @@ import FinetuneView from './views/FinetuneView.vue'
 import MasteryDialog from './components/MasteryDialog.vue'
 
 const userId      = ref('')
-const currentView = ref('browse')
+// 从 localStorage 恢复上次的视图，默认为 'browse'
+const currentView = ref(localStorage.getItem('currentView') || 'browse')
 const showMastery = ref(false)
 const chatViewRef = ref(null)
 const meta        = ref({ total: 0, companies: [], tags: [], positions: [], difficulties: [] })
+
+// 监听视图变化，保存到 localStorage
+watch(currentView, (newView) => {
+  localStorage.setItem('currentView', newView)
+})
 
 const navItems = [
   { key: 'browse',   icon: '📚', label: '题库浏览' },
