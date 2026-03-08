@@ -53,200 +53,34 @@ MINER_SYSTEM_PROMPT = """
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 MINER_TAG_LIBRARY = """
-## 技术标签库（必须使用精确标签）
+## 技术标签示例
 
-### 数据库类
+根据题目内容，从以下类别中选择合适的标签（1-5个）：
 
-**关系型数据库**：
-- MySQL、PostgreSQL、Oracle、SQL Server、SQLite
-- 索引、事务、锁、MVCC、主从复制、分库分表
-- B+树、InnoDB、MyISAM
+**数据库**: MySQL、Redis、MongoDB、PostgreSQL、Elasticsearch、索引、事务、缓存、持久化、B+树
 
-**NoSQL数据库**：
-- Redis、MongoDB、Cassandra、HBase、Neo4j
-- 缓存、持久化、集群、哨兵、分片
-- RDB、AOF、主从复制、Redis Cluster
+**后端框架**: Spring、Spring Boot、Django、Flask、FastAPI、Gin、Express、MyBatis
 
-**搜索引擎**：
-- Elasticsearch、Solr、Lucene
-- 倒排索引、分词、聚合、DSL
+**中间件**: Kafka、RabbitMQ、Nginx、Dubbo、gRPC、消息队列、负载均衡、限流
 
-### 后端框架
+**分布式**: 微服务、分布式事务、分布式锁、CAP、Raft、2PC、TCC、服务治理、熔断降级
 
-**Java生态**：
-- Spring、Spring Boot、Spring Cloud、MyBatis、Hibernate
-- Spring MVC、Spring Security、Spring Data
-- Dubbo、Netty、Tomcat
+**前端**: React、Vue、Angular、Webpack、Vite、虚拟DOM、状态管理
 
-**Python生态**：
-- Django、Flask、FastAPI、Tornado
-- SQLAlchemy、Celery、Gunicorn
+**AI/ML**: LLM、Transformer、Attention、RAG、Agent、Prompt Engineering、Fine-tuning、Embedding
 
-**Go生态**：
-- Gin、Echo、Beego、gRPC
-- Goroutine、Channel、Context
+**算法**: 动态规划、DFS、BFS、二叉树、链表、哈希表、排序、双指针
 
-**Node.js生态**：
-- Express、Koa、Nest.js、Egg.js
-- PM2、Cluster
+**基础**: 操作系统、计算机网络、TCP、HTTP、进程、线程、锁、内存管理
 
-### 中间件
+**语言**: Java、Python、Go、JavaScript、C++、并发、GC、协程
 
-**消息队列**：
-- Kafka、RabbitMQ、RocketMQ、Pulsar
-- 消息可靠性、顺序消息、延迟消息、死信队列
+**系统设计**: 高并发、高可用、性能优化、缓存设计、数据库设计
 
-**缓存**：
-- Redis、Memcached、Caffeine、Guava Cache
-- 缓存穿透、缓存击穿、缓存雪崩、缓存一致性
-
-**RPC框架**：
-- gRPC、Dubbo、Thrift、Feign
-- 服务注册、服务发现、负载均衡、熔断降级
-
-**网关**：
-- Nginx、Kong、Zuul、Gateway
-- 反向代理、负载均衡、限流、鉴权
-
-### 分布式系统
-
-**分布式理论**：
-- CAP、BASE、Paxos、Raft、2PC、3PC、TCC、Saga
-- 分布式锁、分布式事务、分布式ID、分布式缓存
-
-**微服务**：
-- 服务拆分、服务治理、服务网格、API网关
-- Istio、Envoy、Consul、Nacos、Eureka
-
-**容器编排**：
-- Docker、Kubernetes、Helm、Rancher
-- Pod、Service、Deployment、StatefulSet、ConfigMap
-
-### 前端技术
-
-**框架**：
-- React、Vue、Angular、Svelte
-- React Hooks、Vue3 Composition API、虚拟DOM、Diff算法
-
-**构建工具**：
-- Webpack、Vite、Rollup、Parcel
-- Tree Shaking、Code Splitting、HMR
-
-**状态管理**：
-- Redux、Vuex、Pinia、MobX、Zustand
-
-### AI/ML
-
-**大模型**：
-- LLM、GPT、BERT、Transformer、Attention
-- Prompt Engineering、Fine-tuning、RLHF、LoRA
-
-**RAG**：
-- Retrieval、Embedding、Vector Database、Rerank
-- Langchain、LlamaIndex、Semantic Search
-
-**Agent**：
-- ReAct、Tool Use、Planning、Memory
-- Multi-Agent、Agent Framework
-
-**深度学习**：
-- PyTorch、TensorFlow、Keras、ONNX
-- CNN、RNN、LSTM、GAN、Diffusion
-
-**机器学习**：
-- 监督学习、无监督学习、强化学习
-- 决策树、随机森林、XGBoost、SVM、KNN
-
-### 算法与数据结构
-
-**数据结构**：
-- 数组、链表、栈、队列、哈希表、树、图、堆
-- 二叉树、红黑树、B树、B+树、跳表、布隆过滤器
-
-**算法**：
-- 排序、查找、动态规划、贪心、回溯、分治
-- DFS、BFS、双指针、滑动窗口、前缀和、差分
-
-**算法题类型**：
-- 字符串、数组、链表、树、图、动态规划
-- 二分查找、双指针、滑动窗口、单调栈
-
-### 计算机基础
-
-**操作系统**：
-- 进程、线程、协程、锁、信号量、死锁
-- 内存管理、虚拟内存、页面置换、文件系统
-- Linux、进程调度、IO模型
-
-**计算机网络**：
-- TCP、UDP、HTTP、HTTPS、WebSocket、gRPC
-- 三次握手、四次挥手、滑动窗口、拥塞控制
-- DNS、CDN、负载均衡、正向代理、反向代理
-
-**编程语言**：
-- Java、Python、Go、C++、JavaScript、TypeScript
-- JVM、GC、内存模型、并发、协程、闭包
-
-### 系统设计
-
-**高并发**：
-- 限流、降级、熔断、缓存、异步、削峰填谷
-- 读写分离、分库分表、CDN、负载均衡
-
-**高可用**：
-- 主从复制、集群、哨兵、故障转移、容灾
-- 监控、告警、日志、链路追踪
-
-**性能优化**：
-- 数据库优化、缓存优化、代码优化、架构优化
-- 慢查询、索引优化、连接池、异步处理
-
-### 开发工具
-
-**版本控制**：
-- Git、GitHub、GitLab、分支管理、Merge、Rebase
-
-**CI/CD**：
-- Jenkins、GitLab CI、GitHub Actions、Travis CI
-- 持续集成、持续部署、自动化测试
-
-**监控**：
-- Prometheus、Grafana、ELK、Jaeger、Zipkin
-- 日志、监控、告警、链路追踪
-
-## 标签使用规则
-
-### 1. 精确性原则
-- ✅ 使用：Redis、MySQL、Kafka
-- ❌ 避免：数据库、缓存、消息队列（太宽泛）
-
-### 2. 具体性原则
-- ✅ 使用：Redis持久化、MySQL索引、Kafka消息可靠性
-- ❌ 避免：Redis相关、MySQL问题、Kafka使用
-
-### 3. 层级原则
-- 优先使用具体技术：Redis > NoSQL > 数据库
-- 优先使用具体特性：Redis持久化 > Redis
-
-### 4. 数量原则
-- 每道题1-5个标签
-- 核心标签1-2个（如Redis、MySQL）
-- 特性标签2-3个（如持久化、索引、事务）
-
-### 5. 示例
-
-**好的标签**：
-- ["Redis", "持久化", "RDB", "AOF"]
-- ["MySQL", "索引", "B+树", "查询优化"]
-- ["Kafka", "消息可靠性", "ACK机制"]
-- ["Spring Boot", "自动配置", "Starter"]
-- ["LLM", "Prompt Engineering", "Few-shot"]
-
-**不好的标签**：
-- ["数据库"] - 太宽泛
-- ["Redis相关"] - 不具体
-- ["其他"] - 无意义
-- ["未知"] - 无意义
+**标签规则**:
+- 优先使用具体技术名称（如Redis、MySQL）
+- 可添加特性标签（如持久化、索引、缓存穿透）
+- 每题1-5个标签，核心技术1-2个
 """
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
