@@ -12,7 +12,7 @@
              确定性副作用由 Orchestrator 代码层保证执行。
 """
 import logging
-from hello_agents import ReActAgent as PlanAndSolveAgent  # PlanAndSolveAgent 无 tool_registry，改用 ReActAgent
+from hello_agents import SimpleAgent as PlanAndSolveAgent  # InterviewerAgent 无需 ReAct 循环，使用 SimpleAgent（function calling 模式，1.5B 模型友好）
 from hello_agents.core.llm import HelloAgentsLLM
 from hello_agents.tools import ToolRegistry
 
@@ -71,20 +71,23 @@ class InterviewerAgent(PlanAndSolveAgent):
         # 角色未单独配置时回退到全局模型（Ollama 需用本地模型名如 qwen3-vl:4b）
         _model = settings.interviewer_model or settings.llm_model_id
         llm = HelloAgentsLLM(
-            provider=settings.llm_provider,
             model=_model,
             api_key=settings.interviewer_api_key or settings.llm_api_key,
             base_url=settings.interviewer_base_url or settings.llm_base_url,
             temperature=settings.interviewer_temperature,
             timeout=settings.llm_timeout
         )
-        logger.info(f"✅ Interviewer Agent 初始化完成")
+        logger.info("=" * 60)
+        logger.info("✅ Interviewer Agent (面试官) 初始化完成")
+        logger.info("=" * 60)
+        logger.info(f"   - Mode: {settings.interviewer_mode or settings.llm_mode}")
         logger.info(f"   - Model: {_model}")
         logger.info(f"   - Provider: {settings.llm_provider}")
         logger.info(f"   - Base URL: {settings.interviewer_base_url or settings.llm_base_url}")
         logger.info(f"   - Temperature: {settings.interviewer_temperature}")
         logger.info(f"   - Max Tokens: {settings.interviewer_max_tokens or settings.llm_max_tokens}")
         logger.info(f"   - Timeout: {settings.llm_timeout}s")
+        logger.info("=" * 60)
 
         registry = ToolRegistry()
 
@@ -106,20 +109,11 @@ class InterviewerAgent(PlanAndSolveAgent):
         # 这些操作现在由 Orchestrator.submit_answer() / end_session() 确定性执行
 
         max_steps = getattr(settings, "interviewer_max_steps", 8)
-        try:
-            super().__init__(
-                name="Interviewer Agent",
-                llm=llm,
-                tool_registry=registry,
-                system_prompt=interviewer_prompt,
-                max_steps=max_steps,
-            )
-        except TypeError:
-            # 部分 hello_agents 版本可能不支持 max_steps
-            super().__init__(
-                name="Interviewer Agent",
-                llm=llm,
-                tool_registry=registry,
-                system_prompt=interviewer_prompt,
-            )
-            logger.info(f"Interviewer max_steps={max_steps}（父类未支持，使用默认）")
+        super().__init__(
+            name="Interviewer Agent",
+            llm=llm,
+            tool_registry=registry,
+            system_prompt=interviewer_prompt,
+            max_tool_iterations=max_steps,
+        )
+        logger.info(f"Interviewer max_tool_iterations={max_steps}")

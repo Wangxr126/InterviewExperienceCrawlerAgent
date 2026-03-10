@@ -14,7 +14,7 @@ LLM 负责（通过 Agent）：
   • 知识结构化（帖子 → 题目 JSON）           → KnowledgeManager
 """
 
-from backend.utils.time_utils import now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
+from backend.utils.time_utils import now_beijing, now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
 import asyncio
 import json
 import logging
@@ -26,11 +26,10 @@ from functools import partial
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
-from backend.services.knowledge_manager import knowledge_manager
+from backend.services.knowledge.knowledge_manager import knowledge_manager
 from backend.agents.interviewer_agent import InterviewerAgent
 from backend.config.config import settings
-from backend.services.hunter_pipeline import run_hunter_pipeline
-from backend.services.sqlite_service import sqlite_service
+from backend.services.storage.sqlite_service import sqlite_service
 from backend.tools.interviewer_tools import KnowledgeRecommender
 
 logger = logging.getLogger(__name__)
@@ -39,7 +38,7 @@ logger = logging.getLogger(__name__)
 def _save_eval_failure(input_preview: str, raw_output: str, error: str) -> None:
     """答题评估 LLM 解析失败时写入 llm_failures/answer_eval.jsonl"""
     try:
-        from backend.services.llm_parse_failures import save_failure
+        from backend.services.logging.llm_parse_failures import save_failure
         save_failure(
             source="answer_eval",
             input_preview=input_preview,
@@ -228,7 +227,7 @@ class InterviewSystemOrchestrator:
     def __init__(self):
         logger.info("🔄 初始化面试系统编排器 v3.0...")
         try:
-            from backend.services.knowledge_manager import knowledge_manager
+            from backend.services.knowledge.knowledge_manager import knowledge_manager
             self.knowledge_manager = knowledge_manager
             self.interviewer = InterviewerAgent()
             # 按 user_id 缓存 MemoryTool（懒加载）
@@ -237,6 +236,8 @@ class InterviewSystemOrchestrator:
             self._session_weak_counts: Dict[str, Dict[str, Dict[str, int]]] = defaultdict(
                 lambda: defaultdict(lambda: defaultdict(int))
             )
+            # ✅ 新增：按 user_id 缓存 MemoryManager（单例模式，避免每次对话重新初始化）
+            self._memory_managers: Dict[str, Any] = {}
             logger.info("✅ 编排器初始化完成（KnowledgeManager + Interviewer）")
         except Exception as e:
             logger.error(f"❌ 初始化失败: {e}")
@@ -245,6 +246,22 @@ class InterviewSystemOrchestrator:
     # ===========================================================
     # 记忆辅助
     # ===========================================================
+
+    def _get_or_create_memory_manager(self, user_id: str):
+        """
+        获取或创建记忆管理器（按 user_id 缓存，单例模式）。
+        直接复用 MemoryTool，无需额外的 MemoryManager 层。
+        """
+        if user_id not in self._memory_managers:
+            mt = self._get_user_memory(user_id)
+            if mt is None:
+                logger.warning(f"[初始化] ⚠️ 用户 {user_id} 的 MemoryTool 不可用，记忆功能降级")
+                self._memory_managers[user_id] = None
+            else:
+                self._memory_managers[user_id] = mt
+                logger.info(f"[初始化] ✅ 用户 {user_id} 的记忆管理器就绪")
+
+        return self._memory_managers[user_id]
 
     def _get_user_memory(self, user_id: str):
         if user_id not in self._user_memory_tools:
@@ -285,7 +302,7 @@ class InterviewSystemOrchestrator:
         try:
             mt.execute("add", content=content, memory_type="working",
                        importance=importance, session_id=session_id,
-                       timestamp=now_beijing_str().isoformat())
+                       timestamp=now_beijing().isoformat())
         except Exception as e:
             logger.warning(f"写工作记忆失败: {e}")
 
@@ -331,6 +348,13 @@ class InterviewSystemOrchestrator:
             logger.warning(f"记忆整合失败: {e}")
 
     def _build_memory_context(self, user_id: str, user_message: str) -> str:
+        """构建记忆上下文（使用缓存的 MemoryManager）"""
+        # ✅ 使用缓存的 MemoryManager，避免每次重新初始化
+        memory_manager = self._get_or_create_memory_manager(user_id)
+        if not memory_manager:
+            logger.warning(f"[对话处理] ⚠️ 用户 {user_id} 的 MemoryManager 不可用，跳过记忆检索")
+            return ""
+        
         parts = []
         semantic = self._search_memory(user_id, "用户技术栈 目标岗位 掌握程度",
                                         memory_types=["semantic"], limit=3)
@@ -544,6 +568,13 @@ class InterviewSystemOrchestrator:
         返回 (reply: str, thinking_steps: List[Dict])。
         对话记录与 LLM 回复均入库，支持前端加载历史。
         """
+        import time
+        start_time = time.time()
+        
+        logger.info("=" * 60)
+        logger.info(f"[对话处理] 开始处理用户 {user_id} 的消息")
+        logger.info("=" * 60)
+        
         if not session_id:
             session_id = f"sess_{uuid.uuid4().hex[:8]}"
 
@@ -551,8 +582,14 @@ class InterviewSystemOrchestrator:
         sqlite_service.ensure_session_exists(session_id, user_id)
         sqlite_service.update_session_history(session_id, "user", message)
 
-        # 构建记忆上下文注入
+        # 构建记忆上下文注入（使用缓存的 MemoryManager）
+        mm_start = time.time()
         memory_context = self._build_memory_context(user_id, message)
+        mm_time = time.time() - mm_start
+        
+        if mm_time > 0.1:  # 只记录超过 100ms 的
+            logger.info(f"[性能] 记忆检索耗时: {mm_time:.2f}s")
+        
         self._write_working(user_id, f"用户：{message}", session_id=session_id)
 
         if resume:
@@ -567,7 +604,7 @@ class InterviewSystemOrchestrator:
         ]))
         full_input = f"{context_prefix}\n\n[用户消息]\n{message}" if context_prefix.strip() else message
 
-        logger.info(f"💬 [InterviewerAgent] 处理用户 {user_id} 的对话，消息: {message[:80]}")
+        logger.info(f"[对话处理] 💬 [InterviewerAgent] 处理用户 {user_id} 的对话，消息: {message[:80]}")
         # 注入当前 user_id 到线程上下文，工具可直接读取，无需 Agent 每次传参
         from backend.agents.context import set_current_user_id
         from backend.agents.thinking_capture import ThinkingCapture
@@ -581,11 +618,14 @@ class InterviewSystemOrchestrator:
             return result, tc.get_steps()
 
         try:
+            agent_start = time.time()
             response, thinking_steps = await loop.run_in_executor(None, _run_agent_with_capture)
+            agent_time = time.time() - agent_start
+            logger.info(f"[性能] Agent 执行耗时: {agent_time:.2f}s")
         except Exception as agent_err:
-            logger.error(f"❌ [InterviewerAgent] run() 抛出异常: {agent_err}", exc_info=True)
+            logger.error(f"[对话处理] ❌ [InterviewerAgent] run() 抛出异常: {agent_err}", exc_info=True)
             raise
-        logger.info(f"✅ [InterviewerAgent] 回复完成 ({len(response)}字, 思考{len(thinking_steps)}步): {response[:200]}")
+        logger.info(f"[对话处理] ✅ [InterviewerAgent] 回复完成 ({len(response)}字, 思考{len(thinking_steps)}步): {response[:200]}")
 
         # 入库 AI 回复（含 thinking_steps 摘要）
         reasoning_summary = _format_thinking_for_db(thinking_steps)
@@ -605,7 +645,7 @@ class InterviewSystemOrchestrator:
 
         # ── 📝 记录详细的交互日志（推理过程、工具调用等）──
         try:
-            from backend.services.interviewer_logger import get_interviewer_logger
+            from backend.services.logging.interviewer_logger import get_interviewer_logger
             interviewer_logger = get_interviewer_logger()
             
             # 记录完整对话
@@ -635,6 +675,12 @@ class InterviewSystemOrchestrator:
             logger.debug(f"Log saved to interviewer_logs/")
         except Exception as log_err:
             logger.warning(f"Failed to save log: {log_err}")
+
+        total_time = time.time() - start_time
+        logger.info(f"[性能] 总耗时: {total_time:.2f}s")
+        logger.info("=" * 60)
+        logger.info("[对话处理] 对话处理完成")
+        logger.info("=" * 60)
 
         return response, thinking_steps
 

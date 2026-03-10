@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "image-extractor": {
+      "command": "node",
+      "args": [
+        "E:\\Agent\\AgentProject\\wxr_agent\\mcp\\mcp-image-extractor\\dist\\index.js"
+      ],
+      "disabled": false
+    }
+  }
+}

@@ -59,7 +59,7 @@ def main():
     # LLM 已在 main.py 启动时预热，子进程无需重复预热
 
     from backend.services.crawler.xhs_crawler import XHSCrawler
-    from backend.services.sqlite_service import sqlite_service
+    from backend.services.storage.sqlite_service import sqlite_service
     from backend.services.crawler.crawl_helpers import save_xhs_post
 
     crawler = XHSCrawler(headless=headless)
@@ -74,7 +74,7 @@ def main():
 
     questions_added = 0
     if do_process and discovered > 0:
-        from backend.services.scheduler import _process_pending_tasks
+        from backend.services.scheduling.scheduler import _process_pending_tasks
         questions_added = _process_pending_tasks(batch_size=discovered + 5)
         logger.info(f"[小红书立即爬取] 处理完成: {questions_added} 道题入库")
 

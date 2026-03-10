@@ -167,8 +167,8 @@
       <div class="section-header">
         <h3 class="section-title">📋 帖子记录</h3>
         <div class="table-toolbar">
-          <el-select v-model="taskFilter" placeholder="状态" clearable size="small" style="width:140px">
-            <el-option v-for="opt in STATUS_OPTIONS" :key="opt.value" :label="`${opt.label}（${opt.desc}）`" :value="opt.value" />
+          <el-select v-model="taskFilter" placeholder="状态" clearable size="small" style="width:90px">
+            <el-option v-for="opt in STATUS_OPTIONS" :key="opt.value" :label="`${opt.label}`" :value="opt.value" />
           </el-select>
           <el-tooltip placement="bottom" effect="light">
             <template #content>
@@ -194,26 +194,26 @@
         </div>
       </div>
       <el-table :data="tasks" size="small" class="post-table" stripe>
-        <el-table-column label="ID" prop="id" width="60" align="center" />
-        <el-table-column label="关键词" prop="discover_keyword" width="88" show-overflow-tooltip>
-          <template #default="{ row }">{{ row.discover_keyword || '—' }}</template>
-        </el-table-column>
-        <el-table-column label="平台" width="76">
+        <el-table-column label="ID" prop="id" width="52" align="center" />
+        <el-table-column label="平台" width="68">
           <template #default="{ row }">
             <el-tag :type="row.source_platform === 'xiaohongshu' ? 'danger' : 'warning'" size="small">
               {{ row.source_platform === 'xiaohongshu' ? '小红书' : '牛客' }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="标题" min-width="120" show-overflow-tooltip>
+        <el-table-column label="关键词" prop="discover_keyword" width="100" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.discover_keyword || '—' }}</template>
+        </el-table-column>
+        <el-table-column label="标题" min-width="100" show-overflow-tooltip>
           <template #default="{ row }">
             <a :href="row.source_url" target="_blank" style="color:var(--primary);text-decoration:none;font-size:13px">
               {{ row.post_title || row.source_url.slice(-30) }}
             </a>
           </template>
         </el-table-column>
-        <el-table-column label="公司" prop="company" width="80" show-overflow-tooltip />
-        <el-table-column label="正文" width="88" align="center">
+        <el-table-column label="公司" prop="company" width="72" show-overflow-tooltip />
+        <el-table-column label="正文" width="56" align="center">
           <template #default="{ row }">
             <el-link v-if="(row.content_len ?? 0) > 0" type="primary" :underline="false" style="font-size:12px"
                      @click="openContentDialog(row)">
@@ -222,12 +222,12 @@
             <span v-else style="color:#c0c4cc;font-size:12px">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="80" align="center">
+        <el-table-column label="状态" width="60" align="center">
           <template #default="{ row }">
             <el-tag :type="STATUS_TAG[row.status]" size="small">{{ STATUS_LABEL[row.status] || row.status }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="提取题目" width="80" align="center">
+        <el-table-column label="题目" width="48" align="center">
           <template #default="{ row }">
             <el-link v-if="row.questions_count > 0" type="success" :underline="false"
                      style="font-weight:700" @click="openQuestionsDialog(row)">
@@ -236,14 +236,37 @@
             <span v-else style="color:#c0c4cc">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="提取来源" width="88" align="center">
+        <el-table-column label="来源" width="56" align="center">
           <template #default="{ row }">
-            <el-tag v-if="row.extraction_source === 'image'" type="warning" size="small">📷 图片</el-tag>
-            <el-tag v-else-if="row.extraction_source === 'content'" type="primary" size="small">📄 正文</el-tag>
+            <el-tag v-if="row.extraction_source === 'image'" type="warning" size="small">图片</el-tag>
+            <el-tag v-else-if="row.extraction_source === 'content'" type="primary" size="small">正文</el-tag>
             <span v-else style="color:#c0c4cc">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="发现时间" prop="discovered_at" width="148" />
+        <el-table-column label="工具调用" width="68" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.agent_used_tool === 1" type="success" size="small">✓ 是</el-tag>
+            <el-tag v-else-if="row.agent_used_tool === 0 && row.status === 'done'" type="info" size="small">否</el-tag>
+            <span v-else style="color:#c0c4cc">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="耗时" width="62" align="center">
+          <template #default="{ row }">
+            <span v-if="row.extract_duration_sec != null" style="font-size:12px;color:var(--text-main)">{{ row.extract_duration_sec }}s</span>
+            <span v-else style="color:#c0c4cc;font-size:12px">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="提取时间" width="110" align="center">
+          <template #default="{ row }">
+            <span v-if="row.processed_at" style="font-size:11px">{{ row.processed_at?.slice(0,16) }}</span>
+            <span v-else style="color:#c0c4cc;font-size:12px">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="发现时间" width="110" align="center">
+          <template #default="{ row }">
+            <span style="font-size:11px">{{ row.discovered_at?.slice(0,16) }}</span>
+          </template>
+        </el-table-column>
       </el-table>
       <div v-if="tasks.length === 0" class="table-empty">暂无记录，点击「查询」加载</div>
       <div v-else class="pagination-wrap">
@@ -485,6 +508,7 @@ const crawlProgressText = computed(() => {
   const pending = typeof rawStats.value['pending'] === 'object' ? (rawStats.value['pending']?.count ?? 0) : (rawStats.value['pending'] ?? 0)
   const fetched = typeof rawStats.value['fetched'] === 'object' ? (rawStats.value['fetched']?.count ?? 0) : (rawStats.value['fetched'] ?? 0)
   const done = doneCount.value
+  // return `待抓取 ${pending} · 待提取 ${fetched} · 已完成 ${done}`
   return `待抓取 ${pending} · 待提取 ${fetched} · 已完成 ${done}`
 })
 
@@ -919,7 +943,8 @@ watch(crawlPolling, (polling) => {
 <style scoped>
 .collect-page {
   padding: 0 8px 24px;
-  max-width: 1000px;
+  /*数据采集页面宽度 */
+  max-width: 1200px;
   margin: 0 auto;
 }
 .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
@@ -1199,7 +1224,8 @@ watch(crawlPolling, (polling) => {
 
 /* 4. 表格 */
 .table-section { padding: 24px 28px; }
-.table-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.table-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.table-toolbar .el-button { padding: 5px 10px; }
 .status-help-icon { font-size: 16px; color: var(--text-sub); cursor: help; margin-left: -4px; }
 .status-help-icon:hover { color: var(--primary); }
 .status-help { font-size: 12px; line-height: 1.8; }

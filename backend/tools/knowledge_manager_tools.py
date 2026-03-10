@@ -12,8 +12,8 @@ from typing import List, Dict, Any, Optional
 
 from hello_agents.tools import Tool, ToolParameter
 from backend.config.config import settings
-from backend.services.neo4j_service import neo4j_service
-from backend.services.sqlite_service import sqlite_service
+from backend.services.storage.neo4j_service import neo4j_service
+from backend.services.storage.sqlite_service import sqlite_service
 
 logger = logging.getLogger(__name__)
 

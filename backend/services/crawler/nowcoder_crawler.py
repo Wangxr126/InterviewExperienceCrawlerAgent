@@ -334,7 +334,7 @@ def _fetch_post_content_full_impl(
         container = soup.find('div', class_=lambda c: c and cls in c)
         if container:
             content_container = container
-            logger.info(f"找到正文容器: class包含'{cls}'")
+            logger.debug(f"找到正文容器: class包含'{cls}'")
             break
 
     if not content_container:
@@ -702,7 +702,7 @@ class NowcoderCrawler:
             if body:
                 logger.info(f"牛客 详情页解析成功: {title[:30] or '(无标题)'}... ({len(body)}字, {len(image_urls)}图)")
             else:
-                logger.warning(f"牛客 未识别到正文结构: {post_url[:80]}")
+                logger.warning(f"未识别到正文结构 [nowcoder]: {post_url[:80]}")
 
             return body, image_urls
 
@@ -914,7 +914,7 @@ class NowcoderCrawler:
         db_check = None
         if check_db_dedup:
             try:
-                from backend.services.sqlite_service import sqlite_service
+                from backend.services.storage.sqlite_service import sqlite_service
                 db_check = sqlite_service.is_url_crawled
             except Exception:
                 pass

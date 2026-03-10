@@ -22,6 +22,9 @@ class ScheduleConfig(BaseModel):
     interval_seconds: Optional[int] = Field(None, description="间隔秒数")
     interval_minutes: Optional[int] = Field(None, description="间隔分钟数")
     interval_hours: Optional[int] = Field(None, description="间隔小时数")
+    # interval 模式的开始时间，格式 'HH:MM'（当天对应时刻，之后按间隔重复）
+    # 不填则立即开始
+    start_time: Optional[str] = Field(None, description="间隔任务的首次执行时间，格式 HH:MM，如 '08:00'；不填则立即开始")
     
     # Cron 字段（可选，用于更细粒度控制）
     hour: Optional[str] = Field(None, description="小时，如 '2,14' 或 '*/2'")
@@ -34,13 +37,13 @@ class ScheduleConfig(BaseModel):
 class JobParams(BaseModel):
     """任务参数"""
     # 牛客参数
-    nowcoder_keywords: Optional[List[str]] = Field(None, description="牛客搜索关键词")
-    nowcoder_max_pages: Optional[int] = Field(None, description="牛客最大页数")
+    nowcoder_keywords: Optional[List[str]] = Field(None, description="牛客搜索关键词，多个关键词用英文逗号分隔，如 ['Java面经', 'Python面试']")
+    nowcoder_max_pages: Optional[int] = Field(None, description="牛客最大爬取页数")
     
     # 小红书参数
-    xhs_keywords: Optional[List[str]] = Field(None, description="小红书搜索关键词")
+    xhs_keywords: Optional[List[str]] = Field(None, description="小红书搜索关键词，多个关键词用英文逗号分隔，如 ['Java面经', '后端面试']")
     xhs_max_notes: Optional[int] = Field(None, description="小红书每个关键词最大帖子数")
-    xhs_headless: Optional[bool] = Field(True, description="小红书是否无头模式")
+    xhs_headless: Optional[bool] = Field(True, description="小红书是否无头模式（true=后台运行，false=弹出浏览器窗口）")
     
     # 任务处理参数
     process_batch_size: Optional[int] = Field(None, description="处理任务批次大小")
@@ -95,27 +98,48 @@ class JobResponse(BaseModel):
 def list_jobs(
     enabled_only: bool = Query(False, description="仅显示启用的任务")
 ):
-    """获取所有定时任务列表"""
-    from backend.services.scheduler_service import scheduler_service
+    """获取所有定时任务列表，next_run_at 从 APScheduler 实时读取"""
+    from backend.services.scheduling.scheduler_service import scheduler_service
+    from backend.services.scheduling.scheduler import crawl_scheduler
     jobs = scheduler_service.list_jobs(enabled_only=enabled_only)
+
+    # 从 APScheduler 读取实时的下次执行时间，注入到返回结果
+    try:
+        apscheduler_jobs = {j.id: j for j in crawl_scheduler._scheduler.get_jobs()}
+        for job in jobs:
+            job_id = job["job_id"]
+            # 数据库任务的 APScheduler id 前缀为 db_
+            ap_job = apscheduler_jobs.get(f"db_{job_id}")
+            if ap_job and ap_job.next_run_time:
+                job["next_run_at"] = ap_job.next_run_time.isoformat()
+    except Exception:
+        pass
+
     return jobs
 
 
 @router.get("/jobs/{job_id}", response_model=JobResponse)
 def get_job(job_id: str):
-    """获取单个任务详情"""
-    from backend.services.scheduler_service import scheduler_service
+    """获取单个任务详情，next_run_at 从 APScheduler 实时读取"""
+    from backend.services.scheduling.scheduler_service import scheduler_service
+    from backend.services.scheduling.scheduler import crawl_scheduler
     job = scheduler_service.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
+    try:
+        ap_job = crawl_scheduler._scheduler.get_job(f"db_{job_id}")
+        if ap_job and ap_job.next_run_time:
+            job["next_run_at"] = ap_job.next_run_time.isoformat()
+    except Exception:
+        pass
     return job
 
 
 @router.post("/jobs", response_model=dict)
 def create_job(job: JobCreate):
     """创建新的定时任务"""
-    from backend.services.scheduler_service import scheduler_service
-    from backend.services.scheduler import scheduler as crawl_scheduler
+    from backend.services.scheduling.scheduler_service import scheduler_service
+    from backend.services.scheduling.scheduler import crawl_scheduler
     
     # 验证任务类型
     valid_types = ["nowcoder_discovery", "xhs_discovery", "process_tasks"]
@@ -157,8 +181,8 @@ def create_job(job: JobCreate):
 @router.put("/jobs/{job_id}", response_model=dict)
 def update_job(job_id: str, job: JobUpdate):
     """更新定时任务"""
-    from backend.services.scheduler_service import scheduler_service
-    from backend.services.scheduler import scheduler as crawl_scheduler
+    from backend.services.scheduling.scheduler_service import scheduler_service
+    from backend.services.scheduling.scheduler import crawl_scheduler
     
     # 检查任务是否存在
     existing = scheduler_service.get_job(job_id)
@@ -192,8 +216,8 @@ def update_job(job_id: str, job: JobUpdate):
 @router.delete("/jobs/{job_id}", response_model=dict)
 def delete_job(job_id: str):
     """删除定时任务"""
-    from backend.services.scheduler_service import scheduler_service
-    from backend.services.scheduler import scheduler as crawl_scheduler
+    from backend.services.scheduling.scheduler_service import scheduler_service
+    from backend.services.scheduling.scheduler import crawl_scheduler
     
     # 检查任务是否存在
     existing = scheduler_service.get_job(job_id)
@@ -216,8 +240,8 @@ def delete_job(job_id: str):
 @router.post("/jobs/{job_id}/enable", response_model=dict)
 def enable_job(job_id: str):
     """启用定时任务"""
-    from backend.services.scheduler_service import scheduler_service
-    from backend.services.scheduler import scheduler as crawl_scheduler
+    from backend.services.scheduling.scheduler_service import scheduler_service
+    from backend.services.scheduling.scheduler import crawl_scheduler
     
     existing = scheduler_service.get_job(job_id)
     if not existing:
@@ -237,8 +261,8 @@ def enable_job(job_id: str):
 @router.post("/jobs/{job_id}/disable", response_model=dict)
 def disable_job(job_id: str):
     """禁用定时任务"""
-    from backend.services.scheduler_service import scheduler_service
-    from backend.services.scheduler import scheduler as crawl_scheduler
+    from backend.services.scheduling.scheduler_service import scheduler_service
+    from backend.services.scheduling.scheduler import crawl_scheduler
     
     existing = scheduler_service.get_job(job_id)
     if not existing:
@@ -259,8 +283,8 @@ def disable_job(job_id: str):
 async def run_job_now(job_id: str):
     """立即执行任务（不影响定时计划）- 异步执行"""
     import asyncio
-    from backend.services.scheduler_service import scheduler_service
-    from backend.services.scheduler import scheduler as crawl_scheduler
+    from backend.services.scheduling.scheduler_service import scheduler_service
+    from backend.services.scheduling.scheduler import crawl_scheduler
     
     job = scheduler_service.get_job(job_id)
     if not job:

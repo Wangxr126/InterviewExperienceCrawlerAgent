@@ -51,7 +51,8 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted } from 'vue'
+import { ref, watch, onMounted, nextTick } from 'vue'
+import { ElMessage } from 'element-plus'
 import { User } from '@element-plus/icons-vue'
 import { api } from './api.js'
 import BrowseView   from './views/BrowseView.vue'

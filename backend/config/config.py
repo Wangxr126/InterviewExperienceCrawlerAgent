@@ -350,7 +350,69 @@ class _Settings:
     def finetune_llm_max_tokens(self) -> int:
         return _get_int("FINETUNE_LLM_MAX_TOKENS", 0) or self.llm_max_tokens
 
-    # ── 4.6 爬虫/题目提取 ──────────────────────────────────────────
+    # ── 4.6 Miner Agent（题目提取器）──────────────────────────────────
+    @property
+    def miner_mode(self) -> str:
+        """Miner使用模式：local/remote，留空则使用全局LLM_MODE"""
+        return _get("MINER_MODE") or self.llm_mode
+
+    # 本地配置
+    @property
+    def miner_local_provider(self) -> str:
+        return _get("MINER_LOCAL_PROVIDER") or self.llm_local_provider
+
+    @property
+    def miner_local_model(self) -> str:
+        return _get("MINER_LOCAL_MODEL") or self.llm_local_model
+
+    @property
+    def miner_local_base_url(self) -> str:
+        return _get("MINER_LOCAL_BASE_URL") or self.llm_local_base_url
+
+    @property
+    def miner_local_timeout(self) -> int:
+        return _get_int("MINER_LOCAL_TIMEOUT", 0) or self.llm_local_timeout
+
+    # 远程配置
+    @property
+    def miner_remote_provider(self) -> str:
+        return _get("MINER_REMOTE_PROVIDER") or self.llm_remote_provider
+
+    @property
+    def miner_remote_model(self) -> str:
+        return _get("MINER_REMOTE_MODEL") or self.llm_remote_model
+
+    @property
+    def miner_remote_base_url(self) -> str:
+        return _get("MINER_REMOTE_BASE_URL") or self.llm_remote_base_url
+
+    @property
+    def miner_remote_timeout(self) -> int:
+        return _get_int("MINER_REMOTE_TIMEOUT", 0) or self.llm_remote_timeout
+
+    # 当前使用的配置（根据mode选择）
+    @property
+    def miner_provider(self) -> str:
+        return self.miner_local_provider if self.miner_mode == "local" else self.miner_remote_provider
+
+    @property
+    def miner_model(self) -> str:
+        return self.miner_local_model if self.miner_mode == "local" else self.miner_remote_model
+
+    @property
+    def miner_api_key(self) -> str:
+        local_key = _get("MINER_LOCAL_API_KEY") or self.llm_local_api_key
+        remote_key = _get("MINER_REMOTE_API_KEY") or self.llm_remote_api_key
+        return local_key if self.miner_mode == "local" else remote_key
+
+    @property
+    def miner_base_url(self) -> str:
+        return self.miner_local_base_url if self.miner_mode == "local" else self.miner_remote_base_url
+
+    @property
+    def miner_timeout(self) -> int:
+        return self.miner_local_timeout if self.miner_mode == "local" else self.miner_remote_timeout
+
     @property
     def miner_temperature(self) -> float:
         """面经题目提取 LLM 温度。结构化 JSON 输出建议 0.0~0.2，小模型可略高至 0.2 减少刻板错误。"""
@@ -455,8 +517,8 @@ class _Settings:
     # ── OCR 配置 ──────────────────────────────────────────────
     @property
     def ocr_method(self) -> str:
-        """OCR 方法：claude_vision（默认）或 mcp"""
-        return _get("OCR_METHOD", "claude_vision")
+        """OCR 方法：qwen_vl（阿里云百炼，推荐）/ claude_vision / mcp"""
+        return _get("OCR_METHOD", "qwen_vl")
 
     @property
     def mcp_ocr_server(self) -> str:
@@ -464,9 +526,25 @@ class _Settings:
         return _get("MCP_OCR_SERVER", "ocr-server")
 
     @property
+    def mcp_image_extractor_path(self) -> str:
+        """mcp-image-extractor dist/index.js 的绝对路径"""
+        default = str(_PROJECT_ROOT / "mcp" / "mcp-image-extractor" / "dist" / "index.js")
+        return _get("MCP_IMAGE_EXTRACTOR_PATH", default)
+
+    @property
     def anthropic_api_key(self) -> str:
         """Anthropic API Key（用于 Claude Vision OCR）"""
         return _get("ANTHROPIC_API_KEY", "")
+
+    @property
+    def ocr_api_key(self) -> str:
+        """OCR 用 API Key：优先 OCR_API_KEY，其次复用 EMBED_API_KEY（dashscope）"""
+        return _get("OCR_API_KEY") or self.embed_api_key
+
+    @property
+    def ocr_model(self) -> str:
+        """OCR 模型名，留空则按 ocr_method 自动选择"""
+        return _get("OCR_MODEL", "")
 
     @property
     def nowcoder_output_dir(self) -> Path:

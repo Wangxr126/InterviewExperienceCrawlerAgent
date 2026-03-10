@@ -20,20 +20,49 @@
           <el-option v-for="t in (props.meta.tags || []).filter(t => t)" :key="t" :label="t" :value="t" />
         </el-select>
         <el-input v-model="filters.keyword" placeholder="关键词搜索" clearable
-                  @keyup.enter="loadQuestions" />
+                  @keyup.enter="onSearch" />
         <el-select v-model="filters.source_platform" placeholder="来源平台" clearable>
           <el-option label="牛客网" value="nowcoder" />
           <el-option label="小红书" value="xiaohongshu" />
         </el-select>
-        <el-button type="primary" @click="loadQuestions" :loading="loading">🔍 搜索</el-button>
+        <el-button type="primary" @click="onSearch" :loading="loading">🔍 搜索</el-button>
         <el-button @click="loadRandom">🎲 随机一题</el-button>
         <el-button @click="resetFilters">重置</el-button>
       </div>
 
-      <!-- 统计 -->
+      <!-- 统计 + 每页条数 -->
       <div class="stats-bar">
-        共找到 <strong>{{ questions.length }}</strong> 道题
-        <span v-if="props.meta.total"> · 题库总计 {{ props.meta.total }} 题</span>
+        <span>共找到 <strong>{{ pagination.total }}</strong> 道题
+          <span v-if="props.meta.total"> · 题库总计 {{ props.meta.total }} 题</span>
+        </span>
+        <div class="page-size-selector">
+          <span>每页</span>
+          <el-select v-model="pagination.pageSize" size="small" style="width:80px;margin:0 6px"
+                     @change="onPageSizeChange">
+            <el-option :value="10" label="10 题" />
+            <el-option :value="20" label="20 题" />
+            <el-option :value="50" label="50 题" />
+            <el-option :value="100" label="100 题" />
+          </el-select>
+          <span>题</span>
+        </div>
+      </div>
+
+      <!-- 列头排序栏 -->
+      <div class="col-header-bar">
+        <span class="col-header-label">排序：</span>
+        <button
+          v-for="col in SORT_COLUMNS"
+          :key="col.key"
+          class="col-sort-btn"
+          :class="{ active: sortBy === col.key }"
+          @click="toggleSort(col.key)"
+        >
+          {{ col.label }}
+          <span class="col-sort-icon">
+            <span :class="['arrow', sortBy === col.key && sortOrder === 'asc' ? 'on' : '']">↑</span><span :class="['arrow', sortBy === col.key && sortOrder === 'desc' ? 'on' : '']">↓</span>
+          </span>
+        </button>
       </div>
 
       <!-- 题目网格 -->
@@ -65,6 +94,18 @@
       <div v-if="loading" class="loading-center">
         <el-icon class="is-loading" style="font-size:32px;color:var(--primary)"><Loading /></el-icon>
       </div>
+
+      <!-- 分页控件 -->
+      <div v-if="pagination.total > 0 && !loading" class="pagination-bar">
+        <el-pagination
+          v-model:current-page="pagination.page"
+          :page-size="pagination.pageSize"
+          :total="pagination.total"
+          layout="prev, pager, next, jumper, total"
+          background
+          @current-change="onPageChange"
+        />
+      </div>
     </div>
 
     <!-- 题目详情弹窗 -->
@@ -76,6 +117,7 @@
 <script setup>
 import { ref, reactive, onMounted, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { Loading } from '@element-plus/icons-vue'
 import { api } from '../api.js'
 import QuestionDialog from '../components/QuestionDialog.vue'
 
@@ -86,6 +128,28 @@ const props = defineProps({
 const emit = defineEmits(['send-to-chat'])
 
 const filters = reactive({ question_type: '', company: '', difficulty: '', tag: '', keyword: '', source_platform: '' })
+const pagination = reactive({ page: 1, pageSize: 20, total: 0, totalPages: 1 })
+const sortBy = ref('created_at')
+const sortOrder = ref('desc')
+
+const SORT_COLUMNS = [
+  { key: 'created_at',    label: '时间' },
+  { key: 'difficulty',    label: '难度' },
+  { key: 'company',       label: '公司' },
+  { key: 'question_type', label: '类型' },
+  { key: 'question_text', label: '题目' },
+]
+
+const toggleSort = (colKey) => {
+  if (sortBy.value === colKey) {
+    sortOrder.value = sortOrder.value === 'asc' ? 'desc' : 'asc'
+  } else {
+    sortBy.value = colKey
+    sortOrder.value = 'desc'
+  }
+  pagination.page = 1
+  loadQuestions(1)
+}
 const questions = ref([])
 const loading   = ref(false)
 const dialogVisible = ref(false)
@@ -98,11 +162,20 @@ const questionTypeClass = (t) => {
   return m[t] || 'type-tech'
 }
 
-const loadQuestions = async () => {
+const loadQuestions = async (page = pagination.page) => {
   loading.value = true
   try {
-    const d = await api.getQuestions(filters)
+    const d = await api.getQuestions({
+      ...filters,
+      page,
+      page_size: pagination.pageSize,
+      sort_by: sortBy.value,
+      sort_order: sortOrder.value,
+    })
     questions.value = d.questions || []
+    pagination.total = d.total ?? 0
+    pagination.totalPages = d.total_pages ?? 1
+    pagination.page = d.page ?? page
   } catch {
     ElMessage.error('加载题目失败，请检查后端是否已启动')
   } finally {
@@ -110,11 +183,32 @@ const loadQuestions = async () => {
   }
 }
 
+// 搜索时重置到第一页
+const onSearch = () => {
+  pagination.page = 1
+  loadQuestions(1)
+}
+
+// 切换页码
+const onPageChange = (newPage) => {
+  pagination.page = newPage
+  loadQuestions(newPage)
+}
+
+// 切换每页条数时重置到第一页
+const onPageSizeChange = () => {
+  pagination.page = 1
+  loadQuestions(1)
+}
+
 const loadRandom = async () => {
   loading.value = true
   try {
-    const d = await api.getQuestions({ ...filters, rand: true, limit: 1 })
+    const d = await api.getQuestions({ ...filters, rand: true })
     questions.value = d.questions || []
+    pagination.total = d.total ?? 0
+    pagination.totalPages = 1
+    pagination.page = 1
     if (questions.value.length) openDialog(questions.value[0])
   } catch {
     ElMessage.error('随机取题失败')
@@ -125,7 +219,8 @@ const loadRandom = async () => {
 
 const resetFilters = () => {
   Object.assign(filters, { question_type: '', company: '', difficulty: '', tag: '', keyword: '', source_platform: '' })
-  loadQuestions()
+  pagination.page = 1
+  loadQuestions(1)
 }
 
 const openDialog = (q) => {
@@ -139,21 +234,86 @@ const handleSendToChat = (event) => {
   emit('send-to-chat', event)
 }
 
-onMounted(loadQuestions)
+onMounted(() => loadQuestions(1))
 
-// 监听isActive变化，当页面激活时重新加载数据
 watch(() => props.isActive, (newVal, oldVal) => {
   if (newVal && !oldVal) {
-    // 从非激活变为激活，重新加载数据
-    loadQuestions()
+    loadQuestions(pagination.page)
   }
 })
 </script>
 
 <style scoped>
 .filter-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
-.filter-row .el-select { width: 130px; }
-.stats-bar { color: var(--text-sub); font-size: 13px; margin-bottom: 14px; }
+.filter-row .el-select { width: 110px; }
+.filter-row .el-input { width: 140px; }
+.filter-row .el-button { padding: 8px 12px; }
+.stats-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--text-sub);
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.col-header-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding: 6px 2px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.col-header-label {
+  font-size: 11px;
+  color: var(--text-sub);
+  margin-right: 2px;
+}
+.col-sort-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-sub);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all .15s;
+  white-space: nowrap;
+  line-height: 1.6;
+}
+.col-sort-btn:hover {
+  background: var(--primary-light);
+  color: var(--primary);
+  border-color: var(--primary);
+}
+.col-sort-btn.active {
+  background: var(--primary-light);
+  color: var(--primary);
+  border-color: var(--primary);
+  font-weight: 600;
+}
+.col-sort-icon {
+  display: inline-flex;
+  flex-direction: column;
+  line-height: 1;
+  font-size: 9px;
+  margin-left: 1px;
+  gap: 0;
+}
+.col-sort-icon .arrow {
+  color: var(--border);
+  line-height: 1.1;
+}
+.col-sort-icon .arrow.on {
+  color: var(--primary);
+}
+.page-size-selector { display: flex; align-items: center; gap: 4px; font-size: 13px; color: var(--text-sub); }
 
 .question-grid {
   display: grid;
@@ -174,11 +334,11 @@ watch(() => props.isActive, (newVal, oldVal) => {
           -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .q-card-badges { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
 .type-badge { font-size: 10px; padding: 2px 6px; border-radius: 8px; white-space: nowrap; font-weight: 600; }
-.type-tech    { background: #dbeafe; color: #1d4ed8; }      /* 技术题-蓝 */
-.type-algo    { background: #e9d5ff; color: #6b21a8; }      /* 算法题-紫 */
-.type-design  { background: #ccfbf1; color: #0f766e; }      /* 系统设计-青 */
-.type-behavior{ background: #fed7aa; color: #c2410c; }      /* 行为题-橙 */
-.type-hr      { background: #e5e7eb; color: #4b5563; }      /* HR问题-灰 */
+.type-tech    { background: #dbeafe; color: #1d4ed8; }
+.type-algo    { background: #e9d5ff; color: #6b21a8; }
+.type-design  { background: #ccfbf1; color: #0f766e; }
+.type-behavior{ background: #fed7aa; color: #c2410c; }
+.type-hr      { background: #e5e7eb; color: #4b5563; }
 .difficulty-badge { font-size: 11px; padding: 2px 8px; border-radius: 12px; white-space: nowrap; }
 .diff-easy   { background: #d1fae5; color: #065f46; }
 .diff-medium { background: #fef3c7; color: #92400e; }
@@ -191,4 +351,11 @@ watch(() => props.isActive, (newVal, oldVal) => {
 .empty-state { text-align: center; padding: 60px 20px; color: var(--text-sub); }
 .empty-icon  { font-size: 48px; margin-bottom: 16px; }
 .loading-center { text-align: center; padding: 40px; }
+.pagination-bar {
+  display: flex;
+  justify-content: center;
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
 </style>

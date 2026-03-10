@@ -122,12 +122,23 @@ const handleSendToChat = () => {
   console.log('🔵 QuestionDialog: 触发 send-to-chat 事件')
   console.log('🔵 question:', props.question)
   
+  // 防止重复点击
+  if (handleSendToChat._pending) {
+    console.log('🔵 防止重复点击，忽略本次调用')
+    return
+  }
+  handleSendToChat._pending = true
+  
   // 先关闭当前对话框
   visible.value = false
   
   // 延迟触发事件，确保对话框已关闭
   setTimeout(() => {
     emit('send-to-chat', { question: props.question })
+    // 500ms 后重置标志
+    setTimeout(() => {
+      handleSendToChat._pending = false
+    }, 500)
   }, 100)
 }
 </script>

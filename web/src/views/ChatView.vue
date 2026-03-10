@@ -10,6 +10,7 @@
     <!-- 快捷问题 -->
     <div class="quick-btns">
       <el-button v-for="q in quickQuestions" :key="q" size="small"
+                 :disabled="loading || sendInProgress"
                  @click="prefillAndSend(q)">{{ q }}</el-button>
     </div>
 
@@ -138,6 +139,7 @@ const msgBox       = ref(null)
 const sessionId    = ref(`sess_${Date.now()}`)
 let   abortCtrl    = null
 let   lastLoadedUserId = ''
+let   sendInProgress = false  // 防止并发调用的标志
 
 const quickQuestions = [
   '出一道 Redis 面试题',
@@ -181,6 +183,15 @@ const prefillAndSend = (text) => {
   console.log('🟣 ChatView: prefillAndSend 被调用')
   console.log('🟣 text:', text)
   console.log('🟣 loading.value:', loading.value)
+  console.log('🟣 sendInProgress:', sendInProgress)
+  
+  // 防止在发送过程中被调用
+  if (loading.value || sendInProgress) {
+    console.log('🟣 prefillAndSend 被阻止：正在发送中')
+    ElMessage.warning('请等待当前消息发送完成')
+    return
+  }
+  
   inputText.value = text
   console.log('🟣 inputText.value 已设置:', inputText.value)
   nextTick(() => {
@@ -195,11 +206,16 @@ const send = async () => {
   const text = inputText.value.trim()
   console.log('🟣 text:', text)
   console.log('🟣 loading.value:', loading.value)
-  if (!text || loading.value) {
+  console.log('🟣 sendInProgress:', sendInProgress)
+  
+  // 双重检查：既检查 loading 又检查 sendInProgress
+  if (!text || loading.value || sendInProgress) {
     console.log('🟣 send() 提前返回：text 为空或正在加载')
     return
   }
 
+  // 立即设置标志，防止并发调用
+  sendInProgress = true
   inputText.value = ''
   messages.value.push({ role: 'user', content: text, thinking: [], thinkingOpen: false })
   scrollToBottom()
@@ -285,7 +301,7 @@ const send = async () => {
       console.warn('流式接口失败，降级到普通接口', err)
       try {
         const ctrl = new AbortController()
-        const timer = setTimeout(() => ctrl.abort(), 90000)
+        const timer = setTimeout(() => ctrl.abort(), 300000)
         const d = await api.chat({
           user_id: props.userId,
           message: text,
@@ -309,6 +325,7 @@ const send = async () => {
     }
   } finally {
     loading.value = false
+    sendInProgress = false  // 重置标志
     if (streamingMsg.value) {
       streamingMsg.value.streaming = false
       streamingMsg.value = null

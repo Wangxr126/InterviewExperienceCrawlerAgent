@@ -30,8 +30,11 @@ export const api = {
     if (params.tag) p.set('tag', params.tag)
     if (params.keyword) p.set('keyword', params.keyword)
     if (params.source_platform) p.set('source_platform', params.source_platform)
-    p.set('limit', params.limit ?? '60')
     if (params.rand) p.set('rand', 'true')
+    if (params.page != null) p.set('page', String(params.page))
+    if (params.page_size != null) p.set('page_size', String(params.page_size))
+    if (params.sort_by) p.set('sort_by', params.sort_by)
+    if (params.sort_order) p.set('sort_order', params.sort_order)
     const r = await fetch(`${BASE}/api/questions?${p}`)
     return r.json()
   },

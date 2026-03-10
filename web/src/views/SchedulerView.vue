@@ -34,15 +34,22 @@
         </template>
       </el-table-column>
       
-      <el-table-column label="调度配置" min-width="180">
+      <el-table-column label="调度配置" min-width="200">
         <template #default="{ row }">
-          <div style="font-size:13px">
-            {{ formatSchedule(row) }}
+          <div style="font-size:12px">
+            <el-tag
+              size="small"
+              :type="row.schedule_type === 'cron' ? 'info' : 'warning'"
+              style="margin-bottom:4px"
+            >
+              {{ row.schedule_type === 'cron' ? 'Cron' : '固定间隔' }}
+            </el-tag>
+            <div style="color:var(--text-sub);margin-top:2px">{{ formatSchedule(row) }}</div>
           </div>
         </template>
       </el-table-column>
       
-      <el-table-column label="运行状态" width="200">
+      <el-table-column label="运行状态" width="180">
         <template #default="{ row }">
           <div style="font-size:12px">
             <div v-if="row.last_run_at">
@@ -152,6 +159,19 @@
               </el-select>
             </div>
           </el-form-item>
+          <el-form-item label="首次执行时刻">
+            <el-time-picker
+              v-model="intervalStartTime"
+              format="HH:mm"
+              value-format="HH:mm"
+              placeholder="不填则立即开始"
+              style="width:100%"
+              clearable
+            />
+            <div style="font-size:12px;color:var(--text-sub);margin-top:4px">
+              设置后任务将在当天该时刻首次执行，之后按间隔循环；若时刻已过则顺延到明天
+            </div>
+          </el-form-item>
         </template>
         
         <el-divider content-position="left">任务参数</el-divider>
@@ -236,6 +256,7 @@ const form = ref({
 // 间隔配置辅助
 const intervalValue = ref(30)
 const intervalUnit = ref('minutes')
+const intervalStartTime = ref('')
 
 // 关键词辅助（用逗号分隔的字符串）
 const nowcoderKeywords = ref('面经')
@@ -329,6 +350,9 @@ const saveJob = async () => {
     } else {
       form.value.schedule_config.interval_hours = intervalValue.value
     }
+    if (intervalStartTime.value) {
+      form.value.schedule_config.start_time = intervalStartTime.value
+    }
   }
   
   saving.value = true
@@ -379,6 +403,7 @@ const editJob = (job) => {
       intervalValue.value = job.schedule_config.interval_hours
       intervalUnit.value = 'hours'
     }
+    intervalStartTime.value = job.schedule_config.start_time || ''
   }
   
   showCreateDialog.value = true
@@ -452,6 +477,7 @@ const resetForm = () => {
   selectedTemplate.value = ''
   intervalValue.value = 30
   intervalUnit.value = 'minutes'
+  intervalStartTime.value = ''
   nowcoderKeywords.value = '面经'
   xhsKeywords.value = 'agent面经'
 }
@@ -460,16 +486,30 @@ const resetForm = () => {
 const formatSchedule = (job) => {
   if (job.schedule_type === 'cron') {
     const cfg = job.schedule_config
-    const parts = []
-    if (cfg.hour) parts.push(`${cfg.hour}时`)
-    if (cfg.minute) parts.push(`${cfg.minute}分`)
-    return parts.length > 0 ? parts.join('') : 'Cron'
+    const hour = cfg.hour
+    const minute = cfg.minute !== undefined && cfg.minute !== '' ? cfg.minute : '0'
+    if (hour === undefined || hour === '') {
+      return `每小时 ${minute} 分`
+    }
+    if (hour.includes(',')) {
+      return `每天 ${hour.split(',').join('、')} 点整`
+    }
+    if (hour.includes('-')) {
+      return `每天 ${hour} 时，每小时 ${minute} 分`
+    }
+    if (hour.startsWith('*/')) {
+      return `每 ${hour.slice(2)} 小时，${minute} 分`
+    }
+    return `每天 ${hour} 时 ${minute} 分`
   } else {
     const cfg = job.schedule_config
-    if (cfg.interval_minutes) return `每${cfg.interval_minutes}分钟`
-    if (cfg.interval_hours) return `每${cfg.interval_hours}小时`
-    if (cfg.interval_seconds) return `每${cfg.interval_seconds}秒`
-    return '间隔'
+    let desc = ''
+    if (cfg.interval_minutes) desc = `每 ${cfg.interval_minutes} 分钟`
+    else if (cfg.interval_hours) desc = `每 ${cfg.interval_hours} 小时`
+    else if (cfg.interval_seconds) desc = `每 ${cfg.interval_seconds} 秒`
+    else desc = '间隔'
+    if (cfg.start_time) desc += `，从 ${cfg.start_time} 开始`
+    return desc
   }
 }
 

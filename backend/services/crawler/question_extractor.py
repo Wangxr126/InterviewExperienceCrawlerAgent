@@ -15,7 +15,7 @@
   - source_url       原帖链接
 """
 from backend.utils.time_utils import now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
-from backend.prompts.miner_prompt import get_miner_prompt, format_miner_user_prompt
+from backend.agents.prompts.miner_prompt import get_miner_prompt, format_miner_user_prompt
 import json
 import logging
 import re
@@ -43,13 +43,14 @@ def _print_miner_config_once():
         logger.info("=" * 60)
         logger.info("✅ Miner Service (题目提取) 初始化完成")
         logger.info("=" * 60)
-        logger.info(f"   - Model: {settings.llm_model_id}")
-        logger.info(f"   - Provider: {settings.llm_provider}")
-        logger.info(f"   - Base URL: {settings.llm_base_url}")
+        logger.info(f"   - Mode: {settings.miner_mode}")
+        logger.info(f"   - Model: {settings.miner_model}")
+        logger.info(f"   - Provider: {settings.miner_provider}")
+        logger.info(f"   - Base URL: {settings.miner_base_url}")
         logger.info(f"   - Temperature: {settings.miner_temperature}")
-        logger.info(f"   - Max Tokens: {settings.miner_max_tokens or settings.llm_max_tokens}")
+        logger.info(f"   - Max Tokens: {settings.miner_max_tokens}")
         logger.info(f"   - Max Retries: {settings.miner_max_retries}")
-        logger.info(f"   - Timeout: {settings.llm_timeout}s")
+        logger.info(f"   - Timeout: {settings.miner_timeout}s")
         logger.info("=" * 60)
     except Exception as e:
         logger.warning(f"无法打印Miner Service配置: {e}")
@@ -138,7 +139,7 @@ def _get_finetune_log_path(source: str = "nowcoder") -> Path:
     """
     from backend.config.config import settings
     _PROJECT_ROOT = Path(__file__).resolve().parents[3]
-    model_name = (settings.llm_model_id or "unknown").replace(":", "_").replace(" ", "_")
+    model_name = (settings.miner_model or "unknown").replace(":", "_").replace(" ", "_")
     date_str = now_beijing_str("%Y%m%d")
     log_dir = _PROJECT_ROOT / "微调" / "llm_logs" / model_name
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -163,7 +164,7 @@ def _append_llm_log_to_csv(user_prompt: str, llm_response: str, response_time_se
             p = Path(path)
             # 使用模型名子目录
             _PROJECT_ROOT = Path(__file__).resolve().parents[3]
-            model_name = (settings.llm_model_id or "unknown").replace(":", "_").replace(" ", "_")
+            model_name = (settings.miner_model or "unknown").replace(":", "_").replace(" ", "_")
             log_dir = _PROJECT_ROOT / "微调" / "llm_logs" / model_name
             log_dir.mkdir(parents=True, exist_ok=True)
             
@@ -194,7 +195,7 @@ def _append_llm_log_to_csv(user_prompt: str, llm_response: str, response_time_se
         ft_path = _get_finetune_log_path(source)
         ft_record = {
             "ts": now_beijing_str(),
-            "model": settings.llm_model_id or "unknown",
+            "model": settings.miner_model or "unknown",
             "source": source,
             "title": title[:100] if title else "",
             "source_url": source_url,
@@ -209,43 +210,88 @@ def _append_llm_log_to_csv(user_prompt: str, llm_response: str, response_time_se
         logger.debug("微调日志写入失败: %s", e)
 
 
-def _call_llm(user_prompt: str) -> Optional[str]:
-    """调用 LLM API，system+user 双消息，强制 JSON 输出。超时 3 分钟。"""
+# 模块级复用 MinerAgent（LLM 客户端只初始化一次）
+_shared_miner_agent = None
+
+
+def _get_miner_agent(image_paths: List[str] = None, task_id: str = ""):
+    """获取或复用 MinerAgent 实例。LLM 客户端只在首次调用时初始化，后续复用。
+    每次调用前更新 image_paths 和 task_id（这两个是任务级变量）。
+    """
+    global _shared_miner_agent
+    from backend.agents.miner_agent import MinerAgent
+    if _shared_miner_agent is None:
+        _shared_miner_agent = MinerAgent(image_paths=[], task_id="")
+        logger.info("[MinerAgent] 实例已创建（LLM 客户端将复用）")
+    # 每次更新任务级状态
+    _shared_miner_agent._image_paths = image_paths or []
+    _shared_miner_agent._task_id = task_id or ""
+    _shared_miner_agent._ocr_tool._image_paths = image_paths or []
+    _shared_miner_agent._ocr_tool._task_id = task_id or ""
+    return _shared_miner_agent
+
+
+def _call_llm_with_agent(user_prompt: str, image_paths: List[str] = None, task_id: str = "") -> Optional[str]:
+    """
+    使用 MinerAgent（function-calling 模式）提取题目。
+    LLM 自主判断是否调用 ocr_images 工具：
+    - 正文有题目 → 直接调用 Finish 返回 JSON
+    - 正文无题目但有图片 → 自主调用 ocr_images → 再调用 Finish 返回 JSON
+    返回值是 Finish.answer 的内容（JSON 字符串）。
+    """
+    try:
+        agent = _get_miner_agent(image_paths=image_paths, task_id=task_id)
+        result, ocr_called = agent.run(user_prompt)
+        logger.info(f"[MinerAgent] 执行完成，输出长度: {len(result)}, ocr_called={ocr_called}")
+        return result, ocr_called
+    except Exception as e:
+        logger.warning(f"[MinerAgent] 执行失败，降级为直接 LLM 调用: {e}")
+        # 降级：手动 OCR + 直接调用 LLM
+        ocr_text = ""
+        if image_paths:
+            try:
+                from backend.services.crawler.ocr_service_mcp import ocr_images_to_text
+                ocr_text = ocr_images_to_text(image_paths, task_id) or ""
+            except Exception as ocr_e:
+                logger.warning(f"[OCR] 降级 OCR 也失败: {ocr_e}")
+        augmented_prompt = user_prompt + f"\n\n## 图片OCR识别内容\n{ocr_text}" if ocr_text else user_prompt
+        return _call_llm_direct(augmented_prompt), bool(ocr_text)
+
+
+def _call_llm_direct(user_prompt: str) -> Optional[str]:
+    """直接调用 LLM API（不走 Agent，作为降级方案）。使用 Miner 专属配置。"""
     try:
         from openai import OpenAI
         from backend.config.config import settings
-        timeout = settings.llm_timeout or 180
+        timeout = settings.miner_timeout or 180
+        model = settings.miner_model
+        if not model:
+            logger.error("Miner 模型未配置（miner_model 为空），请检查 .env 中 MINER_LOCAL_MODEL 或 MINER_REMOTE_MODEL")
+            return None
         client = OpenAI(
-            api_key=settings.llm_api_key,
-            base_url=settings.llm_base_url,
+            api_key=settings.miner_api_key,
+            base_url=settings.miner_base_url,
             timeout=timeout,
         )
         messages = [
             {"role": "system", "content": get_miner_prompt()},
             {"role": "user",   "content": user_prompt},
         ]
-        # 尝试使用 JSON mode（Ollama 部分模型支持）
-        temp = settings.miner_temperature
-        try:
-            resp = client.chat.completions.create(
-                model=settings.llm_model_id,
-                messages=messages,
-                temperature=temp,
-                timeout=timeout,
-                response_format={"type": "json_object"},
-            )
-        except Exception:
-            # 不支持 json_object 时回退到普通调用
-            resp = client.chat.completions.create(
-                model=settings.llm_model_id,
-                messages=messages,
-                temperature=temp,
-                timeout=timeout,
-            )
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=settings.miner_temperature,
+            timeout=timeout,
+        )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"LLM 调用失败: {e}")
+        logger.error(f"LLM 直接调用失败: {e}")
         return None
+
+
+def _call_llm(user_prompt: str) -> Optional[str]:
+    """调用 LLM API，system+user 双消息，强制 JSON 输出。使用 Miner 专属配置。"""
+    return _call_llm_direct(user_prompt)
 
 
 def _dig_question_arrays(obj, depth=0, max_depth=10) -> List[List[Dict]]:
@@ -270,8 +316,27 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
         return [], "empty"
     # 去掉 markdown 代码块（```json ... ``` 或 ``` ... ```）
     text = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`").strip()
+    # 去掉 deepseek-r1 的 <think>...</think> 推理块（Ollama 本地部署时混在 content 里）
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"<think>[\s\S]*$", "", text, flags=re.IGNORECASE).strip()
+    # 去掉 qwen3 等模型的 <function-call>...</function-call> 包裹，提取内部 JSON
+    _fc = re.search(r"<function-call>([\s\S]*?)</function-call>", text, flags=re.IGNORECASE)
+    if _fc:
+        try:
+            _fc_data = json.loads(_fc.group(1).strip())
+            if isinstance(_fc_data, dict) and _fc_data.get("name") == "Finish":
+                text = _fc_data.get("arguments", {}).get("answer", "") or ""
+            elif isinstance(_fc_data, dict) and "answer" in _fc_data:
+                text = _fc_data["answer"]
+        except (json.JSONDecodeError, AttributeError):
+            text = _fc.group(1).strip()
 
-    # 0. 检测「帖子与面经无关」或空对象
+    # 0a. 检测 NO_RELATED_CONTENT 特殊标识（prompt 要求模型在完全无关时输出此值，不应重试）
+    if text.strip() == "NO_RELATED_CONTENT":
+        logger.info("LLM 明确返回 NO_RELATED_CONTENT，帖子与面经无关")
+        return [], "unrelated"
+
+    # 0b. 检测「帖子与面经无关」或空对象，或 LLM 把原文包裹进对象返回
     try:
         data = json.loads(text)
         if isinstance(data, dict):
@@ -281,6 +346,10 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
             if not data:
                 logger.warning("⚠️ LLM 返回空对象 {}，判定为无题目（应返回空数组[]）")
                 return [], "empty"
+            # LLM 有时把输入原文包裹返回，如 {"面经原文": "..."}，这不是题目列表
+            if set(data.keys()) <= {"面经原文", "title", "正文", "content", "原文", "text"}:
+                logger.warning(f"⚠️ LLM 返回原文包裹对象（keys={list(data.keys())}），判定为无题目")
+                return [], "empty"
     except json.JSONDecodeError:
         pass
 
@@ -288,7 +357,7 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
     try:
         data = json.loads(text)
         if isinstance(data, list):
-            return data, "ok" if data else "empty"
+            return (data, "ok") if data else ([], "empty")
         if isinstance(data, dict):
             # 常见顶层 key 或嵌套 job.project_detail
             for key in ("questions", "items", "results", "data", "list", "output"):
@@ -392,7 +461,7 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
 
     logger.error("LLM 返回内容无法解析为 JSON 数组，提取失败（已入库 status=error）")
     try:
-        from backend.services.llm_parse_failures import save_failure
+        from backend.services.logging.llm_parse_failures import save_failure
         save_failure(
             source="question_extract",
             input_preview=user_prompt_for_debug or "",
@@ -419,14 +488,17 @@ def extract_questions_from_post(
     source_url: str = "",
     post_title: str = "",
     extraction_source: str = "content",
-) -> Tuple[List[Dict], str]:
+    image_paths: List[str] = None,
+    task_id: str = "",
+) -> Tuple[List[Dict], str, bool]:
     """
     从面经原文中用 LLM 提取结构化题目列表。
 
     content 过长时自动截断（6000 字符，约 3000 token）。
-    返回 (questions, status)，status 为 ok/unrelated/empty/parse_error。
-    
-    支持重试机制：当返回为空或解析失败时，自动重试（最大次数由 EXTRACTOR_MAX_RETRIES 配置）。
+    返回 (questions, status, agent_used_tool)，status 为 ok/unrelated/empty/parse_error。
+    agent_used_tool: MinerAgent 是否调用了 ocr_images 工具（True=是，False=否）。
+
+    若正文无题目且有图片，MinerAgent 会自主调用 ocr_images 工具获取图片内容后再提取。
     """
     _print_miner_config_once()
     if not content or len(content.strip()) < 50:
@@ -440,45 +512,51 @@ def extract_questions_from_post(
 
     # 拼接标题和内容
     full_content = f"【标题】{post_title}\n\n【正文】\n{truncated}" if post_title else truncated
-    
+
     # 使用新的 Prompt 系统
-    user_prompt = format_miner_user_prompt(full_content)
+    user_prompt = format_miner_user_prompt(full_content, company=company, position=position)
 
     from backend.config.config import settings
     max_retries = settings.miner_max_retries
-    
-    # 重试循环
+
+    # 正文提取（带重试）
+    # 统一走 MinerAgent（ReAct 模式）：LLM 自主判断是否调用 ocr_images 工具
+    # - 正文有题目 → LLM 直接调用 Finish 返回 JSON
+    # - 正文无题目但有图片 → LLM 自主调用 ocr_images → 再调用 Finish 返回 JSON
+    items, status = [], "empty"
+    agent_used_tool: bool = False
     for attempt in range(1, max_retries + 1):
         t0 = time.perf_counter()
-        raw = _call_llm(user_prompt)
+        raw, ocr_called = _call_llm_with_agent(user_prompt, image_paths=image_paths, task_id=task_id)
         llm_response_time_sec = time.perf_counter() - t0
+        if ocr_called:
+            agent_used_tool = True
 
         items, status = _parse_json_from_llm(raw, user_prompt_for_debug=user_prompt)
 
-        _append_llm_log_to_csv(user_prompt, raw or "", llm_response_time_sec, source=platform, 
+        _append_llm_log_to_csv(user_prompt, raw or "", llm_response_time_sec, source=platform,
                                title=post_title, source_url=source_url)
 
-        # 成功或明确判定为无关，直接返回
         if status == "unrelated":
             logger.info(f"LLM 判定帖子与面经无关: {source_url}")
             return [], "unrelated"
-        
+
         if status == "ok" and items:
             if attempt > 1:
                 logger.info(f"重试成功（第 {attempt} 次）: 提取到 {len(items)} 道题目")
             break
-        
-        # 需要重试的情况：empty 或 parse_error
+
         if attempt < max_retries:
             logger.warning(f"提取失败（第 {attempt} 次，状态: {status}），{max_retries - attempt} 次重试机会剩余")
-            time.sleep(1)  # 短暂延迟避免频繁请求
+            time.sleep(1)
         else:
-            logger.error(f"提取失败，已达最大重试次数 {max_retries}: {source_url}")
-            if not items:
-                logger.warning(f"LLM 未提取到题目: {source_url}")
-                if raw:
-                    logger.info(f"LLM 原始返回（前500字）: {raw[:500]}")
-                return [], status
+            logger.warning(f"提取失败，已达最大重试次数 {max_retries}: {source_url}")
+            if raw:
+                logger.info(f"LLM 原始返回（前500字）: {raw[:500]}")
+
+    if not items:
+        logger.warning(f"LLM 未提取到题目: {source_url}")
+        return [], status, agent_used_tool
 
     questions: List[Dict] = []
     for item in items:
@@ -528,7 +606,7 @@ def extract_questions_from_post(
         })
 
     logger.info(f"从帖子提取到 {len(questions)} 道题目: {post_title[:30] or source_url}")
-    return questions, "ok"
+    return questions, "ok", agent_used_tool
 
 
 
@@ -594,12 +672,12 @@ def check_contents_related_batch(contents: List[str], max_chars_per_item: int = 
     t0 = time.perf_counter()
     try:
         client = OpenAI(
-            api_key=settings.llm_api_key,
-            base_url=settings.llm_base_url,
-            timeout=settings.llm_timeout or 180,
+            api_key=settings.miner_api_key,
+            base_url=settings.miner_base_url,
+            timeout=settings.miner_timeout or 180,
         )
         resp = client.chat.completions.create(
-            model=settings.llm_model_id,
+            model=settings.miner_model,
             messages=[
                 {"role": "system", "content": "你输出严格的 JSON 数组，如 [true, false, true]。"},
                 {"role": "user", "content": user_prompt},

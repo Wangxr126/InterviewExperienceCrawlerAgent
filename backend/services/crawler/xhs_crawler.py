@@ -503,7 +503,8 @@ def fetch_xhs_details(links: List[str]) -> List[Dict]:
     if not links:
         return []
     if os.name == "nt":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        # Windows 需要使用 ProactorEventLoop 来支持子进程（Playwright 需要）
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
