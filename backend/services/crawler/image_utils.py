@@ -78,7 +78,7 @@ def download_images(
                 f.write(resp.content)
             rel = f"{rel_prefix}/{fname}"
             saved.append(rel)
-            logger.debug(f"图片已保存: {rel}")
+            logger.info(f"图片已保存: {rel}")
         except Exception as e:
             logger.warning(f"图片下载失败 {url[:60]}: {e}")
 

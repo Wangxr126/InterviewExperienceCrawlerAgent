@@ -442,6 +442,8 @@ async def _async_fetch_details(links: List[str]) -> List[Dict]:
         logger.error("xhs_crawl 未安装: pip install xhs-crawl")
         return []
 
+    # 静默 xhs_crawl 内部日志（避免重复打印搜索流程日志）
+    logging.getLogger("xhs_crawl").setLevel(logging.WARNING)
     spider = XHSSpider()
     posts: List[Dict] = []
 

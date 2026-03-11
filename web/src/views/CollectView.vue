@@ -176,6 +176,7 @@
                 <div><strong>待抓取</strong>：已发现链接，尚未获取正文</div>
                 <div><strong>待提取</strong>：正文已获取，待 LLM 提取面试题</div>
                 <div><strong>已完成</strong>：题目已提取并入库</div>
+                <div><strong>无关帖</strong>：LLM 判断正文与面经无关，参与「清洗无关帖」后删除</div>
                 <div><strong>失败</strong>：抓取正文或 LLM 提取时出错</div>
               </div>
             </template>
@@ -421,20 +422,22 @@ const refetchLoading        = ref(null)  // task_id 正在重抓正文
 const form = reactive({ keywords: '', maxPages: 5, xhsCount: 20 })
 
 const STATUS_OPTIONS = [
-  { value: 'pending', label: '待抓取', desc: '未获取正文' },
-  { value: 'fetched', label: '待提取', desc: '待 LLM 提取' },
-  { value: 'done',    label: '已完成', desc: '题目已入库' },
-  { value: 'error',   label: '失败',   desc: '抓取或提取出错' },
+  { value: 'pending',   label: '待抓取',  desc: '未获取正文' },
+  { value: 'fetched',   label: '待提取',  desc: '待 LLM 提取' },
+  { value: 'done',      label: '已完成',  desc: '题目已入库' },
+  { value: 'unrelated', label: '无关帖',  desc: 'LLM 判断与面经无关' },
+  { value: 'error',     label: '失败',    desc: '抓取或提取出错' },
 ]
 const STATUS_META = {
   pending:    { label: '待抓取', color: '#e6a23c' },
   fetched:    { label: '待提取', color: '#409eff' },
   done:       { label: '已完成', color: '#67c23a' },
+  unrelated:  { label: '无关帖', color: '#909399' },
   error:      { label: '失败',   color: '#f56c6c' },
-  skipped:    { label: '已跳过', color: '#909399' },
+  skipped:    { label: '已跳过', color: '#c0c4cc' },
 }
-const STATUS_LABEL = { pending:'待抓取', fetched:'待提取', done:'已完成', error:'失败', skipped:'已跳过' }
-const STATUS_TAG   = { pending:'warning', fetched:'', done:'success', error:'danger', skipped:'info' }
+const STATUS_LABEL = { pending:'待抓取', fetched:'待提取', done:'已完成', unrelated:'无关帖', error:'失败', skipped:'已跳过' }
+const STATUS_TAG   = { pending:'warning', fetched:'', done:'success', unrelated:'info', error:'danger', skipped:'info' }
 
 const fetchedCount = computed(() => {
   const v = rawStats.value['fetched']

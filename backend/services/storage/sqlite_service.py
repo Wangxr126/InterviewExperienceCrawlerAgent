@@ -236,9 +236,9 @@ class SqliteService:
             # 迁移：为 crawl_tasks 添加 agent_used_tool 列（MinerAgent 是否进行了工具调用）
             if "agent_used_tool" not in cols:
                 conn.execute("ALTER TABLE crawl_tasks ADD COLUMN agent_used_tool INTEGER DEFAULT 0")
-            # 迁移：为 crawl_tasks 添加 extract_duration_sec 列（LLM 提取耗时，秒）
-            if "extract_duration_sec" not in cols:
-                conn.execute("ALTER TABLE crawl_tasks ADD COLUMN extract_duration_sec REAL")
+            # 迁移：为 crawl_tasks 添加 extract_duration_min 列（LLM 提取耗时，分钟）
+            if "extract_duration_min" not in cols:
+                conn.execute("ALTER TABLE crawl_tasks ADD COLUMN extract_duration_min REAL")
             conn.commit()
         logger.info("✅ SQLite 所有表初始化完成")
         self._seed_knowledge_resources()
@@ -1118,11 +1118,11 @@ class SqliteService:
                            questions_count: int = 0, error_msg: str = "",
                            raw_content: Optional[str] = None, image_paths: Optional[List[str]] = None,
                            extraction_source: str = "", agent_used_tool: Optional[bool] = None,
-                           extract_duration_sec: Optional[float] = None):
+                           extract_duration_min: Optional[float] = None):
         """更新任务状态。raw_content/image_paths 为 None 时不更新该列（保留原文），避免误覆盖。
         extraction_source: content=正文提取, image=图片OCR提取（帖子维度）
         agent_used_tool: MinerAgent 是否进行了工具调用（True/False/None=不更新）
-        extract_duration_sec: LLM 提取耗时（秒），None=不更新"""
+        extract_duration_min: LLM 提取耗时（分钟），None=不更新"""
         import json as _json
         sets = ["status=?", "questions_count=?", "error_msg=?", "extraction_source=?", "processed_at=CURRENT_TIMESTAMP"]
         params: list = [status, questions_count, error_msg, extraction_source or None]
@@ -1135,9 +1135,9 @@ class SqliteService:
         if agent_used_tool is not None:
             sets.append("agent_used_tool=?")
             params.append(1 if agent_used_tool else 0)
-        if extract_duration_sec is not None:
-            sets.append("extract_duration_sec=?")
-            params.append(round(extract_duration_sec, 1))
+        if extract_duration_min is not None:
+            sets.append("extract_duration_min=?")
+            params.append(round(extract_duration_min, 2))
         params.append(task_id)
         with self._get_conn() as conn:
             conn.execute("UPDATE crawl_tasks SET " + ", ".join(sets) + " WHERE task_id=?", params)

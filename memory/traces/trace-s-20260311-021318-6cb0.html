@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Trace: s-20260311-021318-6cb0</title>
+    <style>
+        body {
+            font-family: 'Consolas', 'Monaco', monospace;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            margin: 0;
+        }
+        .header {
+            background: #2a2a2a;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .header h1 {
+            margin: 0 0 10px 0;
+            color: #4af626;
+        }
+        .stats-panel {
+            background: #2a2a2a;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .stat-item {
+            background: #1a1a1a;
+            padding: 15px;
+            border-radius: 5px;
+            border-left: 3px solid #4af626;
+        }
+        .stat-label {
+            display: block;
+            color: #888;
+            font-size: 12px;
+            margin-bottom: 5px;
+        }
+        .stat-value {
+            display: block;
+            color: #e0e0e0;
+            font-size: 24px;
+            font-weight: bold;
+        }
+        .tool-stats {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        .tool-stats th, .tool-stats td {
+            padding: 8px;
+            text-align: left;
+            border-bottom: 1px solid #333;
+        }
+        .tool-stats th {
+            color: #4af626;
+        }
+        .error-list {
+            list-style: none;
+            padding: 0;
+        }
+        .error-list li {
+            background: #331111;
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 5px;
+            border-left: 3px solid #ff4444;
+        }
+        .events-container {
+            background: #2a2a2a;
+            padding: 20px;
+            border-radius: 8px;
+        }
+        .event {
+            border: 1px solid #333;
+            margin: 10px 0;
+            padding: 15px;
+            border-radius: 5px;
+            background: #1a1a1a;
+        }
+        .event-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .step {
+            color: #888;
+            font-size: 12px;
+        }
+        .timestamp {
+            color: #666;
+            font-size: 11px;
+        }
+        .event-type {
+            color: #4af626;
+            font-weight: bold;
+        }
+        .expandable {
+            cursor: pointer;
+            color: #4af626;
+            user-select: none;
+        }
+        .expandable:hover {
+            color: #6fff48;
+        }
+        .details {
+            display: none;
+            margin-top: 10px;
+            padding: 10px;
+            background: #0d0d0d;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+        .details pre {
+            margin: 0;
+            color: #e0e0e0;
+        }
+        .tool-call {
+            border-left: 3px solid #4af626;
+        }
+        .tool-result {
+            border-left: 3px solid #ffd700;
+        }
+        .error {
+            border-left: 3px solid #ff4444;
+            background: #2a1a1a;
+        }
+        .model-output {
+            border-left: 3px solid #00bfff;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🔍 Trace Session: s-20260311-021318-6cb0</h1>
+        <p>生成时间: 2026-03-11 02:13:18</p>
+    </div>
+
+    <div class="events-container">
+        <h2>📋 事件列表</h2>
+
+        <div class="event">
+            <div class="event-header">
+                <span class="step">Step -</span>
+                <span class="timestamp">2026-03-11T02:13:18.242955</span>
+                <span class="event-type">session_start</span>
+                <span class="expandable" onclick="toggleDetails('details-1')">[▼ 详情]</span>
+            </div>
+            <div id="details-1" class="details">
+                <pre>{
+  "agent_name": "Miner Agent",
+  "agent_type": "MinerAgent"
+}</pre>
+            </div>
+        </div>
+
+        <div class="event">
+            <div class="event-header">
+                <span class="step">Step -</span>
+                <span class="timestamp">2026-03-11T02:13:18.243469</span>
+                <span class="event-type">message_written</span>
+                <span class="expandable" onclick="toggleDetails('details-2')">[▼ 详情]</span>
+            </div>
+            <div id="details-2" class="details">
+                <pre>{
+  "role": "user",
+  "content": "## 面经原文\n【标题】广州小厂爱奇创新后端面经\n\n【正文】\n28届，来小厂练手，有笔试题\n笔试\n1、重载重写\n2、异常为什么要传递异常信息\n3、字符串a，b，c...变成a-&gt;b-&gt;c...\n4、列表去重\n5、状态机状态流转思路\n6、忘记了\n7、autowired多bean注入问题\n8、多线程并行处理任务\n面试\n一个很有前辈感的大叔，人很好\n没问什么八股，就看项目问问一些实现\n团队git使用，分支管理\n你笔试用semaphore控制并发，有没有其他方案，我说了其他的aqs框架\ncompletablefuture的方案，并发访问\n文件上传用多轮hash为什么\n写了个sql，phone表和user表，查phone多于2的用户SELECT\nu.user_id,\nu.user_name\nFROM\nuser u\nJOIN (\nSELECT\nuser_id\nFROM\nuser_phone\nGROUP BY\nuser_id\nHAVING\nCOUNT(*) &gt;= 2\n) p ON u.user_id = p.user_id;\n写个case，用string参数\n项目难点\n项目使用数据库数量等要做测试，不要什么都放缓存\n家里面有程序员？这么早出来\n有个人项目吗\n能接受全栈吗，要写app+java或者app+vue\n后端可能只有你一个人负责？\n反问\n我问公司业务、ai使用看法\n他说我可以再考虑一下大一些的厂\n面试官人很好，循循善诱，但是感觉我八股背很多一点没问哈哈哈\n他说后面还有几轮面试，但是我感觉我应该是纯当练手，继续投简历，投了50多家才俩个约面，下一个是12号的，这个大一点，我去试试看\n#牛客AI配图神器#\n\n## 元信息\n- 是否有图片：是\n- 公司：未知\n- 岗位：后端"
+}</pre>
+            </div>
+        </div>
+
+        <div class="event error">
+            <div class="event-header">
+                <span class="step">Step 1</span>
+                <span class="timestamp">2026-03-11T02:22:19.557248</span>
+                <span class="event-type">error</span>
+                <span class="expandable" onclick="toggleDetails('details-3')">[▼ 详情]</span>
+            </div>
+            <div id="details-3" class="details">
+                <pre>{
+  "error_type": "LLM_ERROR",
+  "message": "OpenAI Function Calling调用失败: Request timed out."
+}</pre>
+            </div>
+        </div>
+
+        <div class="event">
+            <div class="event-header">
+                <span class="step">Step -</span>
+                <span class="timestamp">2026-03-11T02:22:19.558545</span>
+                <span class="event-type">session_end</span>
+                <span class="expandable" onclick="toggleDetails('details-4')">[▼ 详情]</span>
+            </div>
+            <div id="details-4" class="details">
+                <pre>{
+  "duration": 541.317376,
+  "total_steps": 1,
+  "final_answer": "",
+  "status": "success"
+}</pre>
+            </div>
+        </div>
+
+    </div>
+
+    <div class="stats-panel">
+        <h2>📊 会话统计</h2>
+        <div class="stats-grid">
+            <div class="stat-item">
+                <span class="stat-label">总步骤数</span>
+                <span class="stat-value">1</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">总 Token</span>
+                <span class="stat-value">0</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">总成本</span>
+                <span class="stat-value">$0.0000</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">会话时长</span>
+                <span class="stat-value">541.3s</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">模型调用次数</span>
+                <span class="stat-value">0</span>
+            </div>
+        </div>
+
+        <h3>🔧 工具调用统计</h3>
+        <table class="tool-stats">
+            <tr><th>工具名称</th><th>调用次数</th></tr>
+            <tr><td colspan="2">无工具调用</td></tr>
+        </table>
+
+        
+        <h3>❌ 错误列表 (1)</h3>
+        <ul class="error-list">
+            <li>Step 1: <strong>LLM_ERROR</strong> - OpenAI Function Calling调用失败: Request timed out.</li>
+
+        </ul>
+
+    </div>
+
+    <script>
+        function toggleDetails(id) {
+            const el = document.getElementById(id);
+            if (el.style.display === 'none' || el.style.display === '') {
+                el.style.display = 'block';
+            } else {
+                el.style.display = 'none';
+            }
+        }
+    </script>
+</body>
+</html>

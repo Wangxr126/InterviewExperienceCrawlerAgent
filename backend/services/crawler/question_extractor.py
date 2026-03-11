@@ -215,35 +215,37 @@ _shared_miner_agent = None
 
 
 def _get_miner_agent(image_paths: List[str] = None, task_id: str = ""):
-    """获取或复用 MinerAgent 实例。LLM 客户端只在首次调用时初始化，后续复用。
-    每次调用前更新 image_paths 和 task_id（这两个是任务级变量）。
+    """获取或创建 MinerAgent 实例。
+    注意：由于改用框架托管，每次都需要创建新实例（工具状态绑定在实例上）。
     """
-    global _shared_miner_agent
     from backend.agents.miner_agent import MinerAgent
-    if _shared_miner_agent is None:
-        _shared_miner_agent = MinerAgent(image_paths=[], task_id="")
-        logger.info("[MinerAgent] 实例已创建（LLM 客户端将复用）")
-    # 每次更新任务级状态
-    _shared_miner_agent._image_paths = image_paths or []
-    _shared_miner_agent._task_id = task_id or ""
-    _shared_miner_agent._ocr_tool._image_paths = image_paths or []
-    _shared_miner_agent._ocr_tool._task_id = task_id or ""
-    return _shared_miner_agent
+    # 框架托管版本：每次创建新实例（工具注册时已绑定 image_paths）
+    return MinerAgent(image_paths=image_paths or [], task_id=task_id or "")
 
 
-def _call_llm_with_agent(user_prompt: str, image_paths: List[str] = None, task_id: str = "") -> Optional[str]:
+def _call_llm_with_agent(content: str, has_image: bool, company: str = "", position: str = "", 
+                         image_paths: List[str] = None, task_id: str = "") -> Tuple[str, bool, bool]:
     """
-    使用 MinerAgent（function-calling 模式）提取题目。
-    LLM 自主判断是否调用 ocr_images 工具：
-    - 正文有题目 → 直接调用 Finish 返回 JSON
-    - 正文无题目但有图片 → 自主调用 ocr_images → 再调用 Finish 返回 JSON
-    返回值是 Finish.answer 的内容（JSON 字符串）。
+    使用 MinerAgent（框架托管版）提取题目。
+    LLM 自主通过工具调用决策：
+    - 正文有题目 → 调用 Finish 返回 JSON
+    - 正文无题但有图片 → 调用 ocr_images → 再调用 Finish
+    - 正文+图片均无题 → 调用 mark_unrelated → 返回 UNRELATED_SIGNAL
+
+    Returns:
+        (result, ocr_called, is_unrelated)
     """
+    from backend.agents.miner_agent import UNRELATED_SIGNAL
     try:
         agent = _get_miner_agent(image_paths=image_paths, task_id=task_id)
-        result, ocr_called = agent.run(user_prompt)
-        logger.info(f"[MinerAgent] 执行完成，输出长度: {len(result)}, ocr_called={ocr_called}")
-        return result, ocr_called
+        result, ocr_called, is_unrelated = agent.run(
+            content=content,
+            has_image=has_image,
+            company=company,
+            position=position
+        )
+        logger.info(f"[MinerAgent] 执行完成，输出长度: {len(result)}, ocr_called={ocr_called}, is_unrelated={is_unrelated}")
+        return result, ocr_called, is_unrelated
     except Exception as e:
         logger.warning(f"[MinerAgent] 执行失败，降级为直接 LLM 调用: {e}")
         # 降级：手动 OCR + 直接调用 LLM
@@ -254,8 +256,14 @@ def _call_llm_with_agent(user_prompt: str, image_paths: List[str] = None, task_i
                 ocr_text = ocr_images_to_text(image_paths, task_id) or ""
             except Exception as ocr_e:
                 logger.warning(f"[OCR] 降级 OCR 也失败: {ocr_e}")
-        augmented_prompt = user_prompt + f"\n\n## 图片OCR识别内容\n{ocr_text}" if ocr_text else user_prompt
-        return _call_llm_direct(augmented_prompt), bool(ocr_text)
+        
+        # 使用 format_miner_user_prompt 格式化输入
+        from backend.agents.prompts.miner_prompt import format_miner_user_prompt
+        user_prompt = format_miner_user_prompt(content, has_image, company, position)
+        if ocr_text:
+            user_prompt += f"\n\n## 图片OCR识别内容\n{ocr_text}"
+        
+        return _call_llm_direct(user_prompt), bool(ocr_text), False
 
 
 def _call_llm_direct(user_prompt: str) -> Optional[str]:
@@ -501,36 +509,53 @@ def extract_questions_from_post(
     若正文无题目且有图片，MinerAgent 会自主调用 ocr_images 工具获取图片内容后再提取。
     """
     _print_miner_config_once()
-    if not content or len(content.strip()) < 50:
-        logger.warning(f"内容过短，跳过提取: {source_url}")
-        return [], "empty"
+    
+    # 只检查是否完全为空（不检查长度）
+    if not content and not image_paths:
+        logger.warning(f"内容和图片均为空，跳过提取: {source_url}")
+        return [], "empty", False
 
     # 截断过长内容
-    truncated = content[:MAX_CONTENT_CHARS]
-    if len(content) > MAX_CONTENT_CHARS:
+    truncated = content[:MAX_CONTENT_CHARS] if content else ""
+    if content and len(content) > MAX_CONTENT_CHARS:
         logger.info(f"内容截断: {len(content)} → {MAX_CONTENT_CHARS} chars")
 
     # 拼接标题和内容
     full_content = f"【标题】{post_title}\n\n【正文】\n{truncated}" if post_title else truncated
 
     # 使用新的 Prompt 系统
-    user_prompt = format_miner_user_prompt(full_content, company=company, position=position)
+    user_prompt = format_miner_user_prompt(full_content, has_image=bool(image_paths), company=company, position=position)
 
     from backend.config.config import settings
     max_retries = settings.miner_max_retries
 
     # 正文提取（带重试）
-    # 统一走 MinerAgent（ReAct 模式）：LLM 自主判断是否调用 ocr_images 工具
+    # 统一走 MinerAgent（框架托管版）：LLM 自主判断是否调用 ocr_images 工具
     # - 正文有题目 → LLM 直接调用 Finish 返回 JSON
     # - 正文无题目但有图片 → LLM 自主调用 ocr_images → 再调用 Finish 返回 JSON
     items, status = [], "empty"
     agent_used_tool: bool = False
+    from backend.agents.miner_agent import UNRELATED_SIGNAL
     for attempt in range(1, max_retries + 1):
         t0 = time.perf_counter()
-        raw, ocr_called = _call_llm_with_agent(user_prompt, image_paths=image_paths, task_id=task_id)
+        raw, ocr_called, is_unrelated = _call_llm_with_agent(
+            content=full_content,
+            has_image=bool(image_paths),
+            company=company,
+            position=position,
+            image_paths=image_paths,
+            task_id=task_id
+        )
         llm_response_time_sec = time.perf_counter() - t0
         if ocr_called:
             agent_used_tool = True
+
+        # LLM 主动调用 mark_unrelated 工具 → 直接标记无关，不再解析 JSON
+        if is_unrelated or raw == UNRELATED_SIGNAL:
+            logger.info(f"LLM 主动标记帖子无关（mark_unrelated）: {source_url}")
+            _append_llm_log_to_csv(user_prompt, "[mark_unrelated]", llm_response_time_sec,
+                                   source=platform, title=post_title, source_url=source_url)
+            return [], "unrelated", agent_used_tool
 
         items, status = _parse_json_from_llm(raw, user_prompt_for_debug=user_prompt)
 
@@ -539,7 +564,7 @@ def extract_questions_from_post(
 
         if status == "unrelated":
             logger.info(f"LLM 判定帖子与面经无关: {source_url}")
-            return [], "unrelated"
+            return [], "unrelated", agent_used_tool
 
         if status == "ok" and items:
             if attempt > 1:
@@ -565,14 +590,15 @@ def extract_questions_from_post(
             logger.debug(f"跳过非字典项: {type(item)}")
             continue
         
-        q_text = str(item.get("question_text", "")).strip()
+        # 兼容多种字段名：question_text / question
+        q_text = str(item.get("question_text") or item.get("question", "")).strip()
         
         # 放宽过滤条件：只过滤完全为空的题目
         if not q_text:
             logger.warning(f"题目为空被过滤")
             continue
 
-        tags_raw = item.get("topic_tags", [])
+        tags_raw = item.get("topic_tags") or item.get("tags", [])
         if not isinstance(tags_raw, list):
             tags_raw = [str(tags_raw)]
 
@@ -590,12 +616,13 @@ def extract_questions_from_post(
         import uuid
         q_id = str(uuid.uuid4())
         
+        # 兼容多种字段名：answer_text / answer, question_type / type
         questions.append({
             "q_id": q_id,  # 添加 q_id 字段
             "question_text": q_text,
-            "answer_text": str(item.get("answer_text", "")).strip(),
+            "answer_text": str(item.get("answer_text") or item.get("answer", "")).strip(),
             "difficulty": difficulty_val,
-            "question_type": str(item.get("question_type", "技术题")),
+            "question_type": str(item.get("question_type") or item.get("type", "技术题")),
             "topic_tags": json.dumps(tags_raw, ensure_ascii=False),
             "company": final_company,
             "position": final_position,
@@ -605,7 +632,9 @@ def extract_questions_from_post(
             "extraction_source": extraction_source,
         })
 
-    logger.info(f"从帖子提取到 {len(questions)} 道题目: {post_title[:30] or source_url}")
+    # 只在成功提取到题目时输出日志
+    if questions:
+        logger.info(f"✅ 提取成功: {len(questions)} 道题目 | {post_title[:30] or source_url}")
     return questions, "ok", agent_used_tool
 
 

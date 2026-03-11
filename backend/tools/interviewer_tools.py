@@ -1,11 +1,14 @@
 """
-面试官工具箱 (Interviewer Tools) v2.0
-新增：SM-2 遗忘曲线算法 / NoteTool / FilterTool / MasteryReporter
+面试官工具箱 (Interviewer Tools) v2.1
+- user_id 全部改为 required=False（由线程上下文自动注入，LLM 无需传参）
+- 移除已弃用的 ProgressTracker / InterviewEvaluator（已由 Orchestrator 确定性调用）
+- re 模块移至顶层 import
 """
 import logging
 import json
+import re
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 from hello_agents.tools import Tool, ToolParameter
 from backend.services.storage.neo4j_service import neo4j_service
@@ -45,7 +48,7 @@ class SmartRecommendationEngine(Tool):
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
-            ToolParameter(name="user_id", type="string", description="用户ID", required=True),
+            ToolParameter(name="user_id", type="string", description="用户ID（可选，系统自动注入）", required=False),
             ToolParameter(name="mode", type="string",
                           description="推荐模式: auto/review/weakness/new/company", required=False),
             ToolParameter(name="topic", type="string",
@@ -148,78 +151,7 @@ def _days_overdue(next_review_str: str) -> int:
 
 
 # ==============================================================================
-# 2. 进度打分机（含 SM-2 更新 + 标签掌握度更新）
-# ==============================================================================
-
-class ProgressTracker(Tool):
-    """
-    记录用户答题结果（0-5分），自动运行 SM-2 算法更新遗忘曲线参数，
-    并同步更新用户的标签掌握度。
-    """
-    def __init__(self):
-        super().__init__(
-            name="update_progress",
-            description=(
-                "记录用户的答题得分（0-5分）并更新遗忘曲线参数。"
-                "评分标准：0=完全不会，1=基本不会，2=大部分不会，"
-                "3=勉强会，4=基本掌握，5=完全掌握。"
-            )
-        )
-
-    def get_parameters(self) -> List[ToolParameter]:
-        return [
-            ToolParameter(name="user_id", type="string", required=True),
-            ToolParameter(name="question_id", type="string", required=True),
-            ToolParameter(name="score", type="integer",
-                          description="评分 0-5", required=True),
-            ToolParameter(name="user_answer", type="string",
-                          description="用户的回答原文", required=False),
-            ToolParameter(name="ai_feedback", type="string",
-                          description="AI 的详细评价", required=False),
-            ToolParameter(name="session_id", type="string",
-                          description="当前面试 session ID", required=False),
-        ]
-
-    def run(self, parameters: Dict[str, Any]) -> str:
-        user_id = _resolve_user_id(parameters)
-        question_id = parameters.get("question_id", "")
-        score = int(parameters.get("score", 0))
-        user_answer = parameters.get("user_answer", "")
-        ai_feedback = parameters.get("ai_feedback", "")
-        session_id = parameters.get("session_id", "")
-
-        if not user_id or not question_id:
-            return "❌ 缺少 user_id 或 question_id"
-        if not (0 <= score <= 5):
-            return "❌ score 必须在 0-5 之间"
-
-        try:
-            sm2_result = sqlite_service.add_study_record(
-                user_id=user_id, question_id=question_id,
-                score=score, user_answer=user_answer,
-                ai_feedback=ai_feedback, session_id=session_id
-            )
-
-            # 更新 session 对话历史
-            if session_id:
-                sqlite_service.update_session_history(session_id, "user_score",
-                                                      f"题目 {question_id} 得分: {score}")
-
-            msg = f"✅ 进度已记录 | 得分: {score}/5\n"
-            msg += f"📅 下次复习时间: {sm2_result['next_review_at']}"
-            if score < 3:
-                msg += "\n💡 建议：这道题需要重点复习，明天将再次出现。"
-            elif score >= 4:
-                msg += f"\n🎉 掌握得不错！下次复习间隔: {sm2_result['interval_days']} 天"
-            return msg
-
-        except Exception as e:
-            logger.error(f"ProgressTracker 异常: {e}")
-            return f"❌ 记录失败: {str(e)}"
-
-
-# ==============================================================================
-# 3. 举一反三 / 换个问法（SimilaritySearchTool）
+# 2. 举一反三 / 换个问法（SimilaritySearchTool）
 # ==============================================================================
 
 class SimilaritySearchTool(Tool):
@@ -302,7 +234,7 @@ class SimilaritySearchTool(Tool):
 
 
 # ==============================================================================
-# 4. 题目过滤器 (FilterTool) —— 纯 SQL，不需要 LLM
+# 3. 题目过滤器 (FilterTool) —— 纯 SQL，不需要 LLM
 # ==============================================================================
 
 class FilterTool(Tool):
@@ -383,7 +315,7 @@ class FilterTool(Tool):
 
 
 # ==============================================================================
-# 5. 笔记工具 (NoteTool)
+# 4. 笔记工具 (NoteTool)
 # ==============================================================================
 
 class NoteTool(Tool):
@@ -404,7 +336,7 @@ class NoteTool(Tool):
         return [
             ToolParameter(name="action", type="string",
                           description="操作: create/list/update/delete", required=True),
-            ToolParameter(name="user_id", type="string", description="用户ID", required=True),
+            ToolParameter(name="user_id", type="string", description="用户ID（可选，系统自动注入）", required=False),
             ToolParameter(name="note_id", type="string",
                           description="笔记ID（update/delete 时必填）", required=False),
             ToolParameter(name="question_id", type="string",
@@ -486,7 +418,7 @@ class NoteTool(Tool):
 
 
 # ==============================================================================
-# 6. 掌握度报告 (MasteryReporter)
+# 5. 掌握度报告 (MasteryReporter)
 # ==============================================================================
 
 class MasteryReporter(Tool):
@@ -502,7 +434,7 @@ class MasteryReporter(Tool):
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
-            ToolParameter(name="user_id", type="string", description="用户ID", required=True),
+            ToolParameter(name="user_id", type="string", description="用户ID（可选，系统自动注入）", required=False),
             ToolParameter(name="tags", type="array",
                           description="指定查询的标签列表，不填则查全部", required=False),
         ]
@@ -565,7 +497,7 @@ class MasteryReporter(Tool):
 
 
 # ==============================================================================
-# 7. 简历分析工具 (ResumeAnalysisTool) —— 升级为 LLM 提取
+# 6. 简历分析工具 (ResumeAnalysisTool)
 # ==============================================================================
 
 class ResumeAnalysisTool(Tool):
@@ -579,7 +511,7 @@ class ResumeAnalysisTool(Tool):
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
-            ToolParameter(name="user_id", type="string", required=True),
+            ToolParameter(name="user_id", type="string", description="用户ID（可选，系统自动注入）", required=False),
             ToolParameter(name="resume_text", type="string",
                           description="简历原文", required=True),
             ToolParameter(name="target_company", type="string",
@@ -640,92 +572,7 @@ class ResumeAnalysisTool(Tool):
 
 
 # ==============================================================================
-# 8. 面试评估工具 (InterviewEvaluator)
-# ==============================================================================
-
-class InterviewEvaluator(Tool):
-    """生成本次面试/练习的评估报告，包含得分统计和薄弱点分析。"""
-
-    def __init__(self):
-        super().__init__(
-            name="generate_evaluation",
-            description="生成本次面试或练习的评估报告，统计得分并分析薄弱点。"
-        )
-
-    def get_parameters(self) -> List[ToolParameter]:
-        return [
-            ToolParameter(name="user_id", type="string", required=True),
-            ToolParameter(name="session_id", type="string",
-                          description="指定 session ID，不填则统计最近10条记录", required=False),
-        ]
-
-    def run(self, parameters: Dict[str, Any]) -> str:
-        user_id = _resolve_user_id(parameters)
-        session_id = parameters.get("session_id", "")
-
-        if not user_id:
-            return "❌ 缺少 user_id"
-
-        try:
-            records = sqlite_service.get_study_history(user_id, limit=10)
-            if session_id:
-                records = [r for r in records if r.get("session_id") == session_id]
-
-            if not records:
-                return "暂无面试记录，开始练习后这里会显示评估报告。"
-
-            total = len(records)
-            avg_score = sum(r["score"] for r in records) / total
-            excellent = sum(1 for r in records if r["score"] >= 4)
-            needs_work = sum(1 for r in records if r["score"] < 3)
-
-            # 统计薄弱标签
-            weak_tags_count: Dict[str, int] = {}
-            for r in records:
-                if r["score"] < 3:
-                    tags = json.loads(r.get("topic_tags") or "[]")
-                    for t in tags:
-                        weak_tags_count[t] = weak_tags_count.get(t, 0) + 1
-
-            weak_sorted = sorted(weak_tags_count.items(), key=lambda x: x[1], reverse=True)
-
-            lines = [
-                "📋 **面试评估报告**\n",
-                f"本次共回答 {total} 道题",
-                f"平均分: {avg_score:.1f}/5.0",
-                f"优秀（≥4分）: {excellent} 题",
-                f"需改进（<3分）: {needs_work} 题\n",
-            ]
-
-            if avg_score >= 4.0:
-                lines.append("🏆 总体表现优秀！继续保持。")
-            elif avg_score >= 3.0:
-                lines.append("📈 总体表现良好，还有提升空间。")
-            else:
-                lines.append("📚 基础需要加强，建议多复习薄弱点。")
-
-            if weak_sorted:
-                lines.append(f"\n⚠️ 薄弱知识点（需重点复习）：")
-                for tag, cnt in weak_sorted[:5]:
-                    lines.append(f"  • {tag}（失误 {cnt} 次）")
-
-            # 关闭 session
-            if session_id:
-                sqlite_service.close_session(
-                    session_id=session_id,
-                    ai_summary="\n".join(lines),
-                    weak_tags=[t for t, _ in weak_sorted[:5]]
-                )
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            logger.error(f"InterviewEvaluator 异常: {e}")
-            return f"评估报告生成失败: {str(e)}"
-
-
-# ==============================================================================
-# 9. 知识补强推荐（KnowledgeRecommender）
+# 7. 知识补强推荐（KnowledgeRecommender）
 # 薄弱标签 → 推荐学习章节 + 列出近期错题和遗漏点
 # ==============================================================================
 
@@ -750,7 +597,7 @@ class KnowledgeRecommender(Tool):
     def get_parameters(self) -> List[ToolParameter]:
         return [
             ToolParameter(name="user_id", type="string",
-                          description="用户ID", required=True),
+                          description="用户ID（可选，系统自动注入）", required=False),
             ToolParameter(name="tags", type="array",
                           description="需要补强的技术标签列表，如 [\"Redis\", \"分布式\"]",
                           required=True),
@@ -852,8 +699,6 @@ def _extract_missed_points(feedback: str) -> List[str]:
     if not feedback:
         return []
 
-    # 切割成句子
-    import re
     sentences = re.split(r'[。\n；;]', feedback)
     miss_keywords = ["遗漏", "未提到", "未提及", "忘记", "没有提", "没有说",
                      "记错", "错误", "缺少", "缺乏", "不完整", "不足", "没有涉及"]

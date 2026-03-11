@@ -1,0 +1,4 @@
+{"ts": "2026-03-11T01:38:28.294931", "session_id": "s-20260311-013828-b7e1", "step": null, "event": "session_start", "payload": {"agent_name": "Miner Agent", "agent_type": "MinerAgent"}}
+{"ts": "2026-03-11T01:38:28.294931", "session_id": "s-20260311-013828-b7e1", "step": null, "event": "message_written", "payload": {"role": "user", "content": "## 面经原文\n【标题】菜鸡后端互联网跳槽日记\n\n【正文】\n结束痛苦的在职面试，做个简单记录。\n\n## 元信息\n- 是否有图片：是"}}
+{"ts": "2026-03-11T01:38:28.359701", "session_id": "s-20260311-013828-b7e1", "step": 1, "event": "error", "payload": {"error_type": "LLM_ERROR", "message": "OpenAI Function Calling调用失败: Error code: 404 - {'error': {'message': \"model 'qwen2.5:14b' not found\", 'type': 'api_error', 'param': None, 'code': None}}"}}
+{"ts": "2026-03-11T01:38:28.359701", "session_id": "s-20260311-013828-b7e1", "step": null, "event": "session_end", "payload": {"duration": 0.06577, "total_steps": 1, "final_answer": "", "status": "success"}}

@@ -147,6 +147,10 @@ try:
     logging.basicConfig(handlers=[_InterceptHandler()], level=0, force=True)
 
     _loguru_logger.info("✅ 日志系统已启动（统一格式）")
+    
+    # 禁用 hello-agents 框架的工具注册日志（避免刷屏）
+    logging.getLogger("hello_agents").setLevel(logging.WARNING)
+    logging.getLogger("hello_agents.tools").setLevel(logging.WARNING)
 
 except ImportError:
 
@@ -1766,7 +1770,9 @@ async def clean_unrelated_data(batch_size: int | None = Query(default=None, ge=1
 
     """
 
-    清洗数据：对已完成（done）的帖子，用 LLM 判断是否与面经相关，无关则删除记录。
+    清洗无关帖：
+    1. 直接删除所有 unrelated 状态的帖子（LLM 提取时已判断无关）
+    2. 对 done 状态帖子用 LLM 二次判断，无关则删除
 
     返回：checked 检查数，deleted 删除数。
 
@@ -1782,6 +1788,44 @@ async def clean_unrelated_data(batch_size: int | None = Query(default=None, ge=1
 
     logger.info(f"[API] 清洗数据 被调用 batch_size={batch_size}")
 
+    deleted_total = 0
+
+
+
+    # ── Step 1: 直接删除所有 unrelated 状态帖子 ──────────────────────
+
+    with sqlite3.connect(sqlite_service.db_path) as conn:
+
+        conn.row_factory = sqlite3.Row
+
+        unrelated_rows = conn.execute(
+
+            "SELECT task_id, source_url, post_title FROM crawl_tasks WHERE status='unrelated'"
+
+        ).fetchall()
+
+
+
+    for r in unrelated_rows:
+
+        url = r["source_url"]
+
+        title = (r["post_title"] or "")[:40]
+
+        cnt = sqlite_service.delete_by_source_url(url)
+
+        deleted_total += cnt
+
+        logger.warning(f"  [unrelated] 直接删除无关帖: {title} | url={url[:80]} | 删除 {cnt} 题")
+
+
+
+    logger.info(f"[API] 清洗数据 Step1 完成: 删除 {len(unrelated_rows)} 条 unrelated 帖，{deleted_total} 道题")
+
+
+
+    # ── Step 2: 对 done 帖子用 LLM 二次判断 ─────────────────────────
+
     with sqlite3.connect(sqlite_service.db_path) as conn:
 
         conn.row_factory = sqlite3.Row
@@ -1791,8 +1835,6 @@ async def clean_unrelated_data(batch_size: int | None = Query(default=None, ge=1
             """SELECT task_id, source_url, raw_content, post_title
 
                FROM crawl_tasks WHERE status='done' AND raw_content IS NOT NULL
-
-               AND length(trim(coalesce(raw_content,''))) > 50
 
                LIMIT ?""",
 
@@ -1804,9 +1846,19 @@ async def clean_unrelated_data(batch_size: int | None = Query(default=None, ge=1
 
     if not rows:
 
-        logger.info("[API] 清洗数据 无 done 记录可检查")
+        if not unrelated_rows:
 
-        return {"status": "ok", "message": "没有可清洗的记录（done 且含正文）", "checked": 0, "deleted": 0}
+            logger.info("[API] 清洗数据 无可清洗记录")
+
+            return {"status": "ok", "message": "没有可清洗的记录", "checked": 0, "deleted": 0}
+
+        stats = sqlite_service.get_crawl_stats()
+
+        msg = f"已清洗 {len(unrelated_rows)} 条无关帖，删除 {deleted_total} 道无关题目"
+
+        logger.info(f"[API] 清洗数据 完成: {msg}")
+
+        return {"status": "ok", "message": msg, "checked": len(unrelated_rows), "deleted": deleted_total, "queue_stats": stats}
 
 
 
@@ -1815,8 +1867,6 @@ async def clean_unrelated_data(batch_size: int | None = Query(default=None, ge=1
     contents = [t["raw_content"] or "" for t in tasks]
 
     BATCH = 5
-
-    deleted_total = 0
 
 
 
@@ -1840,17 +1890,19 @@ async def clean_unrelated_data(batch_size: int | None = Query(default=None, ge=1
 
                 deleted_total += cnt
 
-                logger.warning(f"  内容与面经无关，已删除记录: {title}... | url={url[:80]} | 删除 {cnt} 题")
+                logger.warning(f"  [done→删除] 内容与面经无关: {title}... | url={url[:80]} | 删除 {cnt} 题")
 
 
 
     stats = sqlite_service.get_crawl_stats()
 
-    msg = f"已检查 {len(tasks)} 条，删除 {deleted_total} 道无关题目" if deleted_total else f"已检查 {len(tasks)} 条，均与面经相关"
+    total_checked = len(unrelated_rows) + len(tasks)
+
+    msg = f"已检查 {total_checked} 条（{len(unrelated_rows)} 条无关帖 + {len(tasks)} 条已完成），删除 {deleted_total} 道无关题目" if deleted_total else f"已检查 {total_checked} 条，均与面经相关"
 
     logger.info(f"[API] 清洗数据 完成: {msg}")
 
-    return {"status": "ok", "message": msg, "checked": len(tasks), "deleted": deleted_total, "queue_stats": stats}
+    return {"status": "ok", "message": msg, "checked": total_checked, "deleted": deleted_total, "queue_stats": stats}
 
 
 
@@ -1878,25 +1930,35 @@ async def retry_error_posts(batch_size: int | None = Query(default=None, ge=1, l
 
     with sqlite3.connect(sqlite_service.db_path) as conn:
 
-        # 有正文：重置为 fetched，可重新 LLM 提取
+        # 有正文或有图片：重置为 fetched，进行 LLM 提取（会自动触发 OCR）
 
         r1 = conn.execute(
 
             "UPDATE crawl_tasks SET status='fetched', error_msg=NULL "
 
-            "WHERE status='error' AND raw_content IS NOT NULL AND length(raw_content) > 50"
+            "WHERE status='error' AND ("
+
+            "  raw_content IS NOT NULL "
+
+            "  OR (image_paths IS NOT NULL AND image_paths != '[]')"
+
+            ")"
 
         )
 
         to_extract = r1.rowcount
 
-        # 无正文：重置为 pending，可重新抓取
+        # 无正文且无图片：重置为 pending，重新抓取
 
         r2 = conn.execute(
 
             "UPDATE crawl_tasks SET status='pending', error_msg=NULL "
 
-            "WHERE status='error' AND (raw_content IS NULL OR length(trim(coalesce(raw_content,''))) <= 50)"
+            "WHERE status='error' "
+
+            "AND (raw_content IS NULL OR trim(raw_content) = '') "
+
+            "AND (image_paths IS NULL OR image_paths = '[]')"
 
         )
 
@@ -2002,7 +2064,7 @@ async def re_extract_all_posts(batch_size: int | None = Query(default=None, ge=1
 
 
 
-    _re_extract_cond = "status IN ('done','error') AND raw_content IS NOT NULL AND length(trim(coalesce(raw_content,''))) > 50"
+    _re_extract_cond = "status IN ('done','error') AND raw_content IS NOT NULL"
 
 
 
@@ -2573,7 +2635,7 @@ def get_crawl_tasks(
 
             f"company, position, questions_count, discovered_at, processed_at, error_msg, "
 
-            f"length(raw_content) AS content_len, discover_keyword, extraction_source, extract_duration_sec "
+            f"length(raw_content) AS content_len, discover_keyword, extraction_source, extract_duration_min "
 
             f"FROM crawl_tasks {where} ORDER BY id DESC LIMIT ? OFFSET ?",
 
