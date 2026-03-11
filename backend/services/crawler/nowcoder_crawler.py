@@ -338,7 +338,7 @@ def _fetch_post_content_full_impl(
             break
 
     if not content_container:
-        logger.warning(f"未能定位到正文内容: {url[:80]}")
+        logger.debug(f"未能定位到正文内容: {url[:80]}")
         return "", "", []
 
     # 1. 提取完整的纯文本正文 (保留换行符)
@@ -687,6 +687,16 @@ class NowcoderCrawler:
             soup = BeautifulSoup(html, "html.parser")
             title, body, image_urls = _fetch_post_content_full_impl(html, soup, post_url)
 
+            # DOM 失败时，尝试 __INITIAL_STATE__ JSON 提取
+            if not body:
+                _title_js, _body_js = _extract_content_from_initial_state_feed(html)
+                if _body_js:
+                    body = _body_js
+                    if _title_js:
+                        title = _title_js
+                    image_urls = _collect_image_urls(soup, html)
+                    logger.debug(f"牛客 __INITIAL_STATE__ 提取成功: {title[:30]} ({len(body)}字)")
+
             # feed 页面仍无正文时，尝试跳转到 discuss 获取完整服务端渲染内容
             if not body and "/feed/main/detail/" in post_url:
                 discuss_url = _resolve_feed_to_discuss(soup, post_url)
@@ -698,6 +708,14 @@ class NowcoderCrawler:
                         html2 = resp2.text
                         soup2 = BeautifulSoup(html2, "html.parser")
                         title, body, image_urls = _fetch_post_content_full_impl(html2, soup2, discuss_url)
+                        # discuss 页面也失败时再试 __INITIAL_STATE__
+                        if not body:
+                            _title_js2, _body_js2 = _extract_content_from_initial_state_feed(html2)
+                            if _body_js2:
+                                body = _body_js2
+                                if _title_js2:
+                                    title = _title_js2
+                                image_urls = _collect_image_urls(soup2, html2)
 
             if body:
                 logger.info(f"牛客 详情页解析成功: {title[:30] or '(无标题)'}... ({len(body)}字, {len(image_urls)}图)")

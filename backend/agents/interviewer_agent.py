@@ -12,8 +12,11 @@
              确定性副作用由 Orchestrator 代码层保证执行。
 """
 import logging
+import sys
+import io
 from hello_agents import SimpleAgent as PlanAndSolveAgent  # InterviewerAgent 无需 ReAct 循环，使用 SimpleAgent（function calling 模式，1.5B 模型友好）
 from hello_agents.core.llm import HelloAgentsLLM
+from hello_agents.core.config import Config as HelloAgentsConfig
 from hello_agents.tools import ToolRegistry
 
 from backend.config.config import settings
@@ -51,7 +54,7 @@ def _try_get_memory_tool(user_id: str = "default"):
         logger.info("✅ MemoryTool 初始化成功（工作/情节/语义三层记忆）")
         return mt
     except ImportError:
-        logger.warning("⚠️ MemoryTool 未找到，需要 pip install 'hello-agents[all]'")
+        logger.debug("MemoryTool 未找到（框架已移除），降级运行")
         return None
     except Exception as e:
         logger.warning(f"⚠️ MemoryTool 初始化失败（降级运行）: {e}")
@@ -91,29 +94,51 @@ class InterviewerAgent(PlanAndSolveAgent):
 
         registry = ToolRegistry()
 
-        # ── 可选：hello-agents 框架四层记忆（仅用于用户主动查询记忆时）──
-        memory_tool = _try_get_memory_tool(user_id)
-        if memory_tool:
-            registry.register_tool(memory_tool)
+        # 抑制框架的 print 输出
+        import sys, io
+        _stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            # ── 可选：hello-agents 框架四层记忆（仅用于用户主动查询记忆时）──
+            memory_tool = _try_get_memory_tool(user_id)
+            if memory_tool:
+                registry.register_tool(memory_tool)
 
-        # ── 需要 LLM 推理的工具 ──
-        registry.register_tool(SmartRecommendationEngine())   # 出题策略推理
-        registry.register_tool(SimilaritySearchTool())        # 换个问法/举一反三
-        registry.register_tool(FilterTool())                  # 按条件筛选题目
-        registry.register_tool(NoteTool())                    # 笔记 CRUD
-        registry.register_tool(MasteryReporter())             # 掌握度报告
-        registry.register_tool(KnowledgeRecommender())        # 用户主动请求时的资源推荐
-        registry.register_tool(ResumeAnalysisTool())          # 简历 NLU 分析
+            # ── 需要 LLM 推理的工具 ──
+            registry.register_tool(SmartRecommendationEngine())   # 出题策略推理
+            registry.register_tool(SimilaritySearchTool())        # 换个问法/举一反三
+            registry.register_tool(FilterTool())                  # 按条件筛选题目
+            registry.register_tool(NoteTool())                    # 笔记 CRUD
+            registry.register_tool(MasteryReporter())             # 掌握度报告
+            registry.register_tool(KnowledgeRecommender())        # 用户主动请求时的资源推荐
+            registry.register_tool(ResumeAnalysisTool())          # 简历 NLU 分析
+        finally:
+            sys.stdout = _stdout
 
         # 注意：ProgressTracker / InterviewEvaluator 已移除
         # 这些操作现在由 Orchestrator.submit_answer() / end_session() 确定性执行
 
         max_steps = getattr(settings, "interviewer_max_steps", 8)
-        super().__init__(
-            name="Interviewer Agent",
-            llm=llm,
-            tool_registry=registry,
-            system_prompt=interviewer_prompt,
-            max_tool_iterations=max_steps,
+        # 配置 hello-agents：将 trace/session/todos/devlogs 等数据写到 backend/data/memory/
+        _data_dir = str(settings.backend_data_dir / "memory")
+        _agent_config = HelloAgentsConfig(
+            trace_dir=f"{_data_dir}/traces",
+            session_dir=f"{_data_dir}/sessions",
+            todowrite_persistence_dir=f"{_data_dir}/todos",
+            devlog_persistence_dir=f"{_data_dir}/devlogs",
+            tool_output_dir=f"{_data_dir}/tool_output",
         )
+        _stdout2 = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            super().__init__(
+                name="Interviewer Agent",
+                llm=llm,
+                tool_registry=registry,
+                system_prompt=interviewer_prompt,
+                max_tool_iterations=max_steps,
+                config=_agent_config,
+            )
+        finally:
+            sys.stdout = _stdout2
         logger.info(f"Interviewer max_tool_iterations={max_steps}")

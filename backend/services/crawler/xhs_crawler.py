@@ -490,7 +490,7 @@ async def _async_fetch_details(links: List[str]) -> List[Dict]:
                 "source_url": url,
                 "source_platform": "xiaohongshu",
             })
-            logger.info(f"XHS 获取详情 [{idx}/{len(links)}]: {clean_title[:30]} ({len(content)}字)")
+            logger.info(f"XHS 获取详情 [{idx}/{len(links)}]: {clean_title[:30]} ({len(content)}字, {len(images)}图)")
             await asyncio.sleep(random.uniform(3, 6))
 
         except Exception as e:

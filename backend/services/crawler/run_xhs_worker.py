@@ -33,12 +33,61 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(_project_root, ".env"), override=True)
 
 import logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    stream=sys.stdout,
-)
+try:
+    from loguru import logger as _loguru_logger
+    _loguru_logger.remove()
+    _loguru_logger.add(
+        sys.stdout,
+        colorize=False,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <7} | {message}",
+        level="INFO",
+    )
+    class _InterceptHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                level = _loguru_logger.level(record.levelname).name
+            except ValueError:
+                level = record.levelno
+            # 过滤 neo4j 冗长通知、httpx 请求详情
+            if record.name in ("neo4j.notifications", "httpx"):
+                return
+            # xhs_crawl 内部日志降为 DEBUG
+            if record.name.startswith("xhs_crawl"):
+                level = "DEBUG"
+            _loguru_logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
+    logging.basicConfig(handlers=[_InterceptHandler()], level=0, force=True)
+    # 静默 hello-agents 工具注册 print（monkey-patch）
+    try:
+        import io as _io
+        from hello_agents.tools.registry import ToolRegistry as _TR
+        _orig_rt = _TR.register_tool
+        _orig_rf = _TR.register_function
+        def _silent_rt(self, tool, **kw):
+            import sys as _sys; _old, _sys.stdout = _sys.stdout, _io.StringIO()
+            try: return _orig_rt(self, tool, **kw)
+            finally: _sys.stdout = _old
+        def _silent_rf(self, func, **kw):
+            import sys as _sys; _old, _sys.stdout = _sys.stdout, _io.StringIO()
+            try: return _orig_rf(self, func, **kw)
+            finally: _sys.stdout = _old
+        _TR.register_tool = _silent_rt
+        _TR.register_function = _silent_rf
+    except Exception:
+        pass
+except ImportError:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
+        stream=sys.stdout,
+    )
 logger = logging.getLogger("xhs_worker")
+
+# 子进程无需重复打印 Miner Service 配置（主进程已打印）
+try:
+    import backend.services.crawler.question_extractor as _qe
+    _qe._miner_config_printed = True
+except Exception:
+    pass
 
 
 def main():

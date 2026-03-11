@@ -40,9 +40,9 @@ def _print_miner_config_once():
     
     try:
         from backend.config.config import settings
-        logger.info("=" * 60)
+        logger.info("─" * 60)
         logger.info("✅ Miner Service (题目提取) 初始化完成")
-        logger.info("=" * 60)
+        logger.info("─" * 60)
         logger.info(f"   - Mode: {settings.miner_mode}")
         logger.info(f"   - Model: {settings.miner_model}")
         logger.info(f"   - Provider: {settings.miner_provider}")
@@ -51,7 +51,7 @@ def _print_miner_config_once():
         logger.info(f"   - Max Tokens: {settings.miner_max_tokens}")
         logger.info(f"   - Max Retries: {settings.miner_max_retries}")
         logger.info(f"   - Timeout: {settings.miner_timeout}s")
-        logger.info("=" * 60)
+        logger.info("─" * 60)
     except Exception as e:
         logger.warning(f"无法打印Miner Service配置: {e}")
 _MAX_LOG_INPUT_PREVIEW = 1200   # 原始内容预览最大字符
@@ -236,6 +236,13 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
         (result, ocr_called, is_unrelated)
     """
     from backend.agents.miner_agent import UNRELATED_SIGNAL
+    _REFUSE_QUICK = [
+        r"^抱歉[，]?我无法",
+        r"^对不起[，]?我(不能|无法)",
+        r"^I('m| am) (sorry|unable)",
+        r"^Sorry[，]? I (can'?t|cannot|am unable)",
+        r"^抱歉，我不能",
+    ]
     try:
         agent = _get_miner_agent(image_paths=image_paths, task_id=task_id)
         result, ocr_called, is_unrelated = agent.run(
@@ -245,6 +252,12 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
             position=position
         )
         logger.info(f"[MinerAgent] 执行完成，输出长度: {len(result)}, ocr_called={ocr_called}, is_unrelated={is_unrelated}")
+        # Agent 成功返回，但 result 是拒绝文本时降级为直接 LLM 调用
+        if result and not is_unrelated:
+            _stripped = result.strip()
+            if any(re.search(p, _stripped, re.IGNORECASE) for p in _REFUSE_QUICK):
+                logger.warning(f"[MinerAgent] Agent 返回拒绝文本，降级为直接 LLM 调用: {_stripped[:60]}")
+                raise ValueError("model_refused_fallback")
         return result, ocr_called, is_unrelated
     except Exception as e:
         logger.warning(f"[MinerAgent] 执行失败，降级为直接 LLM 调用: {e}")
@@ -327,6 +340,8 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
     # 去掉 deepseek-r1 的 <think>...</think> 推理块（Ollama 本地部署时混在 content 里）
     text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"<think>[\s\S]*$", "", text, flags=re.IGNORECASE).strip()
+    # 去掉 qwen3 等模型输出的 \boxed{...} 格式噪音
+    text = re.sub(r"\\boxed\{[^}]*\}", "", text).strip()
     # 去掉 qwen3 等模型的 <function-call>...</function-call> 包裹，提取内部 JSON
     _fc = re.search(r"<function-call>([\s\S]*?)</function-call>", text, flags=re.IGNORECASE)
     if _fc:
@@ -339,8 +354,23 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
         except (json.JSONDecodeError, AttributeError):
             text = _fc.group(1).strip()
 
-    # 0a. 检测 NO_RELATED_CONTENT 特殊标识（prompt 要求模型在完全无关时输出此值，不应重试）
-    if text.strip() == "NO_RELATED_CONTENT":
+    # 0a. 检测模型拒绝响应（内容安全/能力限制），这类响应重试无效，直接返回 model_refused
+    _REFUSE_PATTERNS = [
+        r"^抱歉[，,]?我无法",
+        r"^对不起[，,]?我(不能|无法)",
+        r"^I('m| am) (sorry|unable)",
+        r"^Sorry[，,]? I (can'?t|cannot|am unable)",
+        r"无法在限定步数内完成",
+        r"^抱歉，我不能",
+    ]
+    _text_stripped = text.strip()
+    for _pat in _REFUSE_PATTERNS:
+        if re.search(_pat, _text_stripped, re.IGNORECASE):
+            logger.warning(f"LLM 拒绝响应（model_refused），内容: {_text_stripped[:80]}")
+            return [], "model_refused"
+
+    # 0b. 检测 NO_RELATED_CONTENT 特殊标识（prompt 要求模型在完全无关时输出此值，不应重试）
+    if _text_stripped == "NO_RELATED_CONTENT":
         logger.info("LLM 明确返回 NO_RELATED_CONTENT，帖子与面经无关")
         return [], "unrelated"
 
@@ -565,6 +595,23 @@ def extract_questions_from_post(
         if status == "unrelated":
             logger.info(f"LLM 判定帖子与面经无关: {source_url}")
             return [], "unrelated", agent_used_tool
+
+        # 模型拒绝响应（内容安全/能力限制）：Agent 模式可能触发安全过滤，降级为直接 LLM 调用重试
+        if status == "model_refused":
+            logger.warning(f"LLM 拒绝响应，尝试直接 LLM 调用降级: {source_url}")
+            try:
+                _direct_raw = _call_llm_direct(user_prompt)
+                if _direct_raw:
+                    items, status = _parse_json_from_llm(_direct_raw, user_prompt_for_debug=user_prompt)
+                    if status == "ok" and items:
+                        logger.info(f"直接 LLM 调用降级成功: {len(items)} 道题目")
+                        break
+                    elif status == "model_refused":
+                        logger.warning(f"直接 LLM 调用仍拒绝响应，放弃: {source_url}")
+                        return [], "model_refused", agent_used_tool
+            except Exception as _de:
+                logger.warning(f"直接 LLM 调用降级失败: {_de}")
+            return [], "model_refused", agent_used_tool
 
         if status == "ok" and items:
             if attempt > 1:

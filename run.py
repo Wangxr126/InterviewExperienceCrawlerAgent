@@ -102,7 +102,8 @@ def main():
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
 
     cmd = [sys.executable, "-m", "uvicorn", "backend.main:app",
-           "--host", host, "--port", str(port)]
+           "--host", host, "--port", str(port),
+           "--log-level", "warning"]  # 访问日志由 main.py 的 loguru 拦截器处理
     if reload:
         cmd.append("--reload")
 

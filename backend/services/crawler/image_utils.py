@@ -65,6 +65,7 @@ def download_images(
         "Referer": "https://www.xiaohongshu.com/",
     }
 
+    failed = 0
     for idx, url in enumerate(image_urls):
         if not url or not url.startswith("http"):
             continue
@@ -78,8 +79,10 @@ def download_images(
                 f.write(resp.content)
             rel = f"{rel_prefix}/{fname}"
             saved.append(rel)
-            logger.info(f"图片已保存: {rel}")
         except Exception as e:
+            failed += 1
             logger.warning(f"图片下载失败 {url[:60]}: {e}")
 
+    if image_urls:
+        logger.info(f"图片下载完成: {task_id} | 共{len(image_urls)}张, 成功{len(saved)}张" + (f", 失败{failed}张" if failed else ""))
     return saved

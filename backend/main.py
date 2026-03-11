@@ -132,15 +132,31 @@ try:
             # 格式化消息
             msg = record.getMessage()
             
-            # 简化 uvicorn 访问日志格式
+            # 过滤极度冗长的日志（neo4j 约束通知、httpx 请求详情、xhs_crawl 内部日志）
+            if record.name == "neo4j.notifications":
+                return
+            if record.name == "httpx":
+                return
+            if record.name.startswith("xhs_crawl"):
+                level = "DEBUG"
+            
+            # 简化 uvicorn 访问日志格式（降为 DEBUG，避免刷屏）
             if record.name == "uvicorn.access":
                 import re
-                # 从 "127.0.0.1:64326 - "GET /api/finetune/stats HTTP/1.1" 200 OK"
-                # 提取为 "[HTTP] GET /api/finetune/stats → 200"
                 match = re.search(r'"([A-Z]+)\s+([^\s]+)[^"]*"\s+(\d+)', msg)
                 if match:
                     method, path, status = match.groups()
+                    # 200 用 DEBUG，4xx/5xx 用 WARNING/ERROR
+                    status_int = int(status)
+                    if status_int >= 500:
+                        level = "ERROR"
+                    elif status_int >= 400:
+                        level = "WARNING"
+                    else:
+                        level = "DEBUG"
                     msg = f"[HTTP] {method} {path} → {status}"
+                else:
+                    level = "DEBUG"
 
             _loguru_logger.opt(depth=6, exception=record.exc_info).log(level, msg)
 
@@ -148,9 +164,32 @@ try:
 
     _loguru_logger.info("✅ 日志系统已启动（统一格式）")
     
-    # 禁用 hello-agents 框架的工具注册日志（避免刷屏）
+    # 禁用 hello-agents 框架的工具注册日志（print 直接输出到 stdout，需 monkey-patch 静默）
     logging.getLogger("hello_agents").setLevel(logging.WARNING)
     logging.getLogger("hello_agents.tools").setLevel(logging.WARNING)
+    try:
+        from hello_agents.tools.registry import ToolRegistry as _TR
+        import io as _io
+        _orig_register_tool = _TR.register_tool
+        _orig_register_function = _TR.register_function
+        def _silent_register_tool(self, tool, **kw):
+            import sys as _sys
+            _old, _sys.stdout = _sys.stdout, _io.StringIO()
+            try:
+                return _orig_register_tool(self, tool, **kw)
+            finally:
+                _sys.stdout = _old
+        def _silent_register_function(self, func, **kw):
+            import sys as _sys
+            _old, _sys.stdout = _sys.stdout, _io.StringIO()
+            try:
+                return _orig_register_function(self, func, **kw)
+            finally:
+                _sys.stdout = _old
+        _TR.register_tool = _silent_register_tool
+        _TR.register_function = _silent_register_function
+    except Exception:
+        pass
 
 except ImportError:
 
@@ -334,17 +373,17 @@ def _print_agent_llm_config():
 
     base = (s.llm_base_url or "")[:60] + ("..." if len(s.llm_base_url or "") > 60 else "")
 
-    logger.info("=" * 60)
+    logger.info("─" * 60)
 
     logger.info("各 Agent LLM 配置（运行时实际值）")
 
-    logger.info("=" * 60)
+    logger.info("─" * 60)
 
     logger.info(f"  [全局] provider={s.llm_provider}, model={s.llm_model_id or '(未设置)'}")
 
     logger.info(f"          base_url={base or '(未设置)'}, timeout={s.llm_timeout}, temperature={s.llm_temperature}")
 
-    logger.info("-" * 60)
+    logger.info("  " + "─" * 56)
 
     # Miner Agent
 
@@ -383,14 +422,6 @@ async def startup_event():
     
 
     _print_agent_llm_config()
-
-    logger.info(
-
-        f"LLM 配置: provider={_s.llm_provider}, model={_s.llm_model_id}, "
-
-        f"base={_s.llm_base_url[:50] if _s.llm_base_url else 'N/A'}..."
-
-    )
 
     crawl_scheduler.start()
 
@@ -1748,7 +1779,11 @@ async def extract_pending_posts(batch_size: int | None = Query(default=None, ge=
 
 
 
-    threading.Thread(target=_bg, daemon=True).start()
+    _t = threading.Thread(target=_bg, daemon=True)
+
+    _t.start()
+
+    logger.info(f"[后台线程] ▶ 启动 LLM提取线程 tid={_t.ident} | 待处理 {pending_count} 条 | batch_size={batch_size}")
 
     return {
 
@@ -2026,7 +2061,11 @@ async def retry_error_posts(batch_size: int | None = Query(default=None, ge=1, l
 
 
 
-    threading.Thread(target=_bg, daemon=True).start()
+    _t = threading.Thread(target=_bg, daemon=True)
+
+    _t.start()
+
+    logger.info(f"[后台线程] ▶ 启动 重试提取线程 tid={_t.ident} | 重置 {total} 条 | batch_size={batch_size}")
 
     msg_parts = []
 

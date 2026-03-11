@@ -164,11 +164,30 @@ def _process_pending_tasks(batch_size: int = None):
         task_id = task["task_id"]
         url = task["source_url"]
         title = (task.get("post_title") or "").strip() or "(无标题)"
+        max_retries = cfg.crawler_fetch_max_retries
+        retry_delay = cfg.crawler_retry_delay
+        content, image_urls = "", []
+        last_err = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                from backend.services.crawler.nowcoder_crawler import NowcoderCrawler
+                crawler = NowcoderCrawler(cookie=cfg.NOWCODER_COOKIE)
+                content, image_urls = crawler.fetch_post_content_full(url)
+                if content and len(content) >= 50:
+                    break  # 成功，跳出重试
+                last_err = f"正文内容太短({len(content) if content else 0}字，需≥50字)"
+                if attempt < max_retries:
+                    logger.warning(f"⚠️ 第{attempt}次抓取正文太短 [{title[:30]}]，{retry_delay}s后重试...")
+                    time.sleep(retry_delay)
+            except Exception as e:
+                last_err = str(e)[:200]
+                if attempt < max_retries:
+                    logger.warning(f"⚠️ 第{attempt}次抓取异常 [{title[:30]}]: {e}，{retry_delay}s后重试...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"❌抓取详情失败（已重试{max_retries}次）[{title[:40]}]: {e}")
         try:
-            from backend.services.crawler.nowcoder_crawler import NowcoderCrawler
             from backend.services.crawler.image_utils import download_images
-            crawler = NowcoderCrawler(cookie=cfg.NOWCODER_COOKIE)
-            content, image_urls = crawler.fetch_post_content_full(url)
             if content and len(content) >= 50:
                 image_paths = download_images(image_urls, task_id) if image_urls else []
                 sqlite_service.update_task_status(
@@ -178,11 +197,11 @@ def _process_pending_tasks(batch_size: int = None):
                 )
                 logger.info(f"✅抓取content成功 [{title[:40]}]: 正文{len(content)}字, 图片{len(image_paths)}张")
             else:
-                logger.warning(f"⚠️ 正文内容为空或太短（{len(content) if content else 0}字），跳过: {title[:40]}")
-                sqlite_service.update_task_status(task_id, "error", error_msg=f"正文内容太短({len(content) if content else 0}字，需≥50字)")
+                logger.warning(f"⚠️ 正文内容为空或太短，已重试{max_retries}次，跳过: {title[:40]}")
+                sqlite_service.update_task_status(task_id, "error", error_msg=last_err or "正文太短")
         except Exception as e:
             sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200])
-            logger.error(f"❌抓取详情失败 [{title[:40]}]: {e}")
+            logger.error(f"❌保存抓取结果失败 [{title[:40]}]: {e}")
 
     if pending:
         _bsep = '═' * 20
@@ -216,32 +235,22 @@ def _process_pending_tasks(batch_size: int = None):
         except Exception:
             image_paths = []
         
+        _sep = '─' * 60
+        _title_short = post_title[:35] if len(post_title) <= 35 else post_title[:32] + "..."
+
         # 正文为空且无图片 → 跳过
         if not raw_content and not image_paths:
-            _sep = '=' * 60
-            _title_short = post_title[:30] if len(post_title) <= 30 else post_title[:27] + "..."
             logger.info(f"{_sep}")
-            logger.info(f"  {_title_short} 开始")
-            logger.info(f"{_sep}")
-            logger.info(f"  📄 [{platform}] {post_title[:60]}")
+            logger.info(f"  [{platform}] {_title_short} | 正文=0字 | 图片=0张 | {task_id}")
             logger.info(f"  🔗 {url}")
-            logger.info(f"  🆔 {task_id} | 正文={len(raw_content)}字 | 图片={len(image_paths)}张")
             sqlite_service.update_task_status(task_id, "error", error_msg="正文为空且无图片", raw_content=raw_content)
-            logger.error(f"  ❌ 提取失败(正文为空且无图片) task_id={task_id} url={url[:60]} title={post_title[:40]}")
-            logger.info(f"{_sep}")
-            logger.info(f"  {_title_short} 结束")
-            logger.info(f"{_sep}")
+            logger.error(f"  ❌ 正文为空且无图片，已标记 error")
             logger.info("")
             continue
 
-        _sep = '=' * 60
-        _title_short = post_title[:30] if len(post_title) <= 30 else post_title[:27] + "..."
         logger.info(f"{_sep}")
-        logger.info(f"  {_title_short} 开始")
-        logger.info(f"{_sep}")
-        logger.info(f"  📄 [{platform}] {post_title[:60]}")
+        logger.info(f"  [{platform}] {_title_short} | 正文={len(raw_content)}字 | 图片={len(image_paths)}张 | {task_id}")
         logger.info(f"  🔗 {url}")
-        logger.info(f"  🆔 {task_id} | 正文={len(raw_content)}字 | 图片={len(image_paths)}张")
 
         _t0 = time.time()
         try:
@@ -265,20 +274,14 @@ def _process_pending_tasks(batch_size: int = None):
             # 帖子与面经无关 → 标记 unrelated（专用状态，参与「清洗无关帖」操作）
             if status == "unrelated":
                 sqlite_service.update_task_status(task_id, "unrelated", error_msg="LLM 判断与面经无关", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2))
-                logger.warning(f"  ⚠️ LLM 判断与面经无关，已标记 unrelated: {post_title[:40]} | url={url[:80]}")
-                logger.info(f"{_sep}")
-                logger.info(f"  {_title_short} 结束")
-                logger.info(f"{_sep}")
+                logger.warning(f"  ⚠️ 无关帖，已标记 unrelated")
                 logger.info("")
                 continue
 
             # LLM 解析失败 → 标记 error
             if status == "parse_error":
                 sqlite_service.update_task_status(task_id, "error", error_msg="LLM 返回无法解析为 JSON", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2))
-                logger.error(f"  ❌ 提取失败(解析错误) task_id={task_id} url={url[:60]} title={post_title[:40]}")
-                logger.info(f"{_sep}")
-                logger.info(f"  {_title_short} 结束")
-                logger.info(f"{_sep}")
+                logger.error(f"  ❌ LLM 返回无法解析为 JSON")
                 logger.info("")
                 continue
 
@@ -288,35 +291,23 @@ def _process_pending_tasks(batch_size: int = None):
                 count = _save_questions(questions)
                 _dur = round(time.time()-_t0, 1)
                 sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round(_dur/60, 2))
-                logger.info(f"  ✅ 提取完成 [{post_title[:40]}]: {count} 道题目入库，耗时 {_dur/60:.1f}min")
-                logger.info(f"{_sep}")
-                logger.info(f"  {_title_short} 结束")
-                logger.info(f"{_sep}")
+                logger.info(f"  ✅ 提取完成: {count} 道题目入库，耗时 {_dur/60:.1f}min")
                 logger.info("")
                 processed += count
                 continue
 
             # MinerAgent 正文+OCR 均无题目 → 标记 error 保留记录
             sqlite_service.update_task_status(task_id, "error", error_msg="正文+OCR 均无题目（暂不删除）", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2))
-            logger.warning(f"  ⚠️ 正文+OCR 均无题目，已标记 error 保留记录: {post_title[:40]} | url={url[:80]}")
-            logger.info(f"{_sep}")
-            logger.info(f"  {_title_short} 结束")
-            logger.info(f"{_sep}")
+            logger.warning(f"  ⚠️ 正文+OCR 均无题目，已标记 error")
             logger.info("")
 
         except Exception as e:
             import traceback
             sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200], raw_content=raw_content, extract_duration_min=round((time.time()-_t0)/60, 2))
             logger.error(
-                f"  ❌ LLM 提取失败 task_id={task_id} url={url[:60]} title={post_title[:40]}\n"
-                f"      error={e}\n{traceback.format_exc()}"
+                f"  ❌ LLM 提取异常: {e}\n{traceback.format_exc()}"
             )
-            logger.info(f"{_sep}")
-            logger.info(f"  {_title_short} 结束")
-            logger.info(f"{_sep}")
             logger.info("")
-
-# 递归重试逻辑（添加到scheduler.py的_process_pending_tasks函数末尾）
 
     if fetched_rows:
         _bsep = '═' * 20

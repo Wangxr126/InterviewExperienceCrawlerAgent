@@ -1,4 +1,0 @@
-{"ts": "2026-03-11T01:38:31.616738", "session_id": "s-20260311-013831-c859", "step": null, "event": "session_start", "payload": {"agent_name": "Miner Agent", "agent_type": "MinerAgent"}}
-{"ts": "2026-03-11T01:38:31.616738", "session_id": "s-20260311-013831-c859", "step": null, "event": "message_written", "payload": {"role": "user", "content": "## 面经原文\n【标题】阿里云后端一面\n\n【正文】\n上来问我介不介意部门技术栈是go/python 我说不介意，别考我就行#后端开发\n\n## 元信息\n- 是否有图片：是"}}
-{"ts": "2026-03-11T01:38:31.682679", "session_id": "s-20260311-013831-c859", "step": 1, "event": "error", "payload": {"error_type": "LLM_ERROR", "message": "OpenAI Function Calling调用失败: Error code: 404 - {'error': {'message': \"model 'qwen2.5:14b' not found\", 'type': 'api_error', 'param': None, 'code': None}}"}}
-{"ts": "2026-03-11T01:38:31.691358", "session_id": "s-20260311-013831-c859", "step": null, "event": "session_end", "payload": {"duration": 0.07462, "total_steps": 1, "final_answer": "", "status": "success"}}

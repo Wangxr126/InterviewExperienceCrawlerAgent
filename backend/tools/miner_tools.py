@@ -127,5 +127,5 @@ class FinishTool(Tool):
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
         """返回提取结果"""
         answer = parameters.get("answer", "")
-        logger.info(f"[FinishTool] 提取完成，结果长度: {len(answer)}")
+        logger.debug(f"[FinishTool] 提取完成，结果长度: {len(answer)}")
         return ToolResponse.success(text=answer, data={"answer": answer})

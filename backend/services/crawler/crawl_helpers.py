@@ -55,4 +55,8 @@ def save_xhs_post(
         raw_content=raw_content,
         image_paths=image_paths,
     )
+    logger.info(
+        f"[XHS入库] {title[:30] or '(无标题)'} | "
+        f"正文={len(raw_content)}字, 图片={len(image_paths)}张 | {task_id}"
+    )
     return task_id

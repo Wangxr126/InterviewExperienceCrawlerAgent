@@ -1,4 +1,0 @@
-{"ts": "2026-03-11T01:38:33.899204", "session_id": "s-20260311-013833-2f75", "step": null, "event": "session_start", "payload": {"agent_name": "Miner Agent", "agent_type": "MinerAgent"}}
-{"ts": "2026-03-11T01:38:33.899204", "session_id": "s-20260311-013833-2f75", "step": null, "event": "message_written", "payload": {"role": "user", "content": "## 面经原文\n【标题】字节跳动后端开发一二面面经\n\n【正文】\n上个月10号面的了，二面挂了，分享一下#后端开发 #面试分享\n\n## 元信息\n- 是否有图片：是"}}
-{"ts": "2026-03-11T01:38:33.963504", "session_id": "s-20260311-013833-2f75", "step": 1, "event": "error", "payload": {"error_type": "LLM_ERROR", "message": "OpenAI Function Calling调用失败: Error code: 404 - {'error': {'message': \"model 'qwen2.5:14b' not found\", 'type': 'api_error', 'param': None, 'code': None}}"}}
-{"ts": "2026-03-11T01:38:33.972041", "session_id": "s-20260311-013833-2f75", "step": null, "event": "session_end", "payload": {"duration": 0.072837, "total_steps": 1, "final_answer": "", "status": "success"}}

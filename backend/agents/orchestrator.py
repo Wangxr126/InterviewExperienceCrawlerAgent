@@ -64,7 +64,7 @@ def _get_memory_tool(user_id: str):
         from hello_agents.tools import MemoryTool
         return MemoryTool(user_id=user_id)
     except ImportError:
-        logger.warning("⚠️ hello-agents MemoryTool 未安装，记忆功能降级")
+        logger.debug("hello-agents MemoryTool 未安装（框架已移除），记忆功能降级")
         return None
     except Exception as e:
         logger.error(f"MemoryTool 初始化失败: {e}")
@@ -230,14 +230,10 @@ class InterviewSystemOrchestrator:
             from backend.services.knowledge.knowledge_manager import knowledge_manager
             self.knowledge_manager = knowledge_manager
             self.interviewer = InterviewerAgent()
-            # 按 user_id 缓存 MemoryTool（懒加载）
-            self._user_memory_tools: Dict[str, Any] = {}
             # 按 user_id 缓存 session 内的标签失误计数 {user_id: {session_id: {tag: count}}}
             self._session_weak_counts: Dict[str, Dict[str, Dict[str, int]]] = defaultdict(
                 lambda: defaultdict(lambda: defaultdict(int))
             )
-            # ✅ 新增：按 user_id 缓存 MemoryManager（单例模式，避免每次对话重新初始化）
-            self._memory_managers: Dict[str, Any] = {}
             logger.info("✅ 编排器初始化完成（KnowledgeManager + Interviewer）")
         except Exception as e:
             logger.error(f"❌ 初始化失败: {e}")
@@ -247,125 +243,135 @@ class InterviewSystemOrchestrator:
     # 记忆辅助
     # ===========================================================
 
-    def _get_or_create_memory_manager(self, user_id: str):
-        """
-        获取或创建记忆管理器（按 user_id 缓存，单例模式）。
-        直接复用 MemoryTool，无需额外的 MemoryManager 层。
-        """
-        if user_id not in self._memory_managers:
-            mt = self._get_user_memory(user_id)
-            if mt is None:
-                logger.warning(f"[初始化] ⚠️ 用户 {user_id} 的 MemoryTool 不可用，记忆功能降级")
-                self._memory_managers[user_id] = None
-            else:
-                self._memory_managers[user_id] = mt
-                logger.info(f"[初始化] ✅ 用户 {user_id} 的记忆管理器就绪")
-
-        return self._memory_managers[user_id]
-
-    def _get_user_memory(self, user_id: str):
-        if user_id not in self._user_memory_tools:
-            self._user_memory_tools[user_id] = _get_memory_tool(user_id)
-        return self._user_memory_tools.get(user_id)
+    # ===========================================================
+    # 四层记忆系统（基于 SQLite + ContextBuilder 实现）
+    # hello-agents 1.0.0 移除了 MemoryTool，改用项目自有存储实现
+    # working   → SQLite session_history（当前会话上下文）
+    # episodic  → SQLite study_records（答题经历）
+    # semantic  → SQLite tag_mastery + user_progress（用户画像）
+    # perceptual→ 面经场景不需要，忽略
+    # ===========================================================
 
     def _write_episodic(self, user_id: str, content: str,
                          importance: float = 0.75,
                          event_type: str = "study_event",
                          session_id: str = "", **kw):
-        mt = self._get_user_memory(user_id)
-        if not mt:
-            return
-        try:
-            mt.execute("add", content=content, memory_type="episodic",
-                       importance=importance, event_type=event_type,
-                       session_id=session_id, **kw)
-        except Exception as e:
-            logger.warning(f"写情景记忆失败: {e}")
+        """情节记忆：答题经历写入 SQLite study_records（已由 submit_answer 确定性写入，此处为补充）"""
+        # study_records 已在 submit_answer 中确定性写入，这里只记录 debug
+        logger.debug(f"[情节记忆] user={user_id} event={event_type} len={len(content)}")
 
     def _write_semantic(self, user_id: str, content: str,
                          importance: float = 0.85,
                          knowledge_type: str = "user_profile", **kw):
-        mt = self._get_user_memory(user_id)
-        if not mt:
-            return
-        try:
-            mt.execute("add", content=content, memory_type="semantic",
-                       importance=importance, knowledge_type=knowledge_type, **kw)
-        except Exception as e:
-            logger.warning(f"写语义记忆失败: {e}")
+        """语义记忆：用户画像写入 SQLite tag_mastery（已由 submit_answer 确定性写入）"""
+        logger.debug(f"[语义记忆] user={user_id} type={knowledge_type} len={len(content)}")
 
     def _write_working(self, user_id: str, content: str,
                         importance: float = 0.5, session_id: str = ""):
-        mt = self._get_user_memory(user_id)
-        if not mt:
-            return
-        try:
-            mt.execute("add", content=content, memory_type="working",
-                       importance=importance, session_id=session_id,
-                       timestamp=now_beijing().isoformat())
-        except Exception as e:
-            logger.warning(f"写工作记忆失败: {e}")
+        """工作记忆：当前 session 上下文，已由 sqlite_service.update_session_history 维护"""
+        logger.debug(f"[工作记忆] user={user_id} session={session_id} len={len(content)}")
 
     def _write_perceptual(self, user_id: str, content: str,
                            modality: str = "text", importance: float = 0.7,
                            file_path: str = None, **kw):
-        mt = self._get_user_memory(user_id)
-        if not mt:
-            return
-        try:
-            kwargs = dict(content=content, memory_type="perceptual",
-                          importance=importance, modality=modality, **kw)
-            if file_path:
-                kwargs["file_path"] = file_path
-            mt.execute("add", **kwargs)
-        except Exception as e:
-            logger.warning(f"写感知记忆失败: {e}")
-
-    def _search_memory(self, user_id: str, query: str,
-                        memory_types: List[str] = None, limit: int = 5) -> str:
-        mt = self._get_user_memory(user_id)
-        if not mt:
-            return ""
-        try:
-            result = mt.execute("search", query=query,
-                                memory_types=memory_types, limit=limit,
-                                min_importance=0.3)
-            return result if isinstance(result, str) else ""
-        except Exception as e:
-            logger.warning(f"记忆检索失败: {e}")
-            return ""
+        """感知记忆：面经场景不需要图像/音频感知，忽略"""
+        pass
 
     def _consolidate_session_memories(self, user_id: str):
-        mt = self._get_user_memory(user_id)
-        if not mt:
-            return
-        try:
-            mt.execute("consolidate", from_type="working", to_type="episodic",
-                       importance_threshold=0.65)
-            mt.execute("forget", strategy="importance_based", threshold=0.3)
-            logger.info(f"✅ 用户 {user_id} session 记忆整合完成")
-        except Exception as e:
-            logger.warning(f"记忆整合失败: {e}")
+        """Session 结束时的记忆整合（SQLite 自动持久化，无需额外操作）"""
+        logger.debug(f"[记忆整合] user={user_id} - SQLite 自动持久化，无需整合")
 
     def _build_memory_context(self, user_id: str, user_message: str) -> str:
-        """构建记忆上下文（使用缓存的 MemoryManager）"""
-        # ✅ 使用缓存的 MemoryManager，避免每次重新初始化
-        memory_manager = self._get_or_create_memory_manager(user_id)
-        if not memory_manager:
-            logger.warning(f"[对话处理] ⚠️ 用户 {user_id} 的 MemoryManager 不可用，跳过记忆检索")
-            return ""
+        """构建记忆上下文 - 使用 hello-agents 1.0.0 的 ContextBuilder + SQLite 四层记忆
         
-        parts = []
-        semantic = self._search_memory(user_id, "用户技术栈 目标岗位 掌握程度",
-                                        memory_types=["semantic"], limit=3)
-        if semantic and "未找到" not in semantic:
-            parts.append(f"[用户知识画像]\n{semantic}")
-        if user_message:
-            episodic = self._search_memory(user_id, user_message,
-                                            memory_types=["episodic"], limit=3)
-            if episodic and "未找到" not in episodic:
-                parts.append(f"[近期相关学习记录]\n{episodic}")
-        return "\n\n".join(parts)
+        working  (工作记忆) → 近期对话历史（SQLite session_history）
+        episodic (情节记忆) → 近期答题记录（SQLite study_records）
+        semantic (语义记忆) → 用户技术画像（SQLite tag_mastery）
+        """
+        try:
+            from hello_agents.context.builder import ContextBuilder, ContextConfig, ContextPacket
+            from datetime import datetime, timedelta
+
+            parts = []
+
+            # ── 语义记忆：用户技术画像（tag_mastery）──
+            try:
+                tag_rows = sqlite_service.get_tag_mastery(user_id)  # 返回所有标签，按 avg_score ASC
+                if tag_rows:
+                    tag_rows = tag_rows[:10]  # 取前10个（最薄弱的）
+                    novice_learning = [r for r in tag_rows if r.get('mastery_level') in ('novice', 'learning')]
+                    proficient = [r for r in tag_rows if r.get('mastery_level') in ('proficient', 'expert')]
+                    profile_lines = []
+                    if novice_learning:
+                        profile_lines.append("薄弱点：" + "、".join(
+                            f"{r['tag']}({r.get('avg_score', 0):.1f}分)" for r in novice_learning[:5]
+                        ))
+                    if proficient:
+                        profile_lines.append("掌握较好：" + "、".join(
+                            f"{r['tag']}" for r in proficient[:5]
+                        ))
+                    if profile_lines:
+                        parts.append(("semantic", "[用户技术画像]\n" + "\n".join(profile_lines)))
+            except Exception as e:
+                logger.debug(f"[语义记忆] 读取失败: {e}")
+
+            # ── 情节记忆：近期答题记录（study_records）──
+            try:
+                records = sqlite_service.get_study_history(user_id, limit=5)
+                if records:
+                    lines = []
+                    for r in records:
+                        q = r.get('question_text', '')[:40]
+                        score = r.get('score', 0)
+                        lines.append(f"- {q}... 得分:{score}/5")
+                    parts.append(("episodic", "[近期答题记录]\n" + "\n".join(lines)))
+            except Exception as e:
+                logger.debug(f"[情节记忆] 读取失败: {e}")
+
+            # ── 工作记忆：最近一次 session 对话历史──
+            try:
+                latest_session = sqlite_service.get_latest_session_for_user(user_id)
+                if latest_session:
+                    history = latest_session.get('conversation_history', [])
+                    recent = history[-4:] if len(history) > 4 else history
+                    if recent:
+                        lines = []
+                        for h in recent:
+                            role = "用户" if h.get('role') == 'user' else "助手"
+                            content = h.get('content', '')[:80]
+                            lines.append(f"{role}: {content}")
+                        parts.append(("working", "[近期对话上下文]\n" + "\n".join(lines)))
+            except Exception as e:
+                logger.debug(f"[工作记忆] 读取失败: {e}")
+
+            if not parts:
+                return ""
+
+            # ── 用 ContextBuilder 的 GSSC 流水线结构化上下文 ──
+            builder = ContextBuilder(config=ContextConfig(max_tokens=1500, reserve_ratio=0.1))
+            packets = [
+                ContextPacket(
+                    content=content,
+                    metadata={"type": "related_memory" if layer == "episodic" else
+                               ("task_state" if layer == "working" else "knowledge_base")},
+                    relevance_score=0.9 if layer == "semantic" else
+                                   (0.8 if layer == "episodic" else 0.7)
+                )
+                for layer, content in parts
+            ]
+            context = builder.build(
+                user_query=user_message,
+                additional_packets=packets
+            )
+            # 去掉 ContextBuilder 自动加的 [Task]/[Output] 段，只保留记忆部分
+            lines = [l for l in context.split("\n")
+                     if not l.startswith("[Task]") and not l.startswith("[Output]") 
+                     and not l.startswith("用户问题：") and "请按以下格式回答" not in l]
+            return "\n".join(lines).strip()
+
+        except Exception as e:
+            logger.warning(f"[记忆上下文] 构建失败，降级为空: {e}")
+            return ""
 
     # ===========================================================
     # 确定性流程 1：内容采集管道（代码驱动 ETL）
