@@ -86,7 +86,15 @@ python run.py
 cd E:\Agent\AgentProject\wxr_agent
 ```
 
-### 第二步：安装依赖
+### 第二步：配置环境变量
+
+```powershell
+# 复制示例配置并编辑（填入真实 API Key 等）
+copy .env.example .env
+# 编辑 .env，至少配置：EMBED_API_KEY、NEO4J_PASSWORD
+```
+
+### 第三步：安装依赖
 
 ```powershell
 # 激活 conda 环境
@@ -100,7 +108,7 @@ python -m spacy download zh_core_web_sm
 python -m spacy download en_core_web_sm
 ```
 
-### 第三步：启动 Neo4j（本地 Docker）
+### 第四步：启动 Neo4j（本地 Docker）
 
 ```powershell
 # 首次需拉取镜像（约 400MB，需 Docker Desktop 运行且网络正常）
@@ -112,7 +120,7 @@ python check_neo4j.py
 
 浏览器访问 http://localhost:7474 可打开 Neo4j 管理界面（用户名/密码见 `CREDENTIALS.md`）。
 
-### 第四步：启动后端
+### 第五步：启动后端
 
 ```powershell
 python run.py
@@ -132,7 +140,7 @@ python run.py
 ╚══════════════════════════════════════════════════════╝
 ```
 
-### 第五步：构建并打开前端
+### 第六步：构建并打开前端
 
 ```powershell
 cd web

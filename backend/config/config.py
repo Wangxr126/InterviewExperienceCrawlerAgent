@@ -279,6 +279,11 @@ class _Settings:
     def interviewer_max_tokens(self) -> int:
         return _get_int("INTERVIEWER_MAX_TOKENS", 0) or self.llm_max_tokens
 
+    @property
+    def enable_smart_compression(self) -> bool:
+        """是否启用智能摘要（需额外 LLM 调用），默认 False"""
+        return _get_bool("ENABLE_SMART_COMPRESSION", False)
+
     # ── 4.5 微调辅助大模型 ────────────────────────────────────────
     @property
     def finetune_mode(self) -> str:

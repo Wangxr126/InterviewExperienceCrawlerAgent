@@ -239,6 +239,10 @@ class SqliteService:
             # 迁移：为 crawl_tasks 添加 extract_duration_min 列（LLM 提取耗时，分钟）
             if "extract_duration_min" not in cols:
                 conn.execute("ALTER TABLE crawl_tasks ADD COLUMN extract_duration_min REAL")
+            # 迁移：为 interview_sessions 添加 session_meta 列（hello_agents 会话元数据）
+            isess_cols = [r[1] for r in conn.execute("PRAGMA table_info(interview_sessions)").fetchall()]
+            if "session_meta" not in isess_cols:
+                conn.execute("ALTER TABLE interview_sessions ADD COLUMN session_meta TEXT DEFAULT '{}'")
             conn.commit()
         logger.info("✅ SQLite 所有表初始化完成")
         self._seed_knowledge_resources()
@@ -542,7 +546,7 @@ class SqliteService:
             1.3,
             easiness_factor + 0.1 - (5 - score) * (0.08 + (5 - score) * 0.02)
         )
-        next_review_at = now_beijing_str() + timedelta(days=interval_days)
+        next_review_at = now_beijing() + timedelta(days=interval_days)
         return easiness_factor, repetitions, interval_days, next_review_at
 
     def add_study_record(self, user_id: str, question_id: str, score: int,
@@ -725,6 +729,27 @@ class SqliteService:
             s["conversation_history"] = json.loads(s.get("conversation_history") or "[]")
             s["weak_tags"] = json.loads(s.get("weak_tags") or "[]")
             return s
+
+    def patch_last_assistant_content(self, session_id: str, full_content: str):
+        """将最后一条 assistant 消息的 content 替换为完整内容（解决刷新后代码块等丢失）"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT conversation_history FROM interview_sessions WHERE session_id = ?",
+                (session_id,)
+            ).fetchone()
+            if not row:
+                return
+            history = json.loads(row["conversation_history"] or "[]")
+            for i in range(len(history) - 1, -1, -1):
+                if history[i].get("role") == "assistant":
+                    history[i]["content"] = full_content
+                    history[i]["ts"] = now_beijing().isoformat()
+                    break
+            conn.execute(
+                "UPDATE interview_sessions SET conversation_history = ? WHERE session_id = ?",
+                (json.dumps(history, ensure_ascii=False), session_id)
+            )
+            conn.commit()
 
     # ===========================================================
     # user_notes 表操作

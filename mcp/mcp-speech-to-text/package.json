@@ -1,0 +1,26 @@
+{
+  "name": "mcp-speech-to-text",
+  "version": "1.0.0",
+  "description": "MCP server: 语音转文字（Whisper API），支持本地文件/URL/base64 三种输入方式",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-speech-to-text": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && node -e \"require('fs').chmodSync('dist/index.js', '755')\"",
+    "dev": "ts-node --esm src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "form-data": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "type": "module"
+}

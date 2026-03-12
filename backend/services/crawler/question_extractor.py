@@ -224,7 +224,8 @@ def _get_miner_agent(image_paths: List[str] = None, task_id: str = ""):
 
 
 def _call_llm_with_agent(content: str, has_image: bool, company: str = "", position: str = "", 
-                         image_paths: List[str] = None, task_id: str = "") -> Tuple[str, bool, bool]:
+                         image_paths: List[str] = None, task_id: str = "",
+                         retry_hint: str = None) -> Tuple[str, bool, bool]:
     """
     使用 MinerAgent（框架托管版）提取题目。
     LLM 自主通过工具调用决策：
@@ -245,19 +246,35 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
     ]
     try:
         agent = _get_miner_agent(image_paths=image_paths, task_id=task_id)
-        result, ocr_called, is_unrelated = agent.run(
-            content=content,
-            has_image=has_image,
-            company=company,
-            position=position
-        )
+        # 重试时直接用带纠错指令的 retry_hint 作为输入，跳过 format_miner_user_prompt
+        if retry_hint:
+            result, ocr_called, is_unrelated = agent.run(
+                content=content,
+                has_image=has_image,
+                company=company,
+                position=position,
+                user_input_override=retry_hint,
+            )
+        else:
+            result, ocr_called, is_unrelated = agent.run(
+                content=content,
+                has_image=has_image,
+                company=company,
+                position=position,
+            )
         logger.info(f"[MinerAgent] 执行完成，输出长度: {len(result)}, ocr_called={ocr_called}, is_unrelated={is_unrelated}")
         # Agent 成功返回，但 result 是拒绝文本时降级为直接 LLM 调用
         if result and not is_unrelated:
             _stripped = result.strip()
+            # 检测拒绝文本
             if any(re.search(p, _stripped, re.IGNORECASE) for p in _REFUSE_QUICK):
                 logger.warning(f"[MinerAgent] Agent 返回拒绝文本，降级为直接 LLM 调用: {_stripped[:60]}")
                 raise ValueError("model_refused_fallback")
+            # 检测非 JSON 输出（自然语言 / Markdown 格式）
+            _lstripped = _stripped.lstrip()
+            if not _lstripped.startswith('[') and not _lstripped.startswith('{'):
+                logger.warning(f"[MinerAgent] 返回非 JSON 格式，触发降级: {_stripped[:80]}")
+                raise ValueError("non_json_output_fallback")
         return result, ocr_called, is_unrelated
     except Exception as e:
         logger.warning(f"[MinerAgent] 执行失败，降级为直接 LLM 调用: {e}")
@@ -272,7 +289,7 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
         
         # 使用 format_miner_user_prompt 格式化输入
         from backend.agents.prompts.miner_prompt import format_miner_user_prompt
-        user_prompt = format_miner_user_prompt(content, has_image, company, position)
+        user_prompt = retry_hint or format_miner_user_prompt(content, has_image, company, position)
         if ocr_text:
             user_prompt += f"\n\n## 图片OCR识别内容\n{ocr_text}"
         
@@ -568,13 +585,24 @@ def extract_questions_from_post(
     from backend.agents.miner_agent import UNRELATED_SIGNAL
     for attempt in range(1, max_retries + 1):
         t0 = time.perf_counter()
+        # 重试时在 user_prompt 末尾追加纠错指令，强制 JSON-only 输出
+        attempt_prompt = user_prompt
+        if attempt > 1:
+            attempt_prompt = user_prompt + (
+                f"\n\n【第{attempt}次重试 - 重要纠错】"
+                "上一次你的回复不是合法的 JSON 数组，解析失败。"
+                "这次必须只输出 JSON 数组本身，直接以 [ 开头、以 ] 结尾，"
+                "不要有任何前缀、说明、Markdown 格式或代码块。"
+                "即使面经是叙述性格式，也必须从中归纳题目并输出 JSON 数组。"
+            )
         raw, ocr_called, is_unrelated = _call_llm_with_agent(
             content=full_content,
             has_image=bool(image_paths),
             company=company,
             position=position,
             image_paths=image_paths,
-            task_id=task_id
+            task_id=task_id,
+            retry_hint=attempt_prompt if attempt > 1 else None,
         )
         llm_response_time_sec = time.perf_counter() - t0
         if ocr_called:
@@ -645,9 +673,10 @@ def extract_questions_from_post(
             logger.warning(f"题目为空被过滤")
             continue
 
+        # 兼容 topic_tags / tags，缺失时用空数组
         tags_raw = item.get("topic_tags") or item.get("tags", [])
         if not isinstance(tags_raw, list):
-            tags_raw = [str(tags_raw)]
+            tags_raw = [str(tags_raw)] if tags_raw else []
 
         # 公司/岗位/难度：LLM 不确定时填空，不猜测；优先用 LLM 输出，其次用帖子元数据；"未知" 视为空
         item_company = str(item.get("company", "")).strip()
@@ -663,13 +692,14 @@ def extract_questions_from_post(
         import uuid
         q_id = str(uuid.uuid4())
         
-        # 兼容多种字段名：answer_text / answer, question_type / type
+        # 兼容多种字段名：answer_text/answer, question_type/type/role
+        q_type = str(item.get("question_type") or item.get("type") or item.get("role", "技术题")).strip() or "技术题"
         questions.append({
             "q_id": q_id,  # 添加 q_id 字段
             "question_text": q_text,
             "answer_text": str(item.get("answer_text") or item.get("answer", "")).strip(),
             "difficulty": difficulty_val,
-            "question_type": str(item.get("question_type") or item.get("type", "技术题")),
+            "question_type": q_type,
             "topic_tags": json.dumps(tags_raw, ensure_ascii=False),
             "company": final_company,
             "position": final_position,
@@ -687,14 +717,14 @@ def extract_questions_from_post(
 
 
 def _normalize_difficulty(d: str) -> str:
-    """将难度归一化，空或不确定时返回空字符串"""
+    """将难度归一化，空或不确定时返回空字符串。兼容 low/high 等非标准值。"""
     d = (d or "").strip()
     if not d or d.lower() in ("不确定", "unknown", "?"):
         return ""
     d = d.lower()
-    if d in ("hard", "困难", "高", "困难/拷打"):
+    if d in ("hard", "困难", "高", "困难/拷打", "high"):
         return "hard"
-    if d in ("easy", "简单", "低", "简单/常规"):
+    if d in ("easy", "简单", "低", "简单/常规", "low"):
         return "easy"
     if d in ("medium", "适中", "中", "中等"):
         return "medium"

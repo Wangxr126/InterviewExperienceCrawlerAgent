@@ -15,7 +15,7 @@
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
     "@vitejs/plugin-vue": "^6.0.4",
-    "element-plus": "^2.13.3",
+    "element-plus": "^2.13.5",
     "highlight.js": "^11.11.1",
     "marked": "^17.0.3",
     "pinia": "^3.0.4",

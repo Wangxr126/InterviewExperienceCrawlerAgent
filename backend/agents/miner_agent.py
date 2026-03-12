@@ -2,7 +2,8 @@
 Miner Agent - 信息挖掘师（ReAct版）
 职责：从面经原文中智能挖掘结构化信息
 
-使用 hello-agents 框架的 ReActAgent，内置 Thought + Finish 工具
+使用 hello-agents 框架的 ReActAgent，内置 Thought + Finish 工具。
+按框架 16 项能力配置：Trace、熔断器、工具截断、TodoWrite、DevLog、子代理等。
 """
 import logging
 import re
@@ -52,14 +53,41 @@ class MinerAgent(ReActAgent):
         registry.register_tool(OcrImagesTool(image_paths=self._image_paths, task_id=self._task_id))
         registry.register_tool(MarkUnrelatedTool())
 
-        # 配置 hello-agents：将 trace 等数据写到 backend/data/memory/
+        # ── hello-agents Config（对齐框架 16 项能力）────────────────────
         _data_dir = str(settings.backend_data_dir / "memory")
+        _skills_dir = str(settings.backend_data_dir.parent.parent / ".claude" / "skills")
         _agent_config = HelloAgentsConfig(
+            # 可观测性
+            trace_enabled=True,
             trace_dir=f"{_data_dir}/traces",
-            session_dir=f"{_data_dir}/sessions",
+            trace_sanitize=True,
+            # Miner 为单次任务，无会话持久化
+            session_enabled=False,
+            # 上下文工程（单次提取输入较短，保留默认）
+            context_window=128000,
+            compression_threshold=0.8,
+            min_retain_rounds=5,
+            # TodoWrite + DevLog（多步提取可记录进度）
+            todowrite_enabled=True,
             todowrite_persistence_dir=f"{_data_dir}/todos",
+            devlog_enabled=True,
             devlog_persistence_dir=f"{_data_dir}/devlogs",
-            tool_output_dir=f"{_data_dir}/tool_output",
+            # Skills（可选，面经提取可复用）
+            skills_enabled=True,
+            skills_dir=_skills_dir,
+            skills_auto_register=True,
+            # 熔断器（OCR/LLM 失败时自动熔断）
+            circuit_enabled=True,
+            circuit_failure_threshold=3,
+            # 工具输出截断（OCR 结果可能很长）
+            tool_output_max_lines=500,
+            tool_output_max_bytes=20480,
+            tool_output_dir=f"{_data_dir}/tool-output",
+            # 子代理（TaskTool，可选）
+            subagent_enabled=False,
+            # 异步
+            async_enabled=True,
+            max_concurrent_tools=2,
         )
 
         max_steps = getattr(settings, "miner_max_steps", 5)
@@ -74,7 +102,13 @@ class MinerAgent(ReActAgent):
             config=_agent_config,
         )
 
-    def run(self, content: str, has_image: bool = False, company: str = "", position: str = "") -> Tuple[str, bool, bool]:
+        logger.info(
+            f"[MinerAgent] 初始化完成 model={settings.miner_model} "
+            f"max_steps={max_steps} trace_enabled"
+        )
+
+    def run(self, content: str, has_image: bool = False, company: str = "", position: str = "",
+              user_input_override: str = None) -> Tuple[str, bool, bool]:
         """
         运行 MinerAgent。
 
@@ -83,6 +117,7 @@ class MinerAgent(ReActAgent):
             has_image: 是否有图片
             company: 公司名称
             position: 岗位名称
+            user_input_override: 直接覆盖用户输入（用于重试时注入纠错指令），为 None 时自动格式化
 
         Returns:
             (answer, ocr_called, is_unrelated)
@@ -90,8 +125,8 @@ class MinerAgent(ReActAgent):
             - ocr_called   : 是否调用了 ocr_images
             - is_unrelated : LLM 是否主动调用了 mark_unrelated
         """
-        # 格式化用户输入
-        user_input = format_miner_user_prompt(content, has_image, company, position)
+        # 格式化用户输入（重试时使用外部传入的 override，含纠错指令）
+        user_input = user_input_override or format_miner_user_prompt(content, has_image, company, position)
 
         # 重置状态
         self._ocr_called = False

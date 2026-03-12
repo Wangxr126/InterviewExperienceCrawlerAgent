@@ -76,6 +76,14 @@ class _CrawlerConfig:
     def ENABLE_XHS(self) -> bool:
         return settings.scheduler_enable_xhs
 
+    @property
+    def crawler_fetch_max_retries(self) -> int:
+        return settings.crawler_fetch_max_retries
+
+    @property
+    def crawler_retry_delay(self) -> int:
+        return settings.crawler_retry_delay
+
 
 cfg = _CrawlerConfig()
 

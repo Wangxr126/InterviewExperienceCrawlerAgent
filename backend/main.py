@@ -299,6 +299,42 @@ app = FastAPI(
 
 )
 
+# ══════════════════════════════════════════════════════
+# 请求模型定义
+# ══════════════════════════════════════════════════════
+
+class ChatRequest(BaseModel):
+    """自由对话请求"""
+    user_id: str
+    message: str
+    resume: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+class SubmitAnswerRequest(BaseModel):
+    """答题提交请求"""
+    user_id: str
+    session_id: Optional[str] = None
+    question_id: Optional[str] = None
+    question_text: Optional[str] = None
+    user_answer: str
+
+
+
+
+
+
+class EndSessionRequest(BaseModel):
+    """结束会话请求"""
+    user_id: str
+    session_id: str
+
+
+class IngestRequest(BaseModel):
+    """内容采集请求"""
+    url: str
+    user_id: Optional[str] = None
+    source_platform: Optional[str] = None
 
 
 # 允许前端跨域（开发阶段全放开）
@@ -495,129 +531,51 @@ def get_config():
 
 
 
+def _extract_user_display_content(content: str) -> str:
+    """从后端存储的完整输入中提取用户实际内容，供前端展示"""
+    if not content or "[用户消息]" not in content:
+        return content or ""
+    # 格式: ... [用户消息]\n用户实际内容
+    idx = content.find("[用户消息]")
+    after = content[idx + len("[用户消息]"):].lstrip("\n\r")
+    return after if after else content
+
+
 @app.get("/api/user/{user_id}/chat/history")
 
 def get_chat_history(user_id: str):
-
     """获取用户最近一次对话历史，用于前端打开时自动加载"""
-
+    from datetime import datetime
+    import time
+    
     session = sqlite_service.get_latest_session_for_user(user_id)
-
     if not session:
-
         return {"session_id": None, "messages": []}
-
     history = session.get("conversation_history") or []
-
-    # 转为前端格式 [{role, content}]
-
-    messages = [
-
-        {"role": m.get("role", "user"), "content": m.get("content", "")}
-
-        for m in history if m.get("content")
-
-    ]
-
+    
+    # 转为前端格式 [{role, content, timestamp}]
+    messages = []
+    base_time = time.time()
+    
+    for idx, m in enumerate(history):
+        if m.get("content"):
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            # 用户消息：只展示用户实际输入，不展示 [系统][Task][Output] 等后端格式
+            if role == "user":
+                content = _extract_user_display_content(content)
+            
+            timestamp = m.get("timestamp") or m.get("ts")
+            if not timestamp:
+                timestamp = datetime.fromtimestamp(base_time - (len(history) - idx) * 2).isoformat()
+            
+            messages.append({
+                "role": role,
+                "content": content,
+                "timestamp": timestamp
+            })
+    
     return {"session_id": session["session_id"], "messages": messages}
-
-
-
-
-
-# ══════════════════════════════════════════════════════
-
-# 请求 / 响应模型
-
-# ══════════════════════════════════════════════════════
-
-
-
-class IngestRequest(BaseModel):
-
-    url: str
-
-    user_id: str = "default"
-
-    source_platform: str = ""   # nowcoder / xiaohongshu
-
-
-
-
-
-class ChatRequest(BaseModel):
-
-    user_id: str
-
-    message: str
-
-    resume: Optional[str] = None
-
-    session_id: Optional[str] = None
-
-
-
-
-
-class SubmitAnswerRequest(BaseModel):
-
-    user_id: str
-
-    session_id: str
-
-    question_id: str
-
-    question_text: str
-
-    user_answer: str
-
-    question_tags: Optional[List[str]] = None
-
-
-
-
-
-class EndSessionRequest(BaseModel):
-
-    user_id: str
-
-    session_id: str
-
-    session_summary: str = ""
-
-
-
-
-
-class NoteRequest(BaseModel):
-
-    action: str         # create / list / update / delete
-
-    user_id: str
-
-    note_id: Optional[str] = None
-
-    question_id: Optional[str] = None
-
-    title: Optional[str] = None
-
-    content: Optional[str] = None
-
-    tags: Optional[List[str]] = None
-
-    note_type: str = "concept"
-
-
-
-
-
-# ══════════════════════════════════════════════════════
-
-# 健康检查
-
-# ══════════════════════════════════════════════════════
-
-
 
 @app.get("/")
 
@@ -1023,181 +981,62 @@ async def api_chat(req: ChatRequest):
 
 
 @app.post("/api/chat/stream")
-
 async def api_chat_stream(req: ChatRequest):
-
     """
-
-    流式对话接口（SSE）：
-
-    先等待 LLM 完整回复，然后按词推送 text/event-stream，给前端打字机效果。
-
+    流式对话接口（SSE）：使用 hello_agents arun_stream() 实现真实 token 级流式。
     连接/超时错误会自动重试 2 次。
-
     """
-
     import logging as _logging
-
     _chat_logger = _logging.getLogger("chat")
-
     _chat_logger.info(f"[Stream ←] user={req.user_id} | {req.message[:120]}")
 
-
-
     async def generate():
-
         for attempt in range(3):
-
             try:
-
-                _chat_logger.info(f"[Stream] 开始调用 orchestrator.chat(), attempt={attempt+1}")
-
-                reply, thinking_steps = await asyncio.wait_for(
-
-                    orchestrator.chat(
-
-                        user_id=req.user_id,
-
-                        message=req.message,
-
-                        resume=req.resume,
-
-                        session_id=req.session_id,
-
-                    ),
-
-                    timeout=90.0,
-
-                )
-
-                _chat_logger.info(f"[Stream] orchestrator.chat() 返回成功")
-
-                _chat_logger.info(f"[Stream] reply 类型: {type(reply)}, 长度: {len(reply) if isinstance(reply, str) else 'N/A'}")
-
-                _chat_logger.info(f"[Stream] thinking_steps 类型: {type(thinking_steps)}, 长度: {len(thinking_steps) if isinstance(thinking_steps, list) else 'N/A'}")
-
-                _chat_logger.info(f"[Stream] reply 内容（前100字）: {str(reply)[:100]}")
-
-                _chat_logger.info(f"[Stream] thinking_steps: {thinking_steps}")
-
-                
-
-                # 类型检查和转换
-
-                if not isinstance(reply, str):
-
-                    _chat_logger.error(f"[Stream] ❌ reply 不是字符串! 类型: {type(reply)}, 值: {reply}")
-
-                    reply = str(reply) if reply else ""
-
-                
-
-                if not isinstance(thinking_steps, list):
-
-                    _chat_logger.error(f"[Stream] ❌ thinking_steps 不是列表! 类型: {type(thinking_steps)}, 值: {thinking_steps}")
-
-                    thinking_steps = []
-
-                _chat_logger.info(f"[Stream →] {len(reply)}chars, thinking={len(thinking_steps)}steps")
-
-
-
-                if thinking_steps:
-
-                    data = json.dumps({"thinking": thinking_steps}, ensure_ascii=False)
-
-                    yield f"data: {data}\n\n"
-
-                    await asyncio.sleep(0)
-
-
-
-                chunk_size = 3
-
-                for i in range(0, len(reply), chunk_size):
-
-                    chunk = reply[i:i + chunk_size]
-
-                    data = json.dumps({"delta": chunk}, ensure_ascii=False)
-
-                    yield f"data: {data}\n\n"
-
-                    await asyncio.sleep(0.015)
-
-
-
-                yield "data: [DONE]\n\n"
-
+                _chat_logger.info(f"[Stream] 使用 arun_stream，attempt={attempt+1}")
+                # 参照官方 streaming-sse-guide：async for event in agent.arun_stream()
+                async for sse_line in orchestrator.chat_stream(
+                    user_id=req.user_id,
+                    message=req.message,
+                    resume=req.resume,
+                    session_id=req.session_id,
+                ):
+                    yield sse_line
+                _chat_logger.info(f"[Stream →] 完成")
                 return
-
             except asyncio.TimeoutError:
-
                 if attempt < 2:
-
                     _chat_logger.warning(f"[Stream] 超时，重试 {attempt + 2}/3...")
-
                     await asyncio.sleep(2)
-
                 else:
-
-                    err = json.dumps({"error": "⚠️ 响应超时（90s），LLM 服务可能繁忙，请稍后重试"}, ensure_ascii=False)
-
-                    yield f"data: {err}\n\n"
-
+                    yield f"data: {json.dumps({'error': '⚠️ 响应超时（90s），LLM 服务可能繁忙，请稍后重试'}, ensure_ascii=False)}\n\n"
             except Exception as e:
-
                 err_str = str(e)
-
                 if attempt < 2 and _is_retryable_error(e):
-
                     _chat_logger.warning(f"[Stream] 连接错误，重试 {attempt + 2}/3: {err_str[:80]}")
-
                     await asyncio.sleep(2)
-
                     continue
-
                 if "429" in err_str or "SetLimitExceeded" in err_str or "TooManyRequests" in err_str:
-
                     msg = (
-
                         "⚠️ **API 限额已到**（429 SetLimitExceeded）\n\n"
-
                         "原因：火山引擎「安全体验模式」限制了每日调用次数。\n\n"
-
                         "**解决方法**（两步）：\n"
-
                         "1. 打开 https://console.volcengine.com/\n"
-
                         "2. 进入「模型推理」→「安全体验模式」→ 关闭或调高限制\n\n"
-
                         "关闭后刷新页面即可恢复正常使用。"
-
                     )
-
-                    err = json.dumps({"error": msg}, ensure_ascii=False)
-
+                    yield f"data: {json.dumps({'error': msg}, ensure_ascii=False)}\n\n"
                 else:
-
-                    err = json.dumps({"error": f"⚠️ 错误：{err_str[:300]}"}, ensure_ascii=False)
-
-                yield f"data: {err}\n\n"
-
-
+                    yield f"data: {json.dumps({'error': f'⚠️ 错误：{err_str[:300]}'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
-
         generate(),
-
         media_type="text/event-stream",
-
         headers={
-
-            "Cache-Control": "no-cache",
-
-            "X-Accel-Buffering": "no",    # 禁止 nginx 缓冲
-
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 禁用 Nginx 缓冲
         },
-
     )
 
 
@@ -1405,6 +1244,7 @@ def get_memory_summary(user_id: str):
 # 爬虫管理 API
 
 # ══════════════════════════════════════════════════════
+
 
 
 
@@ -2626,6 +2466,10 @@ def get_crawl_tasks(
 
     offset: int = Query(0, ge=0),
 
+    sort_by: Optional[str] = Query(None, description="排序字段：id/status/questions_count/processed_at/extract_duration_sec/content_len等"),
+
+    sort_order: Optional[str] = Query(None, description="排序方向：asc/desc"),
+
 ):
 
     """查看爬虫任务队列详情（分页）"""
@@ -2656,6 +2500,18 @@ def get_crawl_tasks(
 
     where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
+    # 排序字段白名单
+    _SORT_FIELDS = {"id", "source_platform", "discover_keyword", "post_title",
+                    "company", "status", "questions_count", "extraction_source",
+                    "agent_used_tool", "extract_duration_sec", "processed_at", "discovered_at"}
+    order_dir = "ASC" if sort_order and sort_order.lower() == "asc" else "DESC"
+    if sort_by == "content_len":
+        order_clause = f"ORDER BY length(raw_content) {order_dir}"
+    elif sort_by and sort_by in _SORT_FIELDS:
+        order_clause = f"ORDER BY {sort_by} {order_dir}"
+    else:
+        order_clause = "ORDER BY id DESC"
+
 
 
     with sqlite3.connect(sqlite_service.db_path) as conn:
@@ -2674,9 +2530,11 @@ def get_crawl_tasks(
 
             f"company, position, questions_count, discovered_at, processed_at, error_msg, "
 
-            f"length(raw_content) AS content_len, discover_keyword, extraction_source, extract_duration_min "
+            f"length(raw_content) AS content_len, discover_keyword, extraction_source, "
 
-            f"FROM crawl_tasks {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            f"extract_duration_min, agent_used_tool, extract_duration_sec "
+
+            f"FROM crawl_tasks {where} {order_clause} LIMIT ? OFFSET ?",
 
             params + [limit, offset]
 

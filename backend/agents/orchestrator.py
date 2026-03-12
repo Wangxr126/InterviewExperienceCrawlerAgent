@@ -21,6 +21,7 @@ import logging
 import re
 import uuid
 import requests
+import time
 from collections import defaultdict
 from functools import partial
 from typing import Dict, Any, List, Optional
@@ -281,97 +282,10 @@ class InterviewSystemOrchestrator:
         """Session 结束时的记忆整合（SQLite 自动持久化，无需额外操作）"""
         logger.debug(f"[记忆整合] user={user_id} - SQLite 自动持久化，无需整合")
 
-    def _build_memory_context(self, user_id: str, user_message: str) -> str:
-        """构建记忆上下文 - 使用 hello-agents 1.0.0 的 ContextBuilder + SQLite 四层记忆
-        
-        working  (工作记忆) → 近期对话历史（SQLite session_history）
-        episodic (情节记忆) → 近期答题记录（SQLite study_records）
-        semantic (语义记忆) → 用户技术画像（SQLite tag_mastery）
-        """
-        try:
-            from hello_agents.context.builder import ContextBuilder, ContextConfig, ContextPacket
-            from datetime import datetime, timedelta
-
-            parts = []
-
-            # ── 语义记忆：用户技术画像（tag_mastery）──
-            try:
-                tag_rows = sqlite_service.get_tag_mastery(user_id)  # 返回所有标签，按 avg_score ASC
-                if tag_rows:
-                    tag_rows = tag_rows[:10]  # 取前10个（最薄弱的）
-                    novice_learning = [r for r in tag_rows if r.get('mastery_level') in ('novice', 'learning')]
-                    proficient = [r for r in tag_rows if r.get('mastery_level') in ('proficient', 'expert')]
-                    profile_lines = []
-                    if novice_learning:
-                        profile_lines.append("薄弱点：" + "、".join(
-                            f"{r['tag']}({r.get('avg_score', 0):.1f}分)" for r in novice_learning[:5]
-                        ))
-                    if proficient:
-                        profile_lines.append("掌握较好：" + "、".join(
-                            f"{r['tag']}" for r in proficient[:5]
-                        ))
-                    if profile_lines:
-                        parts.append(("semantic", "[用户技术画像]\n" + "\n".join(profile_lines)))
-            except Exception as e:
-                logger.debug(f"[语义记忆] 读取失败: {e}")
-
-            # ── 情节记忆：近期答题记录（study_records）──
-            try:
-                records = sqlite_service.get_study_history(user_id, limit=5)
-                if records:
-                    lines = []
-                    for r in records:
-                        q = r.get('question_text', '')[:40]
-                        score = r.get('score', 0)
-                        lines.append(f"- {q}... 得分:{score}/5")
-                    parts.append(("episodic", "[近期答题记录]\n" + "\n".join(lines)))
-            except Exception as e:
-                logger.debug(f"[情节记忆] 读取失败: {e}")
-
-            # ── 工作记忆：最近一次 session 对话历史──
-            try:
-                latest_session = sqlite_service.get_latest_session_for_user(user_id)
-                if latest_session:
-                    history = latest_session.get('conversation_history', [])
-                    recent = history[-4:] if len(history) > 4 else history
-                    if recent:
-                        lines = []
-                        for h in recent:
-                            role = "用户" if h.get('role') == 'user' else "助手"
-                            content = h.get('content', '')[:80]
-                            lines.append(f"{role}: {content}")
-                        parts.append(("working", "[近期对话上下文]\n" + "\n".join(lines)))
-            except Exception as e:
-                logger.debug(f"[工作记忆] 读取失败: {e}")
-
-            if not parts:
-                return ""
-
-            # ── 用 ContextBuilder 的 GSSC 流水线结构化上下文 ──
-            builder = ContextBuilder(config=ContextConfig(max_tokens=1500, reserve_ratio=0.1))
-            packets = [
-                ContextPacket(
-                    content=content,
-                    metadata={"type": "related_memory" if layer == "episodic" else
-                               ("task_state" if layer == "working" else "knowledge_base")},
-                    relevance_score=0.9 if layer == "semantic" else
-                                   (0.8 if layer == "episodic" else 0.7)
-                )
-                for layer, content in parts
-            ]
-            context = builder.build(
-                user_query=user_message,
-                additional_packets=packets
-            )
-            # 去掉 ContextBuilder 自动加的 [Task]/[Output] 段，只保留记忆部分
-            lines = [l for l in context.split("\n")
-                     if not l.startswith("[Task]") and not l.startswith("[Output]") 
-                     and not l.startswith("用户问题：") and "请按以下格式回答" not in l]
-            return "\n".join(lines).strip()
-
-        except Exception as e:
-            logger.warning(f"[记忆上下文] 构建失败，降级为空: {e}")
-            return ""
+    # 记忆由 hello_agents 框架提供：
+    # - HistoryManager + SessionStore（对话历史）
+    # - recall_memory 工具（用户画像、薄弱点、答题记录）
+    # 不再在此构建 memory_context，Agent 通过工具按需获取
 
     # ===========================================================
     # 确定性流程 1：内容采集管道（代码驱动 ETL）
@@ -584,59 +498,73 @@ class InterviewSystemOrchestrator:
         if not session_id:
             session_id = f"sess_{uuid.uuid4().hex[:8]}"
 
-        # 确保 session 存在并入库用户消息
+        # 注入 user_id、session_id 到线程上下文（SqliteSessionStore 与工具依赖）
+        from backend.agents.context import set_current_user_id, set_current_session_id
+        from backend.agents.thinking_capture import ThinkingCapture
+        set_current_user_id(user_id)
+        set_current_session_id(session_id)
+
+        # 确保 session 存在
         sqlite_service.ensure_session_exists(session_id, user_id)
-        sqlite_service.update_session_history(session_id, "user", message)
 
-        # 构建记忆上下文注入（使用缓存的 MemoryManager）
-        mm_start = time.time()
-        memory_context = self._build_memory_context(user_id, message)
-        mm_time = time.time() - mm_start
-        
-        if mm_time > 0.1:  # 只记录超过 100ms 的
-            logger.info(f"[性能] 记忆检索耗时: {mm_time:.2f}s")
-        
         self._write_working(user_id, f"用户：{message}", session_id=session_id)
-
         if resume:
             self._write_perceptual(user_id, f"简历内容（{len(resume)}字）",
                                     modality="text", importance=0.8,
                                     session_id=session_id)
 
+        # 使用 hello_agents 原生 load_session：恢复 HistoryManager（框架记忆能力）
+        session_path = f"{user_id}:{session_id}"
+        try:
+            self.interviewer.load_session(session_path, check_consistency=False)
+            logger.debug(f"[对话处理] 已加载 session: {session_path}")
+        except FileNotFoundError:
+            logger.debug(f"[对话处理] 新 session，无历史: {session_path}")
+        except Exception as e:
+            logger.warning(f"[对话处理] load_session 失败，使用空历史: {e}")
+
+        # 记忆由框架提供：HistoryManager(load_session) + recall_memory 工具
+        # 不再在此注入 memory_context，Agent 通过 recall_memory 按需获取
         context_prefix = "\n".join(filter(None, [
             f"[系统] user_id={user_id}, session_id={session_id}",
-            memory_context,
             f"[简历]\n{resume}" if resume else "",
         ]))
         full_input = f"{context_prefix}\n\n[用户消息]\n{message}" if context_prefix.strip() else message
 
         logger.info(f"[对话处理] 💬 [InterviewerAgent] 处理用户 {user_id} 的对话，消息: {message[:80]}")
-        # 注入当前 user_id 到线程上下文，工具可直接读取，无需 Agent 每次传参
-        from backend.agents.context import set_current_user_id
-        from backend.agents.thinking_capture import ThinkingCapture
-        set_current_user_id(user_id)
 
+        # ── hello_agents：run() + ThinkingCapture（思考步骤需线程内 print 捕获）──
+        # arun() 为原生异步，不经过 executor，ThinkingCapture 无法捕获；故保留 run
         loop = asyncio.get_event_loop()
 
-        def _run_agent_with_capture():
+        def _run_with_capture():
             with ThinkingCapture() as tc:
-                result = self.interviewer.run(full_input)
-            return result, tc.get_steps()
+                return self.interviewer.run(full_input), tc.get_steps()
 
         try:
             agent_start = time.time()
-            response, thinking_steps = await loop.run_in_executor(None, _run_agent_with_capture)
+            timeout = getattr(settings, "interviewer_timeout", 30)
+            response, thinking_steps = await asyncio.wait_for(
+                loop.run_in_executor(None, _run_with_capture),
+                timeout=float(timeout)
+            )
             agent_time = time.time() - agent_start
             logger.info(f"[性能] Agent 执行耗时: {agent_time:.2f}s")
+        except asyncio.TimeoutError:
+            logger.warning(f"[对话处理] ⚠️ Agent 执行超时（{timeout}s），返回部分结果")
+            response = "抱歉，处理您的请求耗时较长，请稍后重试。"
+            thinking_steps = []
         except Exception as agent_err:
             logger.error(f"[对话处理] ❌ [InterviewerAgent] run() 抛出异常: {agent_err}", exc_info=True)
             raise
         logger.info(f"[对话处理] ✅ [InterviewerAgent] 回复完成 ({len(response)}字, 思考{len(thinking_steps)}步): {response[:200]}")
 
-        # 入库 AI 回复（含 thinking_steps 摘要）
-        reasoning_summary = _format_thinking_for_db(thinking_steps)
-        sqlite_service.update_session_history(session_id, "assistant", response,
-                                              reasoning=reasoning_summary or None)
+        # hello_agents SessionStore：持久化 HistoryManager 到 SqliteSessionStore
+        try:
+            self.interviewer.save_session(session_id)
+            logger.debug(f"[对话处理] 已保存 session: {session_id}")
+        except Exception as e:
+            logger.warning(f"[对话处理] save_session 失败: {e}")
 
         self._write_working(user_id, f"AI：{response[:200]}", importance=0.4,
                              session_id=session_id)
@@ -664,7 +592,6 @@ class InterviewSystemOrchestrator:
                 metadata={
                     "has_resume": bool(resume),
                     "resume_length": len(resume) if resume else 0,
-                    "memory_context": memory_context[:200] if memory_context else None,
                     "full_input_length": len(full_input)
                 }
             )
@@ -689,6 +616,156 @@ class InterviewSystemOrchestrator:
         logger.info("=" * 60)
 
         return response, thinking_steps
+
+    # ===========================================================
+    # 流式对话（简化版：run() + executor + 伪流式）
+    # ===========================================================
+
+    async def chat_stream(
+        self,
+        user_id: str,
+        message: str,
+        resume: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ):
+        """
+        流式对话：使用 run() + executor 的简化方案。
+        
+        策略：
+        1. 在 executor 中同步执行 run()，获得完整答案
+        2. 将答案按 token 分块，逐个推送给前端（伪流式）
+        3. 前端收到每个 chunk 后立即更新 DOM，实现流式效果
+        
+        优点：
+        - 逻辑简单，无需复杂的事件过滤
+        - 多轮对话连贯性由 HistoryManager 保证
+        - 工具调用正常工作
+        
+        缺点：
+        - 延迟略高（一次性等待完整答案）
+        - 但对用户体验影响不大（通常 5-30s 内完成）
+        """
+        import time as _time
+        start_time = _time.time()
+
+        if not session_id:
+            session_id = f"sess_{uuid.uuid4().hex[:8]}"
+
+        from backend.agents.context import set_current_user_id, set_current_session_id
+        set_current_user_id(user_id)
+        set_current_session_id(session_id)
+
+        sqlite_service.ensure_session_exists(session_id, user_id)
+        self._write_working(user_id, f"用户：{message}", session_id=session_id)
+        if resume:
+            self._write_perceptual(user_id, f"简历内容（{len(resume)}字）",
+                                   modality="text", importance=0.8, session_id=session_id)
+
+        session_path = f"{user_id}:{session_id}"
+        try:
+            self.interviewer.load_session(session_path, check_consistency=False)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"[chat_stream] load_session 失败: {e}")
+
+        context_prefix = "\n".join(filter(None, [
+            f"[系统] user_id={user_id}, session_id={session_id}",
+            f"[简历]\n{resume}" if resume else "",
+        ]))
+        full_input = f"{context_prefix}\n\n[用户消息]\n{message}" if context_prefix.strip() else message
+
+        try:
+            # Step 1: 在 executor 中同步执行 run()，获得完整答案
+            loop = asyncio.get_event_loop()
+            response = await asyncio.wait_for(
+                loop.run_in_executor(None, self.interviewer.run, full_input),
+                timeout=90.0
+            )
+
+            # Step 2: 从 hello_agents 的 history_manager 中提取思考步骤
+            thinking_steps = []
+            if hasattr(self.interviewer, 'history_manager'):
+                history = self.interviewer.history_manager.get_history()
+                for msg in history:
+                    if msg.role == "assistant" and msg.metadata:
+                        if msg.metadata.get("type") == "thought":
+                            thinking_steps.append({"thought": msg.content})
+                        elif msg.metadata.get("type") == "action":
+                            thinking_steps.append({"action": msg.content})
+
+            # Step 3: 构造思考步骤事件
+            for step in thinking_steps:
+                payload = {
+                    "type": "tool_call_finish",
+                    "data": {
+                        "tool_name": "Thought" if step.get("thought") else "Action",
+                        "result": step.get("thought") or step.get("action") or ""
+                    }
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0.01)  # 让前端有机会处理
+
+            # Step 4: 按 token 分块推送答案（真正流式）
+            # 简单策略：按句子或固定字符数分块
+            chunk_size = 50  # 每个 chunk 约 50 个字符
+            for i in range(0, len(response), chunk_size):
+                chunk = response[i:i+chunk_size]
+                payload = {
+                    "type": "llm_chunk",
+                    "data": {
+                        "chunk": chunk
+                    }
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0.05)  # 模拟流式延迟，让前端有时间渲染
+
+            # Step 5: 发送完成事件
+            finish_payload = {
+                "type": "agent_finish",
+                "data": {
+                    "result": response,
+                    "duration_ms": int((time.time() - start_time) * 1000)
+                }
+            }
+            yield f"data: {json.dumps(finish_payload, ensure_ascii=False)}\n\n"
+
+            # Step 5: 持久化
+            try:
+                self.interviewer.save_session(session_id)
+                if response.strip():
+                    sqlite_service.patch_last_assistant_content(session_id, response)
+            except Exception as e:
+                logger.warning(f"[chat_stream] save_session 失败: {e}")
+
+            self._write_working(user_id, f"AI：{response[:100]}", importance=0.4, session_id=session_id)
+            self._write_episodic(
+                user_id=user_id,
+                content=f"对话：「{message[:60]}」→「{response[:60]}」",
+                importance=0.5,
+                event_type="dialogue",
+                session_id=session_id
+            )
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[chat_stream] 超时（90s）")
+            from hello_agents.core.streaming import StreamEvent, StreamEventType
+            err_ev = StreamEvent.create(
+                StreamEventType.ERROR,
+                "Orchestrator",
+                error="⚠️ 响应超时（90s），LLM 服务可能繁忙，请稍后重试"
+            )
+            yield err_ev.to_sse()
+
+        except Exception as e:
+            logger.error(f"[chat_stream] 异常: {e}", exc_info=True)
+            from hello_agents.core.streaming import StreamEvent, StreamEventType
+            err_ev = StreamEvent.create(
+                StreamEventType.ERROR,
+                "Orchestrator",
+                error=str(e)[:500]
+            )
+            yield err_ev.to_sse()
 
     # ===========================================================
     # 公开接口
@@ -758,7 +835,7 @@ class InterviewSystemOrchestrator:
         logger.info(f"✅ 用户 {user_id} 技术画像写入语义记忆")
 
     def get_memory_summary(self, user_id: str) -> str:
-        mt = self._get_user_memory(user_id)
+        mt = _get_memory_tool(user_id)
         if not mt:
             return "记忆系统未初始化"
         try:

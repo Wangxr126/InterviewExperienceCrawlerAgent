@@ -1,5 +1,17 @@
 {
   "mcpServers": {
+    "speech-to-text": {
+      "command": "node",
+      "args": [
+        "E:\\Agent\\AgentProject\\wxr_agent\\mcp\\mcp-speech-to-text\\dist\\index.js"
+      ],
+      "env": {
+        "OPENAI_API_KEY": "sk-dhljrvzndzsvfxuajgelksdjebqpzbhwuomdfztxdjlkoqpr",
+        "OPENAI_BASE_URL": "https://api.siliconflow.cn",
+        "WHISPER_MODEL": "FunAudioLLM/SenseVoiceSmall"
+      },
+      "disabled": false
+    },
     "image-extractor": {
       "command": "node",
       "args": [

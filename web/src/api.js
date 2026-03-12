@@ -2,6 +2,8 @@
 // 开发环境：Vite proxy 转发到 localhost:8000
 // 生产环境：FastAPI 静态文件服务，相对路径 /api 即可
 const BASE = import.meta.env.DEV ? '' : ''
+// 开发时若代理仍缓冲 SSE，可在 .env 设置 VITE_STREAM_DIRECT=true 直连后端验证流式
+const STREAM_BASE = import.meta.env.VITE_STREAM_DIRECT === 'true' ? 'http://localhost:8000' : ''
 
 export const api = {
   // ── 配置 ──────────────────────────────────────────────
@@ -63,9 +65,12 @@ export const api = {
   // ── 对话流式 SSE ──────────────────────────────────────
   // 返回 Response 对象，由 ChatView 自行读取 body stream
   async chatStream(payload, signal) {
-    return fetch(`${BASE}/api/chat/stream`, {
+    return fetch(`${STREAM_BASE || BASE}/api/chat/stream`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',  // 明确请求 SSE，避免代理/中间件缓冲
+      },
       body: JSON.stringify(payload),
       signal,
     })
@@ -159,6 +164,8 @@ export const api = {
     if (params.keyword) p.set('keyword', params.keyword)
     p.set('limit', params.limit ?? '20')
     if (params.offset != null) p.set('offset', String(params.offset))
+    if (params.sort_by) p.set('sort_by', params.sort_by)
+    if (params.sort_order) p.set('sort_order', params.sort_order)
     const r = await fetch(`${BASE}/api/crawler/tasks?${p}`)
     return r.json()
   },

@@ -2,12 +2,18 @@
 # 面经 Agent 项目 .gitignore
 # ============================================================
 
-# ━━━ 环境与密钥 ━━━
+# ━━━ 环境与密钥（含 API Key / Token，禁止提交）━━━
 .env
 .env.local
 .env.*.local
+.env.development
+.env.production
 *.pem
+*.key
 CREDENTIALS.md
+*credentials*
+*secrets*
+**/secrets/
 
 # ━━━ 后端数据（不提交到仓库）━━━
 backend/data/
@@ -18,6 +24,7 @@ backend/*.db
 *.db-wal
 
 # 根目录遗留数据目录（已迁移至 backend/data，若存在可删除）
+memory/
 memory_data/
 neo4j_data/
 xhs_user_data/
@@ -72,6 +79,10 @@ xhs_link_cache.txt
 # 临时脚本和归档
 scripts/temp/
 docs/archive/
+
+# ━━━ HelloAgents 源码（项目使用 pip 安装的 hello-agents 包）━━━
+HelloAgents/
+HelloAgents-1.0.0/
 
 # ━━━ 系统文件 ━━━
 .DS_Store

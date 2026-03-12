@@ -97,11 +97,17 @@
 
       <!-- 分页控件 -->
       <div v-if="pagination.total > 0 && !loading" class="pagination-bar">
+        <div class="pagination-info">
+          共 <strong>{{ pagination.total }}</strong> 道题 · 
+          第 <strong>{{ pagination.page }}</strong> / {{ pagination.totalPages }} 页 ·
+          每页 <strong>{{ pagination.pageSize }}</strong> 题
+        </div>
         <el-pagination
           v-model:current-page="pagination.page"
           :page-size="pagination.pageSize"
           :total="pagination.total"
-          layout="prev, pager, next, jumper, total"
+          :pager-count="11"
+          layout="prev, pager, next, jumper"
           background
           @current-change="onPageChange"
         />
@@ -165,6 +171,7 @@ const questionTypeClass = (t) => {
 const loadQuestions = async (page = pagination.page) => {
   loading.value = true
   try {
+    console.log(`📖 加载第 ${page} 页，每页 ${pagination.pageSize} 题`)
     const d = await api.getQuestions({
       ...filters,
       page,
@@ -172,11 +179,14 @@ const loadQuestions = async (page = pagination.page) => {
       sort_by: sortBy.value,
       sort_order: sortOrder.value,
     })
+    console.log(`📖 后端返回: total=${d.total}, page=${d.page}, total_pages=${d.total_pages}, questions=${d.questions?.length}`)
     questions.value = d.questions || []
     pagination.total = d.total ?? 0
     pagination.totalPages = d.total_pages ?? 1
     pagination.page = d.page ?? page
-  } catch {
+    console.log(`📖 前端状态: pagination.page=${pagination.page}, pagination.total=${pagination.total}, pagination.totalPages=${pagination.totalPages}`)
+  } catch (e) {
+    console.error('❌ 加载题目失败:', e)
     ElMessage.error('加载题目失败，请检查后端是否已启动')
   } finally {
     loading.value = false
@@ -191,6 +201,7 @@ const onSearch = () => {
 
 // 切换页码
 const onPageChange = (newPage) => {
+  console.log(`🔄 页码变化: ${pagination.page} → ${newPage}`)
   pagination.page = newPage
   loadQuestions(newPage)
 }
@@ -353,9 +364,16 @@ watch(() => props.isActive, (newVal, oldVal) => {
 .loading-center { text-align: center; padding: 40px; }
 .pagination-bar {
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
   margin-top: 24px;
   padding-top: 16px;
   border-top: 1px solid var(--border);
+}
+.pagination-info {
+  font-size: 13px;
+  color: var(--text-sub);
+  text-align: center;
 }
 </style>

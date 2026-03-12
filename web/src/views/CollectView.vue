@@ -194,27 +194,30 @@
           <el-button size="small" type="danger" plain @click="showClearAllDialog = true">清除所有</el-button>
         </div>
       </div>
-      <el-table :data="tasks" size="small" class="post-table" stripe>
-        <el-table-column label="ID" prop="id" width="52" align="center" />
-        <el-table-column label="平台" width="68">
+      <el-table :data="tasks" size="small" class="post-table" stripe
+        @sort-change="onSortChange"
+        :default-sort="{ prop: 'id', order: 'descending' }"
+      >
+        <el-table-column label="ID" prop="id" width="60" align="center" sortable="custom" />
+        <el-table-column label="平台" prop="source_platform" width="82" sortable="custom">
           <template #default="{ row }">
             <el-tag :type="row.source_platform === 'xiaohongshu' ? 'danger' : 'warning'" size="small">
               {{ row.source_platform === 'xiaohongshu' ? '小红书' : '牛客' }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="关键词" prop="discover_keyword" width="100" show-overflow-tooltip>
+        <el-table-column label="关键词" prop="discover_keyword" width="100" show-overflow-tooltip sortable="custom">
           <template #default="{ row }">{{ row.discover_keyword || '—' }}</template>
         </el-table-column>
-        <el-table-column label="标题" min-width="100" show-overflow-tooltip>
+        <el-table-column label="标题" prop="post_title" min-width="100" show-overflow-tooltip sortable="custom">
           <template #default="{ row }">
             <a :href="row.source_url" target="_blank" style="color:var(--primary);text-decoration:none;font-size:13px">
               {{ row.post_title || row.source_url.slice(-30) }}
             </a>
           </template>
         </el-table-column>
-        <el-table-column label="公司" prop="company" width="72" show-overflow-tooltip />
-        <el-table-column label="正文" width="56" align="center">
+        <el-table-column label="公司" prop="company" width="72" show-overflow-tooltip sortable="custom" />
+        <el-table-column label="正文" prop="content_len" width="68" align="center" sortable="custom">
           <template #default="{ row }">
             <el-link v-if="(row.content_len ?? 0) > 0" type="primary" :underline="false" style="font-size:12px"
                      @click="openContentDialog(row)">
@@ -223,12 +226,12 @@
             <span v-else style="color:#c0c4cc;font-size:12px">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="60" align="center">
+        <el-table-column label="状态" prop="status" width="74" align="center" sortable="custom">
           <template #default="{ row }">
             <el-tag :type="STATUS_TAG[row.status]" size="small">{{ STATUS_LABEL[row.status] || row.status }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="题目" width="48" align="center">
+        <el-table-column label="题目" prop="questions_count" width="70" align="center" sortable="custom">
           <template #default="{ row }">
             <el-link v-if="row.questions_count > 0" type="success" :underline="false"
                      style="font-weight:700" @click="openQuestionsDialog(row)">
@@ -237,33 +240,33 @@
             <span v-else style="color:#c0c4cc">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="来源" width="56" align="center">
+        <el-table-column label="来源" prop="extraction_source" width="70" align="center" sortable="custom">
           <template #default="{ row }">
             <el-tag v-if="row.extraction_source === 'image'" type="warning" size="small">图片</el-tag>
             <el-tag v-else-if="row.extraction_source === 'content'" type="primary" size="small">正文</el-tag>
             <span v-else style="color:#c0c4cc">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="工具调用" width="68" align="center">
+        <el-table-column label="工具调用" prop="agent_used_tool" width="90" align="center" sortable="custom">
           <template #default="{ row }">
             <el-tag v-if="row.agent_used_tool === 1" type="success" size="small">✓ 是</el-tag>
             <el-tag v-else-if="row.agent_used_tool === 0 && row.status === 'done'" type="info" size="small">否</el-tag>
             <span v-else style="color:#c0c4cc">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="耗时" width="62" align="center">
+        <el-table-column label="耗时" prop="extract_duration_sec" width="72" align="center" sortable="custom">
           <template #default="{ row }">
             <span v-if="row.extract_duration_sec != null" style="font-size:12px;color:var(--text-main)">{{ row.extract_duration_sec }}s</span>
             <span v-else style="color:#c0c4cc;font-size:12px">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="提取时间" width="110" align="center">
+        <el-table-column label="提取时间" prop="processed_at" width="110" align="center" sortable="custom">
           <template #default="{ row }">
             <span v-if="row.processed_at" style="font-size:11px">{{ row.processed_at?.slice(0,16) }}</span>
             <span v-else style="color:#c0c4cc;font-size:12px">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="发现时间" width="110" align="center">
+        <el-table-column label="发现时间" prop="discovered_at" width="110" align="center" sortable="custom">
           <template #default="{ row }">
             <span style="font-size:11px">{{ row.discovered_at?.slice(0,16) }}</span>
           </template>
@@ -271,14 +274,52 @@
       </el-table>
       <div v-if="tasks.length === 0" class="table-empty">暂无记录，点击「查询」加载</div>
       <div v-else class="pagination-wrap">
-        <el-pagination
-          v-model:current-page="taskPage"
-          :page-size="taskPageSize"
-          :total="taskTotal"
-          layout="total, prev, pager, next"
-          small
-          @current-change="onTaskPageChange"
-        />
+        <!-- 自定义分页器 - 显示所有页码 -->
+        <div class="custom-pagination">
+          <span class="pagination-total">共 {{ taskTotal }} 条 · 共 {{ totalPages }} 页</span>
+          <button class="pagination-btn" :disabled="taskPage <= 1" @click="taskPage = 1; loadTasks()">
+            ◀◀
+          </button>
+          <button class="pagination-btn" :disabled="taskPage <= 1" @click="taskPage--; loadTasks()">
+            ◀
+          </button>
+          
+          <!-- 页码按钮 -->
+          <div class="pagination-pager">
+            <button
+              v-for="page in visiblePages"
+              :key="page"
+              class="pagination-page-btn"
+              :class="{ active: page === taskPage }"
+              @click="taskPage = page; loadTasks()"
+            >
+              {{ page }}
+            </button>
+          </div>
+          
+          <button class="pagination-btn" :disabled="taskPage >= totalPages" @click="taskPage++; loadTasks()">
+            ▶
+          </button>
+          <button class="pagination-btn" :disabled="taskPage >= totalPages" @click="taskPage = totalPages; loadTasks()">
+            ▶▶
+          </button>
+          
+          <!-- 跳转输入 -->
+          <div class="pagination-jumper">
+            <span>跳至</span>
+            <input
+              v-model="jumpPage"
+              type="number"
+              :min="1"
+              :max="totalPages"
+              :placeholder="`1-${totalPages}`"
+              @keyup.enter="handleJump"
+              class="pagination-jumper-input"
+            />
+            <span class="pagination-jumper-hint">/ {{ totalPages }} 页</span>
+            <button @click="handleJump" class="pagination-jumper-btn">跳转</button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -549,6 +590,53 @@ const loadKeywords = async () => {
   }
 }
 
+const taskSortBy    = ref('')
+const taskSortOrder = ref('desc')
+const jumpPage      = ref(1)
+
+const totalPages = computed(() => Math.ceil(taskTotal.value / taskPageSize.value))
+
+const visiblePages = computed(() => {
+  const total = totalPages.value
+  const current = taskPage.value
+  const maxVisible = 5  // 最多显示5个页码按钮，简洁不拥挤
+  
+  if (total <= maxVisible) {
+    return Array.from({ length: total }, (_, i) => i + 1)
+  }
+  
+  const half = Math.floor(maxVisible / 2)
+  let start = Math.max(1, current - half)
+  let end = Math.min(total, start + maxVisible - 1)
+  
+  if (end - start + 1 < maxVisible) {
+    start = Math.max(1, end - maxVisible + 1)
+  }
+  
+  const pages = []
+  for (let i = start; i <= end; i++) {
+    pages.push(i)
+  }
+  return pages
+})
+
+const handleJump = () => {
+  const page = parseInt(jumpPage.value, 10)
+  if (!isNaN(page) && page >= 1 && page <= totalPages.value) {
+    taskPage.value = page
+    loadTasks()
+  } else {
+    ElMessage.warning(`共 ${totalPages.value} 页，请输入 1～${totalPages.value} 之间的页码（不是条数 ${taskTotal.value}）`)
+  }
+}
+
+const onSortChange = ({ prop, order }) => {
+  taskSortBy.value = prop || ''
+  taskSortOrder.value = order === 'ascending' ? 'asc' : 'desc'
+  taskPage.value = 1
+  loadTasks()
+}
+
 const loadTasks = async () => {
   try {
     const d = await api.getCrawlerTasks({
@@ -557,9 +645,10 @@ const loadTasks = async () => {
       keyword: taskKeyword.value,
       limit: taskPageSize.value,
       offset: (taskPage.value - 1) * taskPageSize.value,
+      sort_by: taskSortBy.value || undefined,
+      sort_order: taskSortOrder.value,
     })
     taskTotal.value = d.total ?? 0
-    // 将 raw_content 长度补充到每行，避免传输大字段
     tasks.value = (d.tasks || []).map(t => ({
       ...t,
       content_len: t.content_len ?? (t.raw_content ? t.raw_content.length : 0),
@@ -1234,12 +1323,198 @@ watch(crawlPolling, (polling) => {
 .status-help { font-size: 12px; line-height: 1.8; }
 .status-help div { margin-bottom: 4px; }
 .status-help div:last-child { margin-bottom: 0; }
-.post-table { border-radius: 10px; overflow: hidden; border: 1px solid var(--border); }
-.post-table :deep(.el-table__header th) { background: var(--bg) !important; font-weight: 600; font-size: 12px; }
-.post-table :deep(.el-table__row td) { font-size: 13px; }
-.post-table :deep(.el-table__body tr:hover > td) { background: var(--primary-light) !important; }
+
+/* 表格整体容器 */
+.post-table {
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  font-size: 13px;
+}
+
+/* 表头 */
+.post-table :deep(.el-table__header-wrapper) {
+  background: linear-gradient(135deg, #f0f4ff 0%, #f8fafc 100%);
+}
+.post-table :deep(.el-table__header th) {
+  background: transparent !important;
+  font-weight: 700;
+  font-size: 12px;
+  color: #4a5568;
+  letter-spacing: 0.02em;
+  padding: 10px 0;
+  border-bottom: 2px solid rgba(91,110,245,0.15);
+}
+/* 排序箭头颜色 */
+.post-table :deep(.el-table__column-filter-trigger),
+.post-table :deep(.caret-wrapper) {
+  color: #a0aec0;
+}
+.post-table :deep(.caret-wrapper .sort-caret) {
+  color: #a0aec0;
+}
+.post-table :deep(.caret-wrapper .sort-caret.ascending) {
+  color: var(--primary);
+}
+.post-table :deep(.caret-wrapper .sort-caret.descending) {
+  color: var(--primary);
+}
+.post-table :deep(.el-table__column-header-button:hover .caret-wrapper .sort-caret) {
+  color: var(--primary);
+}
+
+/* 行样式 */
+.post-table :deep(.el-table__row td) {
+  font-size: 13px;
+  padding: 8px 0;
+  border-bottom: 1px solid #f0f4f8;
+  transition: background 0.15s;
+}
+.post-table :deep(.el-table__body tr:hover > td) {
+  background: #f0f4ff !important;
+}
+.post-table :deep(.el-table__body tr.el-table__row--striped td) {
+  background: #fafbff;
+}
+
 .table-empty { text-align: center; color: var(--text-sub); padding: 40px 20px; font-size: 14px; }
-.pagination-wrap { margin-top: 16px; display: flex; justify-content: flex-end; }
+.pagination-wrap { margin-top: 16px; display: flex; justify-content: center; }
+
+/* 自定义分页器 */
+.custom-pagination {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  background: #f8fafc;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.pagination-total {
+  font-size: 13px;
+  color: var(--text-sub);
+  font-weight: 500;
+  margin-right: 8px;
+}
+
+.pagination-btn {
+  min-width: 32px;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: white;
+  color: var(--text-main);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pagination-btn:hover:not(:disabled) {
+  background: var(--primary-light);
+  color: var(--primary);
+  border-color: var(--primary);
+}
+
+.pagination-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  color: var(--text-sub);
+}
+
+.pagination-pager {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.pagination-page-btn {
+  min-width: 32px;
+  height: 32px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: white;
+  color: var(--text-main);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pagination-page-btn:hover {
+  background: var(--primary-light);
+  color: var(--primary);
+  border-color: var(--primary);
+}
+
+.pagination-page-btn.active {
+  background: var(--primary);
+  color: white;
+  border-color: var(--primary);
+  font-weight: 600;
+}
+
+.pagination-jumper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+.pagination-jumper-hint {
+  font-size: 12px;
+  color: var(--text-sub);
+}
+
+.pagination-jumper-input {
+  width: 50px;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  text-align: center;
+}
+
+.pagination-jumper-input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(91, 110, 245, 0.1);
+}
+
+.pagination-jumper-btn {
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--primary);
+  border-radius: 6px;
+  background: var(--primary);
+  color: white;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.pagination-jumper-btn:hover {
+  background: #4a5ef5;
+  border-color: #4a5ef5;
+}
+
+.pagination-jumper-btn:active {
+  transform: scale(0.98);
+}
 
 .result-msg { padding: 12px 16px; border-radius: 10px; font-size: 13px; margin-top: 14px; line-height: 1.5; }
 .result-msg.ok { background: #f0fdf4; color: #166534; border: 1px solid #86efac; }

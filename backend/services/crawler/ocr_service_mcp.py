@@ -1,11 +1,10 @@
 """
 图片 OCR 服务
 
-支持三种 OCR 方式，通过 .env 的 OCR_METHOD 配置切换：
+支持两种 OCR 方式，通过 .env 的 OCR_METHOD 配置切换：
 
   qwen_vl       — 阿里云百炼 Qwen-VL（推荐，已有 EMBED_API_KEY 即可用）
   claude_vision — Anthropic Claude Vision API（需要 ANTHROPIC_API_KEY）
-  mcp           — 本地 mcp-image-extractor（本地 Node.js 服务，无需 API Key）
 
 .env 示例：
     OCR_METHOD=qwen_vl          # 切换到 Qwen-VL
@@ -13,16 +12,14 @@
     OCR_API_KEY=sk-xxx          # 可选，留空则复用 EMBED_API_KEY
 """
 import logging
-import json
 import base64
-import subprocess
-import sys
 from typing import Optional, List
 from pathlib import Path
 
 from backend.config.config import settings
 
 logger = logging.getLogger(__name__)
+
 
 # ──────────────────────────────────────────────────────────────
 # 方式一：Qwen-VL（阿里云百炼 / dashscope）
@@ -44,7 +41,6 @@ def _call_qwen_vl_ocr(image_path: str) -> Optional[str]:
     try:
         from openai import OpenAI
 
-        # 读取图片转 base64
         suffix = Path(image_path).suffix.lower()
         mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                     ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}
@@ -119,84 +115,6 @@ def _call_claude_vision_ocr(image_path: str) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────────────────────
-# 方式三：本地 mcp-image-extractor（Node.js MCP server）
-# ──────────────────────────────────────────────────────────────
-
-def _call_mcp_ocr(image_path: str) -> Optional[str]:
-    """
-    通过本地 mcp-image-extractor MCP server 提取图片 base64，
-    再调用当前配置的视觉模型（qwen_vl / claude_vision）做 OCR。
-
-    mcp-image-extractor 负责：图片读取 + 压缩缩放到 512x512
-    视觉模型负责：实际文字识别
-    """
-    index_js = settings.mcp_image_extractor_path
-    if not Path(index_js).exists():
-        logger.error(f"[OCR-MCP] mcp-image-extractor 不存在: {index_js}")
-        logger.error("请先在 mcp/mcp-image-extractor 目录执行: npm run build")
-        return None
-
-    # MCP 会话：initialize → tools/call extract_image_from_file
-    messages = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-         "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                    "clientInfo": {"name": "ocr-client", "version": "1.0"}}},
-        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-         "params": {"name": "extract_image_from_file",
-                    "arguments": {"file_path": str(Path(image_path).resolve())}}},
-    ]
-    stdin_data = "\n".join(json.dumps(m) for m in messages) + "\n"
-
-    try:
-        result = subprocess.run(
-            ["node", index_js],
-            input=stdin_data, capture_output=True,
-            text=True, timeout=30, encoding="utf-8"
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("[OCR-MCP] mcp-image-extractor 超时")
-        return None
-    except Exception as e:
-        logger.error(f"[OCR-MCP] 启动失败: {e}")
-        return None
-
-    # 解析 MCP 响应，找 id=2 的结果
-    meta = None
-    for line in result.stdout.strip().split("\n"):
-        if not line.strip():
-            continue
-        try:
-            resp = json.loads(line)
-            if resp.get("id") == 2:
-                content = resp.get("result", {}).get("content", [])
-                if content:
-                    meta_text = content[0].get("text", "")
-                    try:
-                        meta = json.loads(meta_text)
-                    except Exception:
-                        meta = {"raw": meta_text}
-                break
-        except json.JSONDecodeError:
-            continue
-
-    if not meta:
-        logger.warning("[OCR-MCP] 未获取到图片信息")
-        return None
-
-    logger.info(f"[OCR-MCP] 图片元数据: {meta}")
-
-    # mcp-image-extractor 将图片缩放后存为临时文件或只返回元数据
-    # 2.0.0 版本返回元数据，实际图片仍在原路径，直接用原图调用视觉模型
-    # 回退到 qwen_vl 或 claude_vision 做识别
-    logger.info("[OCR-MCP] 调用视觉模型识别...")
-    text = _call_qwen_vl_ocr(image_path)
-    if not text:
-        text = _call_claude_vision_ocr(image_path)
-    return text
-
-
-# ──────────────────────────────────────────────────────────────
 # 统一入口
 # ──────────────────────────────────────────────────────────────
 
@@ -207,7 +125,6 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
     OCR 方式由 .env 的 OCR_METHOD 控制：
       qwen_vl       — 阿里云百炼 Qwen-VL（推荐）
       claude_vision — Claude Vision API
-      mcp           — 本地 mcp-image-extractor + 视觉模型
 
     Args:
         image_paths: 相对路径列表，如 ["TASK_XXX/0.jpg"]
@@ -242,22 +159,20 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
 
         try:
             text = None
-            if method == "qwen_vl":
-                text = _call_qwen_vl_ocr(str(full_path))
-            elif method == "claude_vision":
+            if method == "claude_vision":
                 text = _call_claude_vision_ocr(str(full_path))
-            elif method == "mcp":
-                text = _call_mcp_ocr(str(full_path))
             else:
-                logger.warning(f"[OCR] 未知方式: {method}，回退到 qwen_vl")
+                # 默认 qwen_vl，未知方式也走这里
+                if method not in ("qwen_vl", "claude_vision"):
+                    logger.warning(f"[OCR] 未知方式: {method}，回退到 qwen_vl")
                 text = _call_qwen_vl_ocr(str(full_path))
 
-            # 失败时依次回退
-            if not text and method != "qwen_vl":
-                logger.info(f"[OCR] {method} 失败，回退到 qwen_vl")
+            # 主方式失败时互相回退
+            if not text and method == "claude_vision":
+                logger.info("[OCR] claude_vision 失败，回退到 qwen_vl")
                 text = _call_qwen_vl_ocr(str(full_path))
-            if not text and method != "claude_vision":
-                logger.info(f"[OCR] 回退到 claude_vision")
+            elif not text and method == "qwen_vl":
+                logger.info("[OCR] qwen_vl 失败，回退到 claude_vision")
                 text = _call_claude_vision_ocr(str(full_path))
 
             if text and text.strip():

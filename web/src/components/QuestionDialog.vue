@@ -89,7 +89,13 @@ const scoreEmoji = computed(() => {
 })
 
 watch(visible, (v) => {
-  if (!v) { myAnswer.value = ''; evalResult.value = null; showAnswer.value = false }
+  if (v) {
+    showAnswer.value = !!standardAnswer.value  // 默认打开标准答案
+  } else {
+    myAnswer.value = ''
+    evalResult.value = null
+    showAnswer.value = false
+  }
 })
 
 const submit = async () => {
