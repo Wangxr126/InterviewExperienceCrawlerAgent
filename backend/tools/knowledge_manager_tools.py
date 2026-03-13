@@ -19,39 +19,65 @@ logger = logging.getLogger(__name__)
 
 
 # ==============================================================================
-# 工具函数：生成 Embedding（调用 DashScope text-embedding-v3）
+# 工具函数：生成 Embedding（支持 DashScope / Ollama 本地）
 # ==============================================================================
+
+def _embed_dashscope(text: str) -> List[float]:
+    """DashScope 云端 API（需 API Key，可能欠费 Arrearage）"""
+    headers = {
+        "Authorization": f"Bearer {settings.embed_api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": settings.embed_model_name,
+        "input": text[:2048],
+        "encoding_format": "float"
+    }
+    resp = requests.post(
+        f"{settings.embed_base_url}/embeddings",
+        headers=headers,
+        json=payload,
+        timeout=15
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        return data["data"][0]["embedding"]
+    logger.warning(f"Embedding API 返回错误: {resp.status_code} {resp.text[:200]}")
+    return []
+
+
+def _embed_ollama(text: str) -> List[float]:
+    """
+    Ollama 本地 Embedding（无需 API Key）。
+    推荐模型：qwen3-embedding:0.6b（1024 维，与 Neo4j 兼容）
+    安装：ollama pull qwen3-embedding:0.6b
+    """
+    url = f"{settings.embed_ollama_url.rstrip('/')}/api/embed"
+    payload = {"model": settings.embed_model_name, "input": text[:2048]}
+    resp = requests.post(url, json=payload, timeout=30)
+    if resp.status_code == 200:
+        data = resp.json()
+        emb = data.get("embeddings")
+        if emb and isinstance(emb, list) and len(emb) > 0:
+            return emb[0]
+    logger.warning(f"Ollama Embedding 返回错误: {resp.status_code} {resp.text[:200]}")
+    return []
+
 
 def generate_embedding(text: str) -> List[float]:
     """
-    调用 DashScope 兼容模式生成文本向量（1024维）。
+    根据 EMBED_MODEL_TYPE 生成文本向量。
+    - dashscope: 阿里云 DashScope（1024 维）
+    - ollama: 本地 Ollama（推荐 qwen3-embedding:0.6b，1024 维）
     失败时返回空列表（查重/检索功能降级）。
     """
     if not text or not text.strip():
         return []
-
     try:
-        headers = {
-            "Authorization": f"Bearer {settings.embed_api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": settings.embed_model_name,
-            "input": text[:2048],   # 截断避免超长
-            "encoding_format": "float"
-        }
-        resp = requests.post(
-            f"{settings.embed_base_url}/embeddings",
-            headers=headers,
-            json=payload,
-            timeout=15
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data["data"][0]["embedding"]
-        else:
-            logger.warning(f"Embedding API 返回错误: {resp.status_code} {resp.text[:200]}")
-            return []
+        t = (settings.embed_model_type or "dashscope").lower().strip()
+        if t == "ollama":
+            return _embed_ollama(text)
+        return _embed_dashscope(text)
     except Exception as e:
         logger.error(f"generate_embedding 异常: {e}")
         return []
@@ -368,7 +394,10 @@ class BaseManager(Tool):
             # 2. 生成 Embedding
             embedding = generate_embedding(question)
 
-            # 3. 写入 Neo4j
+            # 3. 查重 + 写入 Neo4j + 维护知识图谱（变体边）
+            similar = None
+            if embedding and neo4j_service.available:
+                similar = neo4j_service.check_duplicate(embedding, threshold=0.85)
             neo4j_service.add_question(
                 q_id=q_id, text=question, answer=answer,
                 tags=tags, embedding=embedding,
@@ -381,6 +410,9 @@ class BaseManager(Tool):
                     "source_platform": source_platform
                 }
             )
+            if similar and neo4j_service.available and str(similar.get("id")) != q_id:
+                neo4j_service.link_variant(q_id, str(similar["id"]))
+                logger.info(f"🔗 [知识图谱] 建立变体边 {q_id} <-> {similar['id']}")
 
             # 4. 写入 SQLite questions 表
             sqlite_service.upsert_question(

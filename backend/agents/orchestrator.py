@@ -257,15 +257,34 @@ class InterviewSystemOrchestrator:
                          importance: float = 0.75,
                          event_type: str = "study_event",
                          session_id: str = "", **kw):
-        """情节记忆：答题经历写入 SQLite study_records（已由 submit_answer 确定性写入，此处为补充）"""
-        # study_records 已在 submit_answer 中确定性写入，这里只记录 debug
-        logger.debug(f"[情节记忆] user={user_id} event={event_type} len={len(content)}")
+        """情节记忆：写入 episodic_log 表，供召回或后续向量化"""
+        try:
+            sqlite_service.add_episodic_log(
+                user_id=user_id,
+                content=content,
+                importance=importance,
+                event_type=event_type,
+                session_id=session_id or kw.get("session_id", ""),
+                question_id=kw.get("question_id", ""),
+                score=kw.get("score"),
+            )
+        except Exception as e:
+            logger.warning(f"[情节记忆] 写入 episodic_log 失败: {e}")
 
     def _write_semantic(self, user_id: str, content: str,
                          importance: float = 0.85,
                          knowledge_type: str = "user_profile", **kw):
-        """语义记忆：用户画像写入 SQLite tag_mastery（已由 submit_answer 确定性写入）"""
-        logger.debug(f"[语义记忆] user={user_id} type={knowledge_type} len={len(content)}")
+        """语义记忆：写入 episodic_log（event_type=knowledge_type），与 tag_mastery 互补"""
+        try:
+            sqlite_service.add_episodic_log(
+                user_id=user_id,
+                content=content,
+                importance=importance,
+                event_type=f"semantic_{knowledge_type}",
+                session_id="",
+            )
+        except Exception as e:
+            logger.warning(f"[语义记忆] 写入 episodic_log 失败: {e}")
 
     def _write_working(self, user_id: str, content: str,
                         importance: float = 0.5, session_id: str = ""):
@@ -677,6 +696,8 @@ class InterviewSystemOrchestrator:
         full_content = ""  # 累积完整内容用于持久化
         chunk_count = 0   # 用于定期保存
         last_save_time = _time.time()
+        thinking_steps: List[dict] = []  # 累积推理过程，用于持久化（解决刷新后推理过程丢失）
+        current_step: dict = {}
         
         # 🔧 方案B：流式开始前先保存用户消息（确保至少用户问题被保存）
         try:
@@ -722,13 +743,46 @@ class InterviewSystemOrchestrator:
                     result = event.data.get("result") or ""
                     if result and not full_content.strip():
                         full_content = result
+                elif event.type.value == "step_start":
+                    current_step = {}
+                elif event.type.value == "tool_call_finish":
+                    tool_name = event.data.get("tool_name") or ""
+                    result = event.data.get("result") or ""
+                    if tool_name == "Thought":
+                        thought = result
+                        for prefix in ("已记录推理过程:", "推理:"):
+                            if thought.startswith(prefix):
+                                thought = thought[len(prefix):].strip()
+                                break
+                        current_step["thought"] = thought or result
+                    elif tool_name == "Finish":
+                        # 单步直接 Finish：无 Thought 时也记录一步，避免「只有一步的推理过程也没显示」
+                        if not thinking_steps and result:
+                            thinking_steps.append({
+                                "action": "📝 输出",
+                                "observation": (result[:300] + "…") if len(result) > 300 else result,
+                            })
+                    else:
+                        current_step["action"] = f"🔧 {tool_name}"
+                        current_step["observation"] = str(result)[:500]
+                    if current_step and tool_name != "Finish":
+                        last = thinking_steps[-1] if thinking_steps else None
+                        if last and last.get("thought") and not last.get("action"):
+                            last.update(current_step)
+                        else:
+                            thinking_steps.append(dict(current_step))
 
-            # 持久化完整内容
+            # 持久化完整内容 + 推理过程 + 耗时（解决刷新/切换页面后推理过程丢失）
+            duration_ms = int((_time.time() - start_time) * 1000)
             try:
                 self.interviewer.save_session(session_id)
                 if full_content.strip():
-                    sqlite_service.patch_last_assistant_content(session_id, full_content)
-                logger.debug(f"[chat_stream] 流式完成，最终保存 {len(full_content)} 字符")
+                    sqlite_service.patch_last_assistant_content(
+                        session_id, full_content,
+                        thinking=thinking_steps if thinking_steps else None,
+                        duration_ms=duration_ms,
+                    )
+                logger.debug(f"[chat_stream] 流式完成，最终保存 {len(full_content)} 字符, {len(thinking_steps)} 步推理, 耗时 {duration_ms}ms")
             except Exception as e:
                 logger.warning(f"[chat_stream] save_session 失败: {e}")
 

@@ -1,4 +1,4 @@
-﻿"""
+"""
 
 面经 Agent 后端 FastAPI 主入口
 
@@ -326,6 +326,7 @@ class SubmitAnswerRequest(BaseModel):
     question_id: Optional[str] = None
     question_text: Optional[str] = None
     user_answer: str
+    question_tags: Optional[List[str]] = None
 
 
 
@@ -525,6 +526,15 @@ def _extract_user_display_content(content: str) -> str:
     return after if after else content
 
 
+def _strip_internal_markers_for_display(content: str) -> str:
+    """移除用户消息中的内部标记（如【q_id:xxx】），不展示给用户"""
+    if not content:
+        return content
+    import re
+    # 移除 【q_id:uuid】 格式
+    return re.sub(r'【q_id:[^\】]+】', '', content).replace('  ', ' ').strip()
+
+
 @app.get("/api/user/{user_id}/chat/history")
 
 def get_chat_history(user_id: str):
@@ -545,19 +555,27 @@ def get_chat_history(user_id: str):
         if m.get("content"):
             role = m.get("role", "user")
             content = m.get("content", "")
-            # 用户消息：只展示用户实际输入，不展示 [系统][Task][Output] 等后端格式
+            # 用户消息：只展示用户实际输入，不展示 [系统][Task][Output] 等后端格式；移除【q_id:xxx】等内部标记
             if role == "user":
                 content = _extract_user_display_content(content)
+                content = _strip_internal_markers_for_display(content)
             
             timestamp = m.get("timestamp") or m.get("ts")
             if not timestamp:
-                timestamp = datetime.fromtimestamp(base_time - (len(history) - idx) * 2).isoformat()
+                # 为历史消息生成近似时间戳，避免前端时间丢失
+                timestamp = datetime.fromtimestamp(base_time - (len(history) - idx) * 60).isoformat()
             
-            messages.append({
+            msg = {
                 "role": role,
                 "content": content,
                 "timestamp": timestamp
-            })
+            }
+            if role == "assistant":
+                if m.get("thinking"):
+                    msg["thinking"] = m["thinking"]
+                if m.get("duration_ms") is not None:
+                    msg["duration_ms"] = m["duration_ms"]
+            messages.append(msg)
     
     return {"session_id": session["session_id"], "messages": messages}
 
@@ -603,6 +621,7 @@ def get_questions(
     page_size: int = Query(20, ge=1, le=100, description="每页题目数量"),
     sort_by: Optional[str] = Query(None, description="排序字段：created_at/difficulty/company/question_type/question_text"),
     sort_order: Optional[str] = Query(None, description="排序方向：asc/desc"),
+    user_id: Optional[str] = Query(None, description="用户ID，传入时在题目中附加该用户最近作答得分"),
 ):
     """
     题库浏览接口（纯 SQL 过滤，不调用 LLM）。
@@ -647,6 +666,16 @@ def get_questions(
             r["topic_tags"] = _json.loads(r.get("topic_tags") or "[]")
         except Exception:
             r["topic_tags"] = []
+
+    # 附加用户作答评分记录（最近一次得分）
+    if user_id and results:
+        q_ids = [r.get("q_id") for r in results if r.get("q_id")]
+        scores_map = sqlite_service.get_latest_scores_for_questions(user_id, q_ids)
+        for r in results:
+            qid = r.get("q_id")
+            if qid and qid in scores_map:
+                r["last_score"] = scores_map[qid]["score"]
+                r["last_studied_at"] = scores_map[qid]["studied_at"]
 
     return {
         "total": total,
@@ -839,7 +868,19 @@ def get_question_detail(q_id: str):
     return q
 
 
-
+@app.get("/api/posts/{crawl_task_id}")
+def get_post_by_crawl_task_id(crawl_task_id: int):
+    """根据 crawl_task_id（crawl_tasks.id）获取原帖子信息，用于「查看原帖」"""
+    import sqlite3
+    with sqlite3.connect(sqlite_service.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, task_id, source_url, source_platform, post_title, company, position FROM crawl_tasks WHERE id = ?",
+            (crawl_task_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="帖子不存在")
+    return dict(row)
 
 
 # ══════════════════════════════════════════════════════
@@ -1048,19 +1089,12 @@ async def api_submit_answer(req: SubmitAnswerRequest):
     try:
 
         result = await orchestrator.submit_answer(
-
             user_id=req.user_id,
-
-            session_id=req.session_id,
-
+            session_id=req.session_id or f"sess_{int(__import__('time').time()*1000)}",
             question_id=req.question_id,
-
             question_text=req.question_text,
-
             user_answer=req.user_answer,
-
-            question_tags=req.question_tags
-
+            question_tags=req.question_tags or []
         )
 
         return result
@@ -1123,18 +1157,18 @@ def get_user_mastery(user_id: str):
 
     profile = sqlite_service.get_user_profile(user_id)
 
+    # 兼容前端 ReportView 期望的字段（total_answered, mastered_count）
+    total = (summary or {}).get("total_questions_practiced", 0)
+    rate = (summary or {}).get("correct_rate", 0) or 0
+    correct = int(total * rate / 100) if total else 0
     return {
-
         "user_id": user_id,
-
         "profile": profile,
-
         "mastery_summary": summary,
-
         "weak_tags": weak_tags,
-
-        "recent_history": history
-
+        "recent_history": history,
+        "total_answered": total,
+        "mastered_count": correct,
     }
 
 

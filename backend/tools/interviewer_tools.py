@@ -47,10 +47,8 @@ class RecallMemoryTool(Tool):
             name="recall_memory",
             description=(
                 "召回当前用户的背景信息：技术栈、目标公司、薄弱标签、最近做题情况。"
-                "在以下场景必须首先调用："
-                "① 对话开始/用户第一条消息；"
-                "② 话题切换时；"
-                "③ 推荐题目前，需了解用户薄弱点。"
+                "在以下场景调用：① 对话开始/用户第一条消息；② 话题切换时；③ 推荐题目前，需了解用户薄弱点。"
+                "**禁止**在用户说「我想练习这道题：XXX」或「我想练习这道题【q_id:xxx】：...」时调用（用户已指定题目，无需召回）。"
             ),
         )
 
@@ -96,11 +94,9 @@ class GetRecommendedQuestionTool(Tool):
             name="get_recommended_question",
             description=(
                 "为用户推荐一道面试题。推荐策略（按优先级）："
-                "① 遗忘曲线到期的复习题；"
-                "② 用户薄弱标签（novice/learning）的新题；"
-                "③ 按 topic 随机一道未做过的题。"
+                "① 遗忘曲线到期的复习题；② 用户薄弱标签的新题；③ 按 topic 随机一道未做过的题。"
                 "用户说'出一道题'/'来一题'/'考我XX'/'练习XX'时调用。"
-                "topic 参数指定知识点；difficulty 过滤难度。"
+                "**禁止**在用户说「我想练习这道题：XXX」或「我想练习这道题【q_id:xxx】：...」时调用（用户已指定题目，直接格式化输出即可）。"
             ),
         )
 
@@ -214,10 +210,10 @@ class FindSimilarQuestionsTool(Tool):
         super().__init__(
             name="find_similar_questions",
             description=(
-                "找与题目相似/换个问法的题目，或按题目描述搜索。"
-                "① 用户说'换一道'/'换个问法'/'类似的题'→ 传入 question_text（从对话历史提取上一道题）+ exclude_id；"
-                "② 用户说'我想练习这道题：XXX'/'找跨域相关的题'→ 传入 question_text=XXX（题目描述/关键词），无需 exclude_id。"
-                "优先 Neo4j 变体关系；无 exclude_id 时按 keyword 直接搜索 SQLite。"
+                "找与题目语义最相近的题目（默认返回3道），或换个问法。"
+                "① 用户说'换一道'/'换个问法'/'类似的题'→ 必须传入 question_text + exclude_id（从对话中【q_id:xxx】提取，按题目编号排除自身）；"
+                "② 用户说'我想练习这道题：XXX'（无 q_id）→ 传入 question_text=XXX，exclude_id 留空。"
+                "过滤依据：exclude_id 对应向量/题库 meta 中的题目编号，不按文本相似度排除。"
             ),
         )
 
@@ -228,7 +224,7 @@ class FindSimilarQuestionsTool(Tool):
             ToolParameter("exclude_id", "string",
                           "要排除的题目 ID（换个问法时用，按描述搜题时留空）", required=False),
             ToolParameter("limit", "integer",
-                          "返回数量，默认3，最多5", required=False),
+                          "返回数量，默认3（语义最相近的3道），最多5", required=False),
         ]
 
     def run(self, parameters):
@@ -241,17 +237,44 @@ class FindSimilarQuestionsTool(Tool):
             results = []
             exclude_ids = [exclude_id] if exclude_id else []
 
-            # 场景1：有 exclude_id → 找相似/变体题（换个问法）
-            if exclude_id and neo4j_service.available:
-                results = neo4j_service.get_variants(exclude_id)
+            # 场景0：优先向量语义检索（Neo4j 可用时，返回语义最相近的 limit 道，且排除自身）
+            if neo4j_service.available:
+                try:
+                    from backend.tools.knowledge_manager_tools import generate_embedding
+                    emb = generate_embedding(question_text[:2048])
+                    if emb:
+                        vec_results = neo4j_service.search_similar(
+                            emb, top_k=limit + len(exclude_ids),
+                            score_threshold=0.5, exclude_ids=exclude_ids
+                        )
+                        if vec_results:
+                            for rec in vec_results[:limit]:
+                                results.append({
+                                    "q_id": str(rec["id"]),
+                                    "question_text": rec.get("text", ""),
+                                    "difficulty": rec.get("difficulty", "medium"),
+                                    "topic_tags": rec.get("tags", []) if isinstance(rec.get("tags"), list) else [],
+                                    "company": rec.get("company", ""),
+                                    "similarity_score": round(rec.get("score", 0), 3),
+                                })
+                except Exception as e:
+                    logger.debug("向量检索降级: %s", e)
 
-            # 场景2：无 exclude_id 或 Neo4j 无结果 → 按 question_text 作为 keyword 搜索
-            # 用户说「我想练习这道题：跨域的概念...」时，直接用 keyword 搜题
+            # 场景1：无向量结果时，有 exclude_id → 用 Neo4j 变体关系
+            if not results and exclude_id and neo4j_service.available:
+                results = neo4j_service.get_variants(exclude_id)
+                results = [
+                    {"q_id": str(r["id"]), "question_text": r.get("text", ""),
+                     "difficulty": r.get("difficulty", "medium"),
+                     "topic_tags": [], "company": ""}
+                    for r in results
+                ][:limit]
+
+            # 场景2：按 keyword 搜索（SQLite），按 exclude_ids 过滤（题目编号）
             if not results:
-                # 用题目描述/关键词搜索（支持「按描述练习」场景）
                 sq = sqlite_service.filter_questions(
                     keyword=question_text[:80] if len(question_text) > 20 else question_text,
-                    limit=limit + len(exclude_ids),
+                    limit=limit + 10,
                 )
                 results = [
                     {"q_id": str(r["q_id"]),
@@ -263,7 +286,7 @@ class FindSimilarQuestionsTool(Tool):
                     if str(r["q_id"]) not in exclude_ids
                 ][:limit]
 
-            # 场景3：有 exclude_id 且 Neo4j 无结果 → 按相同标签兜底
+            # 场景3：有 exclude_id 且仍无结果 → 按相同标签兜底
             if not results and exclude_id:
                 tags = []
                 sq = sqlite_service.filter_questions(
@@ -272,7 +295,7 @@ class FindSimilarQuestionsTool(Tool):
                     tags = json.loads(sq[0].get("topic_tags") or "[]")
                 if tags:
                     sim = sqlite_service.filter_questions(
-                        tags=tags[:2], limit=limit + 1)
+                        tags=tags[:2], limit=limit + 5)
                     results = [
                         {"q_id": str(r["q_id"]),
                          "question_text": r["question_text"],
@@ -374,10 +397,10 @@ class SubmitAnswerTool(Tool):
                 "用户提交答案后调用：① 用 LLM 对答案评分（0-5分）并生成反馈；"
                 "② 将得分写入 study_records（触发 SM-2 遗忘曲线更新）；"
                 "③ 更新该题相关标签的掌握度。"
-                "必须传入 question_id（题目ID）和 user_answer（用户答案）；"
+                "必须传入 question_id（题目ID，从【q_id:xxx】提取）和 user_answer（用户答案，从【我的作答】提取）；"
                 "可选 question_text/answer_text 用于评分时提供上下文；"
                 "可选 session_id 关联当前会话。"
-                "在用户说'我的答案是...'或直接作答后调用。"
+                "当用户发送【已作答】格式（含【q_id:xxx】【我的作答】yyy）时，必须调用此工具。"
             ),
         )
 
@@ -585,6 +608,7 @@ class GetSessionContextTool(Tool):
             description=(
                 "读取本次会话统计：已做题数、已练标签、会话进度。"
                 "用户问「做了几道」「会话进度」「今天练了几题」时调用。"
+                "**禁止**在出题场景（如「我想练习这道题」）调用。"
             ),
         )
 
@@ -633,9 +657,9 @@ class GetMasteryReportTool(Tool):
             name="get_mastery_report",
             description=(
                 "生成用户当前的知识点掌握度报告。"
-                "包含：各级别标签统计（expert/proficient/learning/novice）、"
-                "整体正确率、总做题数、薄弱点列表、具体薄弱题目、推荐复习题目。"
+                "包含：各级别标签统计、整体正确率、薄弱点列表、推荐复习题目。"
                 "用户说'我的掌握情况'/'复习报告'/'哪些地方还不熟'/'推荐我复习什么'时调用。"
+                "**禁止**在出题场景（如「我想练习这道题」）调用。"
             ),
         )
 
@@ -719,8 +743,8 @@ class GetKnowledgeRecommendationTool(Tool):
             name="get_knowledge_recommendation",
             description=(
                 "根据用户薄弱标签推荐学习资源（文章/视频/题集）。"
-                "可选 tags 指定关注的知识点；留空则自动取薄弱标签。"
                 "用户说'推荐资料'/'怎么学XX'/'给我推荐学习资源'时调用。"
+                "**禁止**在出题场景（如「我想练习这道题」）调用。"
             ),
         )
 

@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_msg_for_message(msg: dict) -> dict:
-    """将存储格式转为 Message.from_dict 兼容格式"""
+    """将存储格式转为 Message.from_dict 兼容格式，保留 thinking/duration_ms 供前端展示"""
     role = msg.get("role") or "user"
     content = msg.get("content") or ""
     ts = msg.get("timestamp") or msg.get("ts")
@@ -35,21 +35,31 @@ def _normalize_msg_for_message(msg: dict) -> dict:
         out["timestamp"] = ts
     if msg.get("metadata"):
         out["metadata"] = msg.get("metadata")
+    # 保留推理过程与耗时，供 get_chat_history 返回给前端
+    if msg.get("thinking"):
+        out["thinking"] = msg["thinking"]
+    if msg.get("duration_ms") is not None:
+        out["duration_ms"] = msg["duration_ms"]
     return out
 
 
 def _message_to_storage(msg: Any) -> dict:
-    """Message 转为存储格式（兼容现有 conversation_history）"""
+    """Message 转为存储格式（兼容现有 conversation_history），含 thinking/duration_ms"""
     if hasattr(msg, "to_dict"):
         d = msg.to_dict()
     else:
         d = dict(msg) if isinstance(msg, dict) else {}
-    return {
+    out = {
         "role": d.get("role", "user"),
         "content": d.get("content", ""),
         "timestamp": d.get("timestamp"),
         "ts": d.get("timestamp") or datetime.now().isoformat(),
     }
+    if d.get("thinking"):
+        out["thinking"] = d["thinking"]
+    if d.get("duration_ms") is not None:
+        out["duration_ms"] = d["duration_ms"]
+    return out
 
 
 class SqliteSessionStore:
@@ -90,6 +100,23 @@ class SqliteSessionStore:
 
         # 转为 conversation_history 格式
         history_data = [_message_to_storage(m) for m in history]
+
+        # 合并已有推理过程：save_session 会覆盖整段 history，需保留旧消息的 thinking
+        try:
+            session = self._sqlite.get_session(session_id)
+            old_history = session.get("conversation_history") or []
+            assistant_indices = [i for i, m in enumerate(history_data) if m.get("role") == "assistant"]
+            old_assistant_indices = [i for i, m in enumerate(old_history) if (m or {}).get("role") == "assistant"]
+            for ki, idx in enumerate(assistant_indices):
+                if ki < len(old_assistant_indices):
+                    old_idx = old_assistant_indices[ki]
+                    old_msg = old_history[old_idx] if isinstance(old_history[old_idx], dict) else {}
+                    if old_msg.get("thinking") and not history_data[idx].get("thinking"):
+                        history_data[idx]["thinking"] = old_msg["thinking"]
+                    if old_msg.get("duration_ms") is not None and history_data[idx].get("duration_ms") is None:
+                        history_data[idx]["duration_ms"] = old_msg["duration_ms"]
+        except Exception as e:
+            logger.debug(f"[SqliteSessionStore] 合并 thinking 时忽略: {e}")
 
         # session_meta：hello_agents 扩展字段
         session_meta = {

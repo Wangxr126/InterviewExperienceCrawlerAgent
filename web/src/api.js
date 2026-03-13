@@ -37,6 +37,7 @@ export const api = {
     if (params.page_size != null) p.set('page_size', String(params.page_size))
     if (params.sort_by) p.set('sort_by', params.sort_by)
     if (params.sort_order) p.set('sort_order', params.sort_order)
+    if (params.user_id) p.set('user_id', params.user_id)
     const r = await fetch(`${BASE}/api/questions?${p}`)
     return r.json()
   },
@@ -48,7 +49,12 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     })
-    return r.json()
+    const data = await r.json()
+    if (!r.ok) {
+      const msg = data?.detail || (typeof data?.detail === 'string' ? data.detail : JSON.stringify(data))
+      throw new Error(msg)
+    }
+    return data
   },
 
   // ── 对话（普通，用于兜底）──────────────────────────────

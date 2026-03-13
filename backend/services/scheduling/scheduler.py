@@ -296,7 +296,8 @@ def _process_pending_tasks(batch_size: int = None):
             # 提取到题目 → 入库
             if questions:
                 extraction_src = "image" if image_paths and not raw_content.strip() else "content"
-                count = _save_questions(questions)
+                crawl_task_id = row["id"] if "id" in row.keys() else None
+                count = _save_questions(questions, crawl_task_id=crawl_task_id)
                 _dur = round(time.time()-_t0, 1)
                 sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round(_dur/60, 2))
                 logger.info(f"  ✅ 提取完成: {count} 道题目入库，耗时 {_dur/60:.1f}min")
@@ -422,7 +423,8 @@ def process_single_task(task_id: str) -> Dict:
 
     if questions:
         extraction_src = "image" if image_paths and not raw_content.strip() else "content"
-        count = _save_questions(questions)
+        crawl_task_id = task.get("id") if isinstance(task, dict) else None
+        count = _save_questions(questions, crawl_task_id=crawl_task_id)
         sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool)
         logger.info(f"[SingleTask] 完成 task_id={task_id}: {count} 道题目入库, ocr_called={agent_used_tool}")
         return {
@@ -447,10 +449,11 @@ def _get_embedding(text: str) -> Optional[List[float]]:
         return None
 
 
-def _save_questions(questions: List[Dict]) -> int:
+def _save_questions(questions: List[Dict], crawl_task_id: Optional[int] = None) -> int:
     """
     将提取的题目写入 SQLite（主存储）+ Neo4j（知识图谱，可选）。
     Neo4j 不可用时静默跳过，不影响 SQLite 入库。
+    crawl_task_id: 关联 crawl_tasks.id，便于根据帖子 id 查原帖。
     返回成功入库数量。
     """
     saved = 0
@@ -472,8 +475,8 @@ def _save_questions(questions: List[Dict]) -> int:
                     INSERT OR IGNORE INTO questions
                         (q_id, question_text, answer_text, difficulty, question_type,
                          source_platform, source_url, company, position, business_line,
-                         topic_tags, extraction_source, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                         topic_tags, extraction_source, crawl_task_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """, (
                     q["q_id"], q["question_text"], q.get("answer_text", ""),
                     q.get("difficulty", "medium"), q.get("question_type", "技术题"),
@@ -481,13 +484,15 @@ def _save_questions(questions: List[Dict]) -> int:
                     q.get("company", ""), q.get("position", ""), q.get("business_line", ""),
                     json.dumps(tags, ensure_ascii=False),
                     extraction_source,
+                    crawl_task_id,
                 ))
                 conn.commit()
 
-            # ── Neo4j（知识图谱 + 向量索引，可选）─────────
+            # ── Neo4j（知识图谱 + 向量索引 + 变体边维护）─────────
             if neo4j_service.available:
                 embedding = _get_embedding(q["question_text"])
                 if embedding:
+                    similar = neo4j_service.check_duplicate(embedding, threshold=0.85)
                     neo4j_service.add_question(
                         q_id=q["q_id"],
                         text=q["question_text"],
@@ -503,6 +508,9 @@ def _save_questions(questions: List[Dict]) -> int:
                             "source": q.get("source_url", ""),
                         }
                     )
+                    if similar and str(similar.get("id")) != str(q["q_id"]):
+                        neo4j_service.link_variant(q["q_id"], str(similar["id"]))
+                        logger.debug(f"🔗 [知识图谱] 变体边 {q['q_id']} <-> {similar['id']}")
                 else:
                     logger.debug(f"跳过 Neo4j 写入（无法生成 embedding）: {q['q_id']}")
 

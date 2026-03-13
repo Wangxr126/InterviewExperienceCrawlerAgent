@@ -30,8 +30,10 @@
       <main class="content">
         <!-- 使用 v-show 保持各视图状态，避免切换时重新挂载 -->
         <BrowseView  v-show="currentView === 'browse'" :meta="meta"
+                     :user-id="userId"
                      :is-active="currentView === 'browse'"
-                     @send-to-chat="onSendToChat" />
+                     @send-to-chat="onSendToChat"
+                     @submit-complete="onSubmitComplete" />
         <ChatView    v-show="currentView === 'chat'"   ref="chatViewRef"
                      :user-id="userId" :is-active="currentView === 'chat'" />
         <IngestView  v-show="currentView === 'ingest'" :user-id="userId"
@@ -103,37 +105,51 @@ const loadConfig = async () => {
   if (!userId.value) userId.value = 'user_001'
 }
 
-// 发送到对话：切换视图并预填消息
+// 提交作答：跳转 chat，屏幕只展示题目+作答，完整信息（q_id、公司、难度、标签等）发给 AI
+const onSubmitComplete = ({ question, userAnswer }) => {
+  const displayParts = []
+  displayParts.push(`题目：${question?.question_text || ''}`)
+  displayParts.push(`我的作答：${userAnswer || ''}`)
+  const displayMsg = displayParts.join('\n')
+
+  const apiParts = []
+  apiParts.push(`【已作答】题目：${question?.question_text || ''}【q_id:${question?.q_id || ''}】`)
+  const meta = []
+  if (question?.company) meta.push(`公司：${question.company}`)
+  if (question?.difficulty) meta.push(`难度：${question.difficulty === 'easy' ? '简单' : question.difficulty === 'hard' ? '困难' : '中等'}`)
+  if (question?.topic_tags?.length) meta.push(`标签：${question.topic_tags.join('、')}`)
+  if (meta.length) apiParts.push(`【题目信息】${meta.join(' | ')}`)
+  apiParts.push(`【我的作答】${userAnswer || ''}`)
+  const apiMsg = apiParts.join('\n')
+
+  currentView.value = 'chat'
+  nextTick(() => {
+    setTimeout(() => {
+      chatViewRef.value?.prefillAndSend({ display: displayMsg, api: apiMsg })
+    }, 200)
+  })
+}
+
+// 发送到对话：切换视图并预填消息。屏幕只展示题目，q_id 等内部信息不展示给用户
 const onSendToChat = ({ question }) => {
-  // 安全检查
   if (!question) {
     ElMessage.error('题目数据为空')
-    console.error('❌ question 为空')
     return
   }
-  
   if (!question.question_text) {
     ElMessage.error('题目内容缺失')
-    console.error('❌ question.question_text 不存在，question:', question)
     return
   }
-  
-  console.log('✅ 切换到对话页面，题目:', question.question_text.slice(0, 30))
+  const displayMsg = `我想练习这道题：${question.question_text}`
+  const apiMsg = `我想练习这道题【q_id:${question.q_id}】：${question.question_text}`
   currentView.value = 'chat'
-  
-  // 使用 nextTick + setTimeout 确保 ChatView 已完全激活
   nextTick(() => {
     setTimeout(() => {
       if (!chatViewRef.value) {
         ElMessage.error('对话组件未就绪，请稍后再试')
-        console.error('❌ chatViewRef.value 为 null')
         return
       }
-      
-      console.log('✅ 调用 prefillAndSend')
-      chatViewRef.value.prefillAndSend(
-        `我想练习这道题：${question.question_text.slice(0, 50)}`
-      )
+      chatViewRef.value.prefillAndSend({ display: displayMsg, api: apiMsg })
     }, 200)
   })
 }

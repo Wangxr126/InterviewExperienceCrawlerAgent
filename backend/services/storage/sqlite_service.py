@@ -148,6 +148,20 @@ class SqliteService:
                 crawled_at          DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """,
+            # ── 情节记忆日志（答题/收录等事件摘要，可扩展为向量检索）──
+            """
+            CREATE TABLE IF NOT EXISTS episodic_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                importance  REAL DEFAULT 0.75,
+                event_type  TEXT DEFAULT 'study_event',
+                session_id  TEXT,
+                question_id TEXT,
+                score       INTEGER,
+                created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
             # ── 入库日志 ──
             """
             CREATE TABLE IF NOT EXISTS ingestion_logs (
@@ -233,6 +247,9 @@ class SqliteService:
             qcols = [r[1] for r in conn.execute("PRAGMA table_info(questions)").fetchall()]
             if "extraction_source" not in qcols:
                 conn.execute("ALTER TABLE questions ADD COLUMN extraction_source TEXT DEFAULT 'content'")
+            # 迁移：为 questions 表添加 crawl_task_id，关联 crawl_tasks.id，便于根据帖子 id 查原帖
+            if "crawl_task_id" not in qcols:
+                conn.execute("ALTER TABLE questions ADD COLUMN crawl_task_id INTEGER")
             # 迁移：为 crawl_tasks 添加 agent_used_tool 列（MinerAgent 是否进行了工具调用）
             if "agent_used_tool" not in cols:
                 conn.execute("ALTER TABLE crawl_tasks ADD COLUMN agent_used_tool INTEGER DEFAULT 0")
@@ -612,6 +629,21 @@ class SqliteService:
             """, (user_id, now, limit))
             return [dict(row) for row in cursor.fetchall()]
 
+    def add_episodic_log(self, user_id: str, content: str,
+                         importance: float = 0.75,
+                         event_type: str = "study_event",
+                         session_id: str = "",
+                         question_id: str = "",
+                         score: int = None) -> None:
+        """写入情节记忆日志（答题/收录等事件摘要），供后续召回或向量化"""
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT INTO episodic_log
+                    (user_id, content, importance, event_type, session_id, question_id, score)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (user_id, content[:2000], importance, event_type, session_id or "", question_id or "", score))
+            conn.commit()
+
     def get_study_history(self, user_id: str, limit: int = 20) -> List[Dict]:
         """获取用户做题历史"""
         with self._get_conn() as conn:
@@ -623,6 +655,26 @@ class SqliteService:
                 ORDER BY sr.studied_at DESC LIMIT ?
             """, (user_id, limit))
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_latest_scores_for_questions(self, user_id: str, question_ids: List[str]) -> Dict[str, Dict]:
+        """获取指定题目列表下，用户最近一次作答的得分。返回 {q_id: {score, studied_at}}"""
+        if not question_ids or not user_id:
+            return {}
+        placeholders = ",".join("?" * len(question_ids))
+        params = [user_id] + list(question_ids) + [user_id] + list(question_ids)
+        with self._get_conn() as conn:
+            cursor = conn.execute(f"""
+                SELECT sr.question_id, sr.score, sr.studied_at
+                FROM study_records sr
+                INNER JOIN (
+                    SELECT question_id, MAX(studied_at) as max_at
+                    FROM study_records
+                    WHERE user_id = ? AND question_id IN ({placeholders})
+                    GROUP BY question_id
+                ) latest ON sr.question_id = latest.question_id AND sr.studied_at = latest.max_at
+                WHERE sr.user_id = ? AND sr.question_id IN ({placeholders})
+            """, params)
+            return {row["question_id"]: {"score": row["score"], "studied_at": row["studied_at"]} for row in cursor.fetchall()}
 
     # ===========================================================
     # interview_sessions 表操作
@@ -730,8 +782,14 @@ class SqliteService:
             s["weak_tags"] = json.loads(s.get("weak_tags") or "[]")
             return s
 
-    def patch_last_assistant_content(self, session_id: str, full_content: str):
-        """将最后一条 assistant 消息的 content 替换为完整内容（解决刷新后代码块等丢失）"""
+    def patch_last_assistant_content(
+        self,
+        session_id: str,
+        full_content: str,
+        thinking: Optional[List[dict]] = None,
+        duration_ms: Optional[int] = None,
+    ):
+        """将最后一条 assistant 消息的 content 替换为完整内容，并可选保存推理过程、耗时"""
         with self._get_conn() as conn:
             row = conn.execute(
                 "SELECT conversation_history FROM interview_sessions WHERE session_id = ?",
@@ -743,7 +801,13 @@ class SqliteService:
             for i in range(len(history) - 1, -1, -1):
                 if history[i].get("role") == "assistant":
                     history[i]["content"] = full_content
-                    history[i]["ts"] = now_beijing().isoformat()
+                    ts = now_beijing().isoformat()
+                    history[i]["ts"] = ts
+                    history[i]["timestamp"] = ts  # 双写，确保前端能读取
+                    if thinking is not None and len(thinking) > 0:
+                        history[i]["thinking"] = thinking
+                    if duration_ms is not None:
+                        history[i]["duration_ms"] = duration_ms
                     break
             conn.execute(
                 "UPDATE interview_sessions SET conversation_history = ? WHERE session_id = ?",

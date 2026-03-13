@@ -80,6 +80,9 @@
             </div>
           </div>
           <div class="q-meta">
+            <span v-if="q.last_score != null" class="score-chip" :class="q.last_score >= 3 ? 'score-ok' : 'score-low'">
+              📝 {{ q.last_score }}/5
+            </span>
             <span v-if="q.company" class="meta-chip">🏢 {{ q.company }}</span>
             <span v-if="q.position" class="meta-chip">💼 {{ q.position }}</span>
             <span v-if="q.source_platform" class="meta-chip">{{ platformLabel(q.source_platform) }}</span>
@@ -116,7 +119,9 @@
 
     <!-- 题目详情弹窗 -->
     <QuestionDialog v-model="dialogVisible" :question="selectedQ"
-                    @send-to-chat="handleSendToChat" />
+                    :user-id="userId"
+                    @send-to-chat="handleSendToChat"
+                    @submit-complete="handleSubmitComplete" />
   </div>
 </template>
 
@@ -129,9 +134,10 @@ import QuestionDialog from '../components/QuestionDialog.vue'
 
 const props = defineProps({
   meta: { type: Object, default: () => ({}) },
-  isActive: { type: Boolean, default: false }
+  isActive: { type: Boolean, default: false },
+  userId: { type: String, default: 'user_001' },
 })
-const emit = defineEmits(['send-to-chat'])
+const emit = defineEmits(['send-to-chat', 'submit-complete'])
 
 const filters = reactive({ question_type: '', company: '', difficulty: '', tag: '', keyword: '', source_platform: '' })
 const pagination = reactive({ page: 1, pageSize: 20, total: 0, totalPages: 1 })
@@ -178,6 +184,7 @@ const loadQuestions = async (page = pagination.page) => {
       page_size: pagination.pageSize,
       sort_by: sortBy.value,
       sort_order: sortOrder.value,
+      user_id: props.userId || undefined,
     })
     console.log(`📖 后端返回: total=${d.total}, page=${d.page}, total_pages=${d.total_pages}, questions=${d.questions?.length}`)
     questions.value = d.questions || []
@@ -215,7 +222,7 @@ const onPageSizeChange = () => {
 const loadRandom = async () => {
   loading.value = true
   try {
-    const d = await api.getQuestions({ ...filters, rand: true })
+    const d = await api.getQuestions({ ...filters, rand: true, user_id: props.userId || undefined })
     questions.value = d.questions || []
     pagination.total = d.total ?? 0
     pagination.totalPages = 1
@@ -240,9 +247,11 @@ const openDialog = (q) => {
 }
 
 const handleSendToChat = (event) => {
-  console.log('🟢 BrowseView: 收到 send-to-chat 事件')
-  console.log('🟢 event:', event)
   emit('send-to-chat', event)
+}
+
+const handleSubmitComplete = (payload) => {
+  emit('submit-complete', payload)
 }
 
 onMounted(() => loadQuestions(1))
@@ -357,6 +366,9 @@ watch(() => props.isActive, (newVal, oldVal) => {
 .q-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .meta-chip { font-size: 11px; background: var(--primary-light); color: var(--primary);
              padding: 2px 8px; border-radius: 10px; }
+.score-chip { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
+.score-chip.score-ok  { background: #dcfce7; color: #166534; }
+.score-chip.score-low { background: #fee2e2; color: #991b1b; }
 .tag-chip  { font-size: 11px; background: #f0fdf4; color: #166534;
              padding: 2px 8px; border-radius: 10px; }
 .empty-state { text-align: center; padding: 60px 20px; color: var(--text-sub); }

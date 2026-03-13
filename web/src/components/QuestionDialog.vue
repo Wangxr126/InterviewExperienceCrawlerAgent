@@ -25,11 +25,15 @@
                   placeholder="输入你的回答..." />
       </div>
 
+      <div class="section">
+        <div class="section-title">得分</div>
+        <div class="score-display">{{ evalResult ? `${evalResult.score}/5` : '—/5' }} <span v-if="evalResult" class="score-emoji">{{ scoreEmoji }}</span></div>
+      </div>
+
       <div v-if="evalResult" class="eval-result" :class="evalResult.score >= 3 ? 'good' : 'bad'">
-        <div class="eval-score">得分：{{ evalResult.score }}/5 {{ scoreEmoji }}</div>
         <div class="eval-feedback" v-html="formattedFeedbackHtml"></div>
-        <div v-if="evalResult.missing_points?.length" class="eval-missing">
-          <strong>遗漏点：</strong>{{ evalResult.missing_points.join('、') }}
+        <div v-if="(evalResult.missed_points || evalResult.missing_points)?.length" class="eval-missing">
+          <strong>遗漏点：</strong>{{ (evalResult.missed_points || evalResult.missing_points || []).join('、') }}
         </div>
       </div>
     </template>
@@ -57,11 +61,10 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { api } from '../api.js'
 import { formatAnswerToHtml } from '../utils/formatAnswer.js'
 
-const props  = defineProps({ modelValue: Boolean, question: Object })
-const emit   = defineEmits(['update:modelValue', 'send-to-chat'])
+const props  = defineProps({ modelValue: Boolean, question: Object, userId: { type: String, default: 'user_001' }, sessionId: { type: String, default: '' } })
+const emit   = defineEmits(['update:modelValue', 'send-to-chat', 'submit-complete'])
 const visible = computed({
   get: () => props.modelValue,
   set: (v) => emit('update:modelValue', v)
@@ -98,21 +101,15 @@ watch(visible, (v) => {
   }
 })
 
-const submit = async () => {
+const submit = () => {
   if (!myAnswer.value.trim()) { ElMessage.warning('请先输入你的答案'); return }
+  if (!props.question?.q_id) { ElMessage.warning('题目 ID 缺失，无法记录'); return }
   submitting.value = true
+  evalResult.value = null
   try {
-    const r = await api.submitAnswer({
-      user_id: 'user_001',
-      session_id: `sess_${Date.now()}`,
-      question_id: props.question.q_id,
-      question_text: props.question.question_text,
-      user_answer: myAnswer.value,
-      question_tags: props.question.topic_tags || [],
-    })
-    evalResult.value = r
-  } catch {
-    ElMessage.error('提交失败')
+    const userAnswer = myAnswer.value.trim()
+    visible.value = false
+    emit('submit-complete', { question: props.question, userAnswer })
   } finally {
     submitting.value = false
   }
@@ -168,4 +165,6 @@ const handleSendToChat = () => {
 .eval-feedback :deep(.answer-line) { margin-bottom: 6px; }
 .eval-feedback :deep(.answer-line:last-child) { margin-bottom: 0; }
 .eval-missing  { margin-top: 8px; font-size: 13px; color: #dc2626; }
+.score-display { font-size: 18px; font-weight: 700; color: var(--primary); }
+.score-emoji   { font-size: 20px; margin-left: 4px; }
 </style>

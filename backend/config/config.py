@@ -79,7 +79,7 @@ class _Settings:
 
     @property
     def llm_local_timeout(self) -> int:
-        return _get_int("LLM_LOCAL_TIMEOUT", 60)
+        return _get_int("LLM_LOCAL_TIMEOUT", 120)  # 默认 120s，Function Calling 等场景需更长时间
 
     # ── 1.2 远程配置（云端API）──
     @property
@@ -229,7 +229,7 @@ class _Settings:
 
     @property
     def interviewer_local_timeout(self) -> int:
-        return _get_int("INTERVIEWER_LOCAL_TIMEOUT", 0) or self.llm_local_timeout
+        return _get_int("INTERVIEWER_LOCAL_TIMEOUT", 0) or max(120, self.llm_local_timeout)  # 至少 120s，避免 Function Calling 超时
 
     # 远程配置
     @property
@@ -246,7 +246,7 @@ class _Settings:
 
     @property
     def interviewer_remote_timeout(self) -> int:
-        return _get_int("INTERVIEWER_REMOTE_TIMEOUT", 0) or self.llm_remote_timeout
+        return _get_int("INTERVIEWER_REMOTE_TIMEOUT", 0) or max(180, self.llm_remote_timeout)  # 至少 180s，云端 API 可能较慢
 
     # 当前使用的配置（根据mode选择）
     @property
@@ -459,6 +459,11 @@ class _Settings:
     @property
     def embed_base_url(self) -> str:
         return _get("EMBED_BASE_URL")
+
+    @property
+    def embed_ollama_url(self) -> str:
+        """Ollama 本地服务地址（EMBED_MODEL_TYPE=ollama 时使用）"""
+        return _get("EMBED_OLLAMA_URL", "http://localhost:11434")
 
     # ── 6. Neo4j ──────────────────────────────────────────────────
     @property

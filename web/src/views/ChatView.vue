@@ -27,8 +27,8 @@
           <img v-else src="@/assets/avatars/ai-avatar.png" alt="ai" class="avatar-img" />
         </div>
         <div class="msg-col">
-          <!-- 时间戳：放在对话框上方 -->
-          <div v-if="m.timestamp" class="msg-timestamp">{{ formatTime(m.timestamp) }}</div>
+          <!-- 时间戳：放在对话框上方（始终显示，无则用占位） -->
+          <div class="msg-timestamp">{{ formatTime(m.timestamp) || '—' }}</div>
 
           <!-- 思考过程（仅 AI 消息，且存在思考步骤时显示）-->
           <div v-if="m.role === 'assistant' && m.thinking && m.thinking.length > 0"
@@ -36,7 +36,7 @@
             <button class="thinking-toggle" @click="m.thinkingOpen = !m.thinkingOpen">
               <span class="think-icon">🧠</span>
               <span>{{ m.thinkingOpen ? '收起' : '查看' }}推理过程</span>
-              <span class="step-badge">{{ m.thinking.length }} 步</span>
+              <span class="step-badge">{{ m.thinking.length + (!m.streaming && m.thinking.length > 0 ? 1 : 0) }} 步</span>
               <span class="toggle-arrow" :class="{ open: m.thinkingOpen }">▾</span>
             </button>
             <transition name="slide">
@@ -59,6 +59,14 @@
                     <span class="step-text">{{ step.warning }}</span>
                   </div>
                 </div>
+                <!-- 第 N 步：完成（与后端 [Stream →] 完成 对应，作为最后一步）-->
+                <div v-if="!m.streaming" class="think-step completed-step">
+                  <div class="step-num">第 {{ m.thinking.length + 1 }} 步</div>
+                  <div class="step-item completed">
+                    <span class="step-icon">✓</span>
+                    <span class="step-text">完成</span>
+                  </div>
+                </div>
               </div>
             </transition>
           </div>
@@ -73,11 +81,14 @@
             <span v-if="m.streaming" class="cursor">▋</span>
           </div>
 
-          <!-- 耗时 & 思考步骤统计（AI 消息完成后显示）-->
-          <div v-if="m.role === 'assistant' && !m.streaming && m.duration_ms != null"
+          <!-- 耗时 & 完成标识（AI 消息完成后显示）-->
+          <div v-if="m.role === 'assistant' && !m.streaming"
                class="msg-meta">
-            <span class="meta-item">
+            <span v-if="m.duration_ms != null" class="meta-item">
               <span class="meta-icon">⏱</span> {{ (m.duration_ms / 1000).toFixed(1) }}s
+            </span>
+            <span class="meta-item completed-badge">
+              <span class="meta-icon">✓</span> 完成
             </span>
           </div>
 
@@ -141,6 +152,7 @@ import { marked } from 'marked'
 import hljs from 'highlight.js'
 import 'highlight.js/styles/github.css'
 import { api } from '../api.js'
+import { useChatStore } from '../stores/chatStore.js'
 import { diagnoseSseStream } from '../sse-diagnostic.js'
 import { renderEnhancedContent, questionCardStyles } from '../utils/question-renderer.js'
 
@@ -183,7 +195,7 @@ const renderMd = (text) => {
 const formatTime = (timeStr) => {
   if (!timeStr) return ''
   const d = new Date(timeStr)
-  if (isNaN(d.getTime())) return String(timeStr)
+  if (isNaN(d.getTime())) return ''
   const y = d.getFullYear()
   const M = String(d.getMonth() + 1).padStart(2, '0')
   const D = String(d.getDate()).padStart(2, '0')
@@ -200,6 +212,7 @@ const getAvatarStyle = (role) => {
   return { ...base, background: 'linear-gradient(135deg, #a8b3ff 0%, #c4b5fd 100%)', color: '#fff' }
 }
 
+const chatStore = useChatStore()
 const messages     = ref([])
 const inputText    = ref('')
 const loading      = ref(false)
@@ -301,14 +314,37 @@ const scrollToBottom = () => {
   })
 }
 
+const restoreFromStore = () => {
+  if (chatStore.userId !== props.userId || !chatStore.messages.length) return false
+  messages.value = chatStore.messages.map(m => ({
+    ...m,
+    thinking: m.thinking || [],
+    thinkingOpen: (m.thinking?.length ?? 0) > 0,
+    timestamp: m.timestamp || new Date().toISOString(),
+  }))
+  if (chatStore.sessionId) sessionId.value = chatStore.sessionId
+  const last = messages.value[messages.value.length - 1]
+  if (last?.streaming) {
+    streamingMsg.value = last
+  } else {
+    streamingMsg.value = null
+  }
+  scrollToBottom()
+  console.log(`[restoreFromStore] 从 store 恢复 ${messages.value.length} 条消息`)
+  return true
+}
+
 const loadHistory = async () => {
-  // 每次激活时都重新加载（不使用 lastLoadedUserId 缓存）
   if (!props.userId) return
   
-  // 🔧 如果正在流式输出，不重新加载历史（避免覆盖正在输出的内容）
   if (loading.value || streamingMsg.value) {
     console.log('[loadHistory] 跳过加载：正在流式输出中')
     return
+  }
+  
+  // 🔧 切换回 chat 时优先从 store 恢复（解决切换页面后正在输出的内容丢失）
+  if (chatStore.hasRestorableStreaming(props.userId)) {
+    if (restoreFromStore()) return
   }
   
   try {
@@ -316,14 +352,20 @@ const loadHistory = async () => {
     lastLoadedUserId = props.userId
     
     if (d.messages?.length) {
-      // 历史消息补齐字段：thinking、thinkingOpen、timestamp
-      messages.value = d.messages.map(m => ({
+      const apiMsgs = d.messages.map(m => ({
         ...m,
         thinking: m.thinking || [],
-        thinkingOpen: false,
-        timestamp: m.timestamp || new Date().toISOString(),  // 补齐时间戳
+        thinkingOpen: (m.thinking?.length ?? 0) > 0,
+        timestamp: m.timestamp || new Date().toISOString(),
       }))
-      
+      const lastStore = chatStore.messages[chatStore.messages.length - 1]
+      const lastApi = apiMsgs[apiMsgs.length - 1]
+      const storeHasNewer = chatStore.userId === props.userId && lastStore?.role === 'assistant' &&
+        ((lastStore.content?.length || 0) > (lastApi?.content?.length || 0) || lastStore.streaming)
+      if (storeHasNewer) {
+        if (restoreFromStore()) return
+      }
+      messages.value = apiMsgs
       if (d.session_id) sessionId.value = d.session_id
       scrollToBottom()
       console.log(`[loadHistory] 加载了 ${d.messages.length} 条历史消息`)
@@ -335,15 +377,25 @@ const clearChat = () => {
   messages.value = []
   sessionId.value = `sess_${Date.now()}`
   lastLoadedUserId = props.userId
+  chatStore.clear()
 }
 
-const prefillAndSend = (text) => {
-  // 防止在发送过程中被调用
+// 当传入 { display, api } 时，屏幕只展示 display，实际发给 AI 的是 api
+const prefillDisplayRef = ref(null)
+const prefillAndSend = (textOrOptions) => {
   if (loading.value || sendInProgress) {
     ElMessage.warning('请等待当前消息发送完成')
     return
   }
-  
+  let text, display
+  if (typeof textOrOptions === 'object' && textOrOptions?.display != null && textOrOptions?.api != null) {
+    display = textOrOptions.display
+    text = textOrOptions.api
+    prefillDisplayRef.value = display
+  } else {
+    text = typeof textOrOptions === 'string' ? textOrOptions : ''
+    prefillDisplayRef.value = null
+  }
   inputText.value = text
   nextTick(() => send())
 }
@@ -358,9 +410,11 @@ const send = async () => {
   // 立即设置标志，防止并发调用
   sendInProgress = true
   inputText.value = ''
+  const displayContent = prefillDisplayRef.value ?? text
+  prefillDisplayRef.value = null
   messages.value.push({ 
     role: 'user', 
-    content: text, 
+    content: displayContent, 
     thinking: [], 
     thinkingOpen: false,
     timestamp: new Date().toISOString()  // 添加用户消息时间戳
@@ -369,13 +423,13 @@ const send = async () => {
 
   loading.value = true
   abortCtrl = new AbortController()
-
+  // 不传 signal，切换页面时流式输出不被中断（onUnmounted 已不再 abort）
   try {
     const res = await api.chatStream({
       user_id: props.userId,
       message: text,
       session_id: sessionId.value,
-    }, abortCtrl.signal)
+    }, undefined)
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     if (!res.body) throw new Error('SSE 响应无 body，请检查后端是否返回流式数据')
@@ -392,6 +446,7 @@ const send = async () => {
       _startTs: Date.now()
     })
     streamingMsg.value = messages.value[aiMsgIndex]
+    chatStore.startStream(props.userId, sessionId.value, messages.value)
 
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
@@ -440,11 +495,22 @@ const send = async () => {
             if (thought.startsWith(p)) { thought = thought.slice(p.length).trim(); break }
           }
           currentStep.thought = thought || result
-        } else if (toolName !== 'Finish') {
+        } else if (toolName === 'Finish') {
+          // 单步直接 Finish：无 Thought 时也显示一步，避免「只有一步的推理过程也没显示」
+          if (aiMsg.thinking.length === 0 && result) {
+            aiMsg.thinking.push({
+              action: '📝 输出',
+              observation: result.length > 300 ? result.slice(0, 300) + '…' : result
+            })
+            messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
+            streamingMsg.value = messages.value[aiMsgIndex]
+            scrollToBottom()
+          }
+        } else {
           currentStep.action = `🔧 ${toolName}`
           currentStep.observation = String(result).slice(0, 500)
         }
-        if (Object.keys(currentStep).length) {
+        if (Object.keys(currentStep).length && toolName !== 'Finish') {
           const last = aiMsg.thinking[aiMsg.thinking.length - 1]
           if (last?.thought && !last?.action) {
             Object.assign(last, currentStep)
@@ -460,6 +526,7 @@ const send = async () => {
         messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
         streamingMsg.value = messages.value[aiMsgIndex]
       }
+      chatStore.syncMessages(messages.value)
     }
 
     let eventCount = 0
@@ -534,15 +601,19 @@ const send = async () => {
       console.error(`[SSE流错误]:`, streamErr)
       throw streamErr
     } finally {
-      // 流结束，更新 streaming 状态
+      // 流结束，更新 streaming 状态，确保耗时已设置
       console.log(`[SSE] 流式响应完成，共接收 ${eventCount} 个事件`)
       const finalMsg = messages.value[aiMsgIndex]
       if (finalMsg) {
         finalMsg.streaming = false
+        if (finalMsg.duration_ms == null && finalMsg._startTs) {
+          finalMsg.duration_ms = Date.now() - finalMsg._startTs
+        }
         messages.value.splice(aiMsgIndex, 1, { ...finalMsg })
         console.log(`[SSE] 消息状态已更新为 completed，消息ID: ${finalMsg.id}`)
       }
       streamingMsg.value = null
+      chatStore.finishStream(messages.value)
     }
 
   } catch (err) {
@@ -592,6 +663,7 @@ const send = async () => {
       streamingMsg.value.streaming = false
       streamingMsg.value = null
     }
+    chatStore.finishStream(messages.value)
     abortCtrl = null
     scrollToBottom()
   }
@@ -607,14 +679,7 @@ watch([() => props.isActive, () => props.userId], ([active, uid], [prevActive, p
 }, { immediate: true })
 
 onUnmounted(() => {
-  // 静默中断 SSE 连接（不显示错误）
-  if (abortCtrl) {
-    try {
-      abortCtrl.abort()
-    } catch (e) {
-      // 忽略中断错误
-    }
-  }
+  // 不再在卸载时 abort，避免切换页面时打断流式输出；页面关闭时浏览器会自动清理
   if (isRecording.value && recognition) {
     isRecording.value = false
     try {
@@ -727,6 +792,7 @@ onUnmounted(() => {
   display: flex; align-items: center; gap: 3px;
 }
 .meta-icon { font-size: 11px; }
+.meta-item.completed-badge { color: #22c55e; font-weight: 500; }
 
 /* ── 思考块 ── */
 .thinking-block {
@@ -810,6 +876,13 @@ onUnmounted(() => {
   background: #fff3f3;
   color: #c0392b; font-size: 12px; padding: 4px 8px;
 }
+
+.step-item.completed {
+  background: #e8f5e9;
+  color: #2e7d32; font-weight: 500;
+}
+.step-item.completed .step-icon { color: #22c55e; }
+.completed-step .step-num { color: #22c55e; }
 
 /* slide 动画 */
 .slide-enter-active, .slide-leave-active {
