@@ -618,7 +618,7 @@ class InterviewSystemOrchestrator:
         return response, thinking_steps
 
     # ===========================================================
-    # 流式对话（简化版：run() + executor + 伪流式）
+    # 流式对话（真正流式：arun_stream() + 官方 SSE 格式）
     # ===========================================================
 
     async def chat_stream(
@@ -629,21 +629,20 @@ class InterviewSystemOrchestrator:
         session_id: Optional[str] = None,
     ):
         """
-        流式对话：使用 run() + executor 的简化方案。
+        流式对话：使用 HelloAgents 的 arun_stream() 获得真正的流式事件。
         
         策略：
-        1. 在 executor 中同步执行 run()，获得完整答案
-        2. 将答案按 token 分块，逐个推送给前端（伪流式）
-        3. 前端收到每个 chunk 后立即更新 DOM，实现流式效果
+        1. 使用 arun_stream() 获得官方 SSE 事件流（AGENT_START, STEP_START, TOOL_CALL_FINISH, LLM_CHUNK, AGENT_FINISH）
+        2. 直接转发 SSE 格式给前端（event.to_sse()）
+        3. 前端按官方格式解析，支持 8 种事件类型
         
         优点：
-        - 逻辑简单，无需复杂的事件过滤
-        - 多轮对话连贯性由 HistoryManager 保证
-        - 工具调用正常工作
+        - 真正的流式输出，首字节时间短
+        - 思考过程（Thought 工具）、工具调用、LLM chunk 都能流式显示
+        - 前端能逐步构建思考步骤和内容
         
         缺点：
-        - 延迟略高（一次性等待完整答案）
-        - 但对用户体验影响不大（通常 5-30s 内完成）
+        - 需要正确处理 arun_stream() 的异步生成器
         """
         import time as _time
         start_time = _time.time()
@@ -675,73 +674,68 @@ class InterviewSystemOrchestrator:
         ]))
         full_input = f"{context_prefix}\n\n[用户消息]\n{message}" if context_prefix.strip() else message
 
+        full_content = ""  # 累积完整内容用于持久化
+        chunk_count = 0   # 用于定期保存
+        last_save_time = _time.time()
+        
+        # 🔧 方案B：流式开始前先保存用户消息（确保至少用户问题被保存）
         try:
-            # Step 1: 在 executor 中同步执行 run()，获得完整答案
-            loop = asyncio.get_event_loop()
-            response = await asyncio.wait_for(
-                loop.run_in_executor(None, self.interviewer.run, full_input),
-                timeout=90.0
-            )
+            from hello_agents.core.message import Message
+            self.interviewer.add_message(Message(full_input, "user"))
+            self.interviewer.save_session(session_id)
+            logger.debug(f"[chat_stream] 已保存用户消息到 session")
+        except Exception as e:
+            logger.warning(f"[chat_stream] 预保存用户消息失败: {e}")
+        
+        try:
+            # 使用 arun_stream() 获得官方 SSE 事件流
+            async for event in self.interviewer.arun_stream(full_input):
+                # 转换为 SSE 格式字符串，然后编码为字节
+                sse_line = event.to_sse()
+                if isinstance(sse_line, str):
+                    # 确保以 \n\n 结尾（SSE 规范）
+                    if not sse_line.endswith('\n\n'):
+                        sse_line += '\n\n'
+                    yield sse_line  # 返回字符串，main.py 会处理编码
+                else:
+                    yield sse_line
+                
+                # 累积内容用于持久化
+                if event.type.value == "llm_chunk":
+                    chunk = event.data.get("chunk") or event.data.get("content") or ""
+                    full_content += chunk
+                    chunk_count += 1
+                    
+                    # 🔧 方案B：每 50 个 chunk 或每 5 秒保存一次（防止页面切换丢失）
+                    current_time = _time.time()
+                    if chunk_count % 50 == 0 or (current_time - last_save_time) >= 5:
+                        try:
+                            # 临时保存当前进度
+                            if full_content.strip():
+                                sqlite_service.patch_last_assistant_content(session_id, full_content)
+                                last_save_time = current_time
+                                logger.debug(f"[chat_stream] 中间保存点：已保存 {len(full_content)} 字符")
+                        except Exception as e:
+                            logger.debug(f"[chat_stream] 中间保存失败: {e}")
+                    
+                elif event.type.value == "agent_finish":
+                    result = event.data.get("result") or ""
+                    if result and not full_content.strip():
+                        full_content = result
 
-            # Step 2: 从 hello_agents 的 history_manager 中提取思考步骤
-            thinking_steps = []
-            if hasattr(self.interviewer, 'history_manager'):
-                history = self.interviewer.history_manager.get_history()
-                for msg in history:
-                    if msg.role == "assistant" and msg.metadata:
-                        if msg.metadata.get("type") == "thought":
-                            thinking_steps.append({"thought": msg.content})
-                        elif msg.metadata.get("type") == "action":
-                            thinking_steps.append({"action": msg.content})
-
-            # Step 3: 构造思考步骤事件
-            for step in thinking_steps:
-                payload = {
-                    "type": "tool_call_finish",
-                    "data": {
-                        "tool_name": "Thought" if step.get("thought") else "Action",
-                        "result": step.get("thought") or step.get("action") or ""
-                    }
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                await asyncio.sleep(0.01)  # 让前端有机会处理
-
-            # Step 4: 按 token 分块推送答案（真正流式）
-            # 简单策略：按句子或固定字符数分块
-            chunk_size = 50  # 每个 chunk 约 50 个字符
-            for i in range(0, len(response), chunk_size):
-                chunk = response[i:i+chunk_size]
-                payload = {
-                    "type": "llm_chunk",
-                    "data": {
-                        "chunk": chunk
-                    }
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                await asyncio.sleep(0.05)  # 模拟流式延迟，让前端有时间渲染
-
-            # Step 5: 发送完成事件
-            finish_payload = {
-                "type": "agent_finish",
-                "data": {
-                    "result": response,
-                    "duration_ms": int((time.time() - start_time) * 1000)
-                }
-            }
-            yield f"data: {json.dumps(finish_payload, ensure_ascii=False)}\n\n"
-
-            # Step 5: 持久化
+            # 持久化完整内容
             try:
                 self.interviewer.save_session(session_id)
-                if response.strip():
-                    sqlite_service.patch_last_assistant_content(session_id, response)
+                if full_content.strip():
+                    sqlite_service.patch_last_assistant_content(session_id, full_content)
+                logger.debug(f"[chat_stream] 流式完成，最终保存 {len(full_content)} 字符")
             except Exception as e:
                 logger.warning(f"[chat_stream] save_session 失败: {e}")
 
-            self._write_working(user_id, f"AI：{response[:100]}", importance=0.4, session_id=session_id)
+            self._write_working(user_id, f"AI：{full_content[:100]}", importance=0.4, session_id=session_id)
             self._write_episodic(
                 user_id=user_id,
-                content=f"对话：「{message[:60]}」→「{response[:60]}」",
+                content=f"对话：「{message[:60]}」→「{full_content[:60]}」",
                 importance=0.5,
                 event_type="dialogue",
                 session_id=session_id

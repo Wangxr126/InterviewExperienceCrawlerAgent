@@ -1,4 +1,4 @@
-"""
+﻿"""
 
 面经 Agent 后端 FastAPI 主入口
 
@@ -86,18 +86,24 @@ try:
     # 统一的日志格式：完整日期时间 | 级别（7字符宽） | 消息
     _log_format = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <7}</level> | <level>{message}</level>"
 
-    _loguru_logger.add(
+    # 多进程模式：只在主进程输出到终端，避免重复打印
+    # uvicorn多进程模式下，worker进程会设置 UVICORN_WORKER_ID 环境变量
+    is_main_process = os.environ.get('UVICORN_WORKER_ID') is None
+    
+    if is_main_process:
+        _loguru_logger.add(
 
-        sys.stderr,
+            sys.stderr,
 
-        colorize=True,
+            colorize=True,
 
-        format=_log_format,
+            format=_log_format,
 
-        level="INFO",
+            level="INFO",
 
-    )
+        )
 
+    # 所有进程都写入文件（enqueue=True 确保多进程安全）
     _loguru_logger.add(
 
         _BACKEND_LOGS / "backend.log",
@@ -111,6 +117,8 @@ try:
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <7} | {message}",
 
         level="INFO",
+
+        enqueue=True,
 
     )
 
@@ -439,52 +447,28 @@ def _print_agent_llm_config():
 
 
 
+
+
 @app.on_event("startup")
-
 async def startup_event():
-
     """FastAPI 启动时启动后台调度器，并可选预热 LLM"""
-
     from backend.config.config import settings as _s
-
     from backend.services.crawler.question_extractor import _print_miner_config_once
 
-    
-
-    # 初始化 Miner Agent 配置（提前打印，避免首次提取时才显示）
-
     _print_miner_config_once()
-
-    
-
     _print_agent_llm_config()
-
     crawl_scheduler.start()
-
     logger.info("爬虫调度器已启动")
 
-
-
     # 同步预热 LLM，确保首次提取不因冷启动超时
-
     if _s.llm_warmup_enabled and _s.llm_base_url:
-
         await asyncio.to_thread(_warmup_llm_sync)
 
 
-
-
-
 @app.on_event("shutdown")
-
 async def shutdown_event():
-
     """FastAPI 停止时关闭调度器"""
-
     crawl_scheduler.stop()
-
-
-
 
 
 @app.get("/", include_in_schema=False)
@@ -1001,7 +985,13 @@ async def api_chat_stream(req: ChatRequest):
                     resume=req.resume,
                     session_id=req.session_id,
                 ):
-                    yield sse_line
+                    # sse_line 是字符串，需要编码为字节
+                    if isinstance(sse_line, str):
+                        if not sse_line.endswith('\n\n'):
+                            sse_line += '\n\n'
+                        yield sse_line.encode('utf-8')
+                    else:
+                        yield sse_line
                 _chat_logger.info(f"[Stream →] 完成")
                 return
             except asyncio.TimeoutError:
@@ -2897,4 +2887,5 @@ async def finetune_preview_log(body: dict):
     if not log_path:
         raise HTTPException(status_code=400, detail="log_path 不能为空")
     return preview_log_file(log_path, limit)
+
 

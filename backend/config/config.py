@@ -522,8 +522,8 @@ class _Settings:
     # ── OCR 配置 ──────────────────────────────────────────────
     @property
     def ocr_method(self) -> str:
-        """OCR 方法：qwen_vl（阿里云百炼，推荐）/ claude_vision / mcp"""
-        return _get("OCR_METHOD", "qwen_vl")
+        """OCR 方法：ollama_vl（本地 Ollama）/ qwen_vl（阿里云百炼）/ claude_vision / mcp"""
+        return _get("OCR_METHOD", "ollama_vl")
 
     @property
     def mcp_ocr_server(self) -> str:

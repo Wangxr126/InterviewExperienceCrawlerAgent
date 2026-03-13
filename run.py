@@ -5,6 +5,7 @@
   1. 直接双击本文件（自动使用 NewCoderAgent 环境）
   2. 在任意终端：python run.py
   3. 开发模式（代码改动自动重启）：python run.py --reload
+  4. 指定工作进程数：python run.py --workers 4
 
 NewCoderAgent 环境路径固定写死，无需 conda activate。
 """
@@ -72,6 +73,7 @@ def main():
     host = "0.0.0.0"
     port = 8000
     reload = False
+    workers = 1  # 个人使用单进程即可：async IO 已可并发，多进程会导致调度器重复启动
 
     args = sys.argv[1:]
     for i, arg in enumerate(args):
@@ -81,8 +83,16 @@ def main():
             host = args[i + 1]
         if arg == "--reload":
             reload = True
+        if arg == "--workers" and i + 1 < len(args):
+            workers = int(args[i + 1])
 
     check_neo4j()
+
+    # 如果没有指定 workers，自动使用 CPU 核心数（但 reload 模式下只用 1 个）
+    if workers is None and not reload:
+        import multiprocessing
+        workers = multiprocessing.cpu_count()
+        logger.info("自动检测 CPU 核心数: %d", workers)
 
     logger.info("""
 ╔═══════════════════════════════════════════════════════════╗
@@ -95,17 +105,21 @@ def main():
 ║ 前端-开发  ：cd web && npm run dev  → localhost:5173
 ║ Neo4j 管理：http://localhost:7474
 ║ Ollama LLM ：http://localhost:11434
+║ 工作进程  ：%s
 ║ 退出      ：Ctrl+C
 ╚═══════════════════════════════════════════════════════════╝
-""", port, port, port)
+""", port, port, port, f"{workers} 个" if workers else "1 个（开发模式）")
 
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
 
     cmd = [sys.executable, "-m", "uvicorn", "backend.main:app",
            "--host", host, "--port", str(port),
            "--log-level", "warning"]  # 访问日志由 main.py 的 loguru 拦截器处理
+    
     if reload:
         cmd.append("--reload")
+    elif workers:
+        cmd.extend(["--workers", str(workers)])
 
     subprocess.run(cmd, env=env)
 

@@ -146,12 +146,28 @@ class InterviewerAgent(ReActAgent):
 
         原版 ReActAgent 只返回 [system, user]，无法利用多轮上下文。
         本实现：system + 历史消息（user/assistant 交替）+ 当前 user 消息。
+        
+        注意：工具描述由 hello_agents 框架自动注入到 system prompt 中，
+        无需在此手动添加。
         """
         messages = []
 
         # 系统提示词（由父类 system_prompt 提供）
+        # hello_agents 框架会自动在此基础上注入工具描述
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
+
+        # 从 HistoryManager 获取历史，转为 OpenAI API 格式
+        history = self.history_manager.get_history()
+        recent = history[-HISTORY_MAX_MESSAGES:] if len(history) > HISTORY_MAX_MESSAGES else history
+        for msg in recent:
+            if msg.role in ("user", "assistant") and (msg.content or "").strip():
+                messages.append({"role": msg.role, "content": msg.content})
+
+        # 当前用户消息
+        messages.append({"role": "user", "content": input_text})
+
+        return messages
 
         # 从 HistoryManager 获取历史，转为 OpenAI API 格式
         history = self.history_manager.get_history()

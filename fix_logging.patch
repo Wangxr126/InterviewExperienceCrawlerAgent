@@ -1,0 +1,37 @@
+--- backend/main.py.orig
++++ backend/main.py
+@@ -76,6 +76,11 @@
+     _loguru_logger.remove()
+ 
+     # 统一的日志格式：完整日期时间 | 级别（7字符宽） | 消息
+     _log_format = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <7}</level> | <level>{message}</level>"
++    
++    # 多进程模式：只在主进程输出到终端，避免重复打印
++    # uvicorn多进程模式下，worker进程会设置 UVICORN_WORKER_ID 环境变量
++    is_main_process = os.environ.get('UVICORN_WORKER_ID') is None
++    
++    if is_main_process:
++        _loguru_logger.add(
++            sys.stderr,
++            colorize=True,
++            format=_log_format,
++            level="INFO",
++        )
+ 
+-    _loguru_logger.add(
+-        sys.stderr,
+-        colorize=True,
+-        format=_log_format,
+-        level="INFO",
+-    )
+-
++    # 所有进程都写入文件（enqueue=True 确保多进程安全）
+     _loguru_logger.add(
+         _BACKEND_LOGS / "backend.log",
+         rotation="10 MB",
+         retention=5,
+         encoding="utf-8",
+         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <7} | {message}",
+         level="INFO",
++        enqueue=True,
+     )

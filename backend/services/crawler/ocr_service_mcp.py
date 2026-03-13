@@ -1,15 +1,15 @@
 """
 图片 OCR 服务
 
-支持两种 OCR 方式，通过 .env 的 OCR_METHOD 配置切换：
+支持三种 OCR 方式，通过 .env 的 OCR_METHOD 配置切换：
 
-  qwen_vl       — 阿里云百炼 Qwen-VL（推荐，已有 EMBED_API_KEY 即可用）
+  ollama_vl     — 本地 Ollama 视觉模型（推荐，无需 API Key）
+  qwen_vl       — 阿里云百炼 Qwen-VL（已有 EMBED_API_KEY 即可用）
   claude_vision — Anthropic Claude Vision API（需要 ANTHROPIC_API_KEY）
 
 .env 示例：
-    OCR_METHOD=qwen_vl          # 切换到 Qwen-VL
-    OCR_MODEL=qwen-vl-plus      # 可选，留空则自动选默认模型
-    OCR_API_KEY=sk-xxx          # 可选，留空则复用 EMBED_API_KEY
+    OCR_METHOD=ollama_vl        # 切换到本地 Ollama
+    OCR_MODEL=qwen3-vl:2b       # 可选，留空则自动选默认模型
 """
 import logging
 import base64
@@ -22,7 +22,51 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────
-# 方式一：Qwen-VL（阿里云百炼 / dashscope）
+# 方式一：Ollama VL（本地视觉模型）
+# ──────────────────────────────────────────────────────────────
+
+def _call_ollama_vl_ocr(image_path: str) -> Optional[str]:
+    """
+    使用本地 Ollama 视觉模型识别图片文字。
+    默认使用 qwen3-vl:2b，无需 API Key。
+    """
+    model = settings.ocr_model or "qwen3-vl:2b"
+    base_url = "http://localhost:11434/v1"
+
+    try:
+        from openai import OpenAI
+
+        suffix = Path(image_path).suffix.lower()
+        mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                    ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}
+        mime = mime_map.get(suffix, "image/jpeg")
+
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+
+        client = OpenAI(api_key="ollama", base_url=base_url)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                    {"type": "text",
+                     "text": "请识别图片中的所有文字内容，按原文输出。如果是面试题目，请完整提取题目和答案。"}
+                ]
+            }],
+            max_tokens=2048,
+        )
+        return resp.choices[0].message.content
+
+    except Exception as e:
+        logger.error(f"[OCR-OllamaVL] 识别失败: {e}")
+        return None
+
+
+# ──────────────────────────────────────────────────────────────
+# 方式二：Qwen-VL（阿里云百炼 / dashscope）
 # ──────────────────────────────────────────────────────────────
 
 def _call_qwen_vl_ocr(image_path: str) -> Optional[str]:
@@ -71,7 +115,7 @@ def _call_qwen_vl_ocr(image_path: str) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────────────────────
-# 方式二：Claude Vision（Anthropic）
+# 方式三：Claude Vision（Anthropic）
 # ──────────────────────────────────────────────────────────────
 
 def _call_claude_vision_ocr(image_path: str) -> Optional[str]:
@@ -123,7 +167,8 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
     批量 OCR 本地图片，返回拼接后的文本。
 
     OCR 方式由 .env 的 OCR_METHOD 控制：
-      qwen_vl       — 阿里云百炼 Qwen-VL（推荐）
+      ollama_vl     — 本地 Ollama 视觉模型（推荐）
+      qwen_vl       — 阿里云百炼 Qwen-VL
       claude_vision — Claude Vision API
 
     Args:
@@ -140,7 +185,7 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
     post_images_dir = settings.post_images_dir
     logger.info(f"[OCR] 方式={method}, 图片数={len(image_paths)}, task={task_id}")
 
-    # 预检 API Key
+    # 预检 API Key（ollama_vl 不需要）
     if method == "qwen_vl" and not settings.ocr_api_key:
         logger.warning("[OCR] qwen_vl 模式但未配置 API Key，请设置 OCR_API_KEY 或 EMBED_API_KEY")
         return ""
@@ -159,15 +204,18 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
 
         try:
             text = None
-            if method == "claude_vision":
+            if method == "ollama_vl":
+                text = _call_ollama_vl_ocr(str(full_path))
+            elif method == "claude_vision":
                 text = _call_claude_vision_ocr(str(full_path))
-            else:
-                # 默认 qwen_vl，未知方式也走这里
-                if method not in ("qwen_vl", "claude_vision"):
-                    logger.warning(f"[OCR] 未知方式: {method}，回退到 qwen_vl")
+            elif method == "qwen_vl":
                 text = _call_qwen_vl_ocr(str(full_path))
+            else:
+                # 未知方式回退到 ollama_vl
+                logger.warning(f"[OCR] 未知方式: {method}，回退到 ollama_vl")
+                text = _call_ollama_vl_ocr(str(full_path))
 
-            # 主方式失败时互相回退
+            # 主方式失败时回退（ollama_vl 失败不回退，避免调用云端 API）
             if not text and method == "claude_vision":
                 logger.info("[OCR] claude_vision 失败，回退到 qwen_vl")
                 text = _call_qwen_vl_ocr(str(full_path))

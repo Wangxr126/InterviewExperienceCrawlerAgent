@@ -23,7 +23,8 @@
 
       <div v-for="(m, i) in messages" :key="i" class="msg-row" :class="m.role">
         <div class="msg-avatar" :style="getAvatarStyle(m.role)">
-          <div class="avatar-inner">{{ m.role === 'user' ? '👤' : '🤖' }}</div>
+          <img v-if="m.role === 'user'" src="@/assets/avatars/user-avatar.png" alt="user" class="avatar-img" />
+          <img v-else src="@/assets/avatars/ai-avatar.png" alt="ai" class="avatar-img" />
         </div>
         <div class="msg-col">
           <!-- 时间戳：放在对话框上方 -->
@@ -140,6 +141,13 @@ import { marked } from 'marked'
 import hljs from 'highlight.js'
 import 'highlight.js/styles/github.css'
 import { api } from '../api.js'
+import { diagnoseSseStream } from '../sse-diagnostic.js'
+import { renderEnhancedContent, questionCardStyles } from '../utils/question-renderer.js'
+
+// 暴露诊断工具到全局，方便在控制台调用
+if (typeof window !== 'undefined') {
+  window.diagnoseSseStream = diagnoseSseStream
+}
 
 const props = defineProps({
   userId:   { type: String, default: 'user_001' },
@@ -157,8 +165,19 @@ marked.setOptions({
 })
 
 const renderMd = (text) => {
-  try { return marked.parse(text || '') }
-  catch { return text }
+  try { 
+    const result = renderEnhancedContent(text || '', marked)
+    // 调试：确认返回的是字符串而不是 Promise
+    if (result instanceof Promise) {
+      console.error('❌ renderMd 返回了 Promise，应该返回字符串！')
+      return text
+    }
+    return result
+  }
+  catch (e) { 
+    console.error('renderMd 错误:', e)
+    return text 
+  }
 }
 
 const formatTime = (timeStr) => {
@@ -283,19 +302,31 @@ const scrollToBottom = () => {
 }
 
 const loadHistory = async () => {
-  if (!props.userId || lastLoadedUserId === props.userId) return
+  // 每次激活时都重新加载（不使用 lastLoadedUserId 缓存）
+  if (!props.userId) return
+  
+  // 🔧 如果正在流式输出，不重新加载历史（避免覆盖正在输出的内容）
+  if (loading.value || streamingMsg.value) {
+    console.log('[loadHistory] 跳过加载：正在流式输出中')
+    return
+  }
+  
   try {
     const d = await api.getChatHistory(props.userId)
     lastLoadedUserId = props.userId
+    
     if (d.messages?.length) {
-      // 历史消息无思考步骤，补齐字段
+      // 历史消息补齐字段：thinking、thinkingOpen、timestamp
       messages.value = d.messages.map(m => ({
         ...m,
         thinking: m.thinking || [],
         thinkingOpen: false,
+        timestamp: m.timestamp || new Date().toISOString(),  // 补齐时间戳
       }))
+      
       if (d.session_id) sessionId.value = d.session_id
       scrollToBottom()
+      console.log(`[loadHistory] 加载了 ${d.messages.length} 条历史消息`)
     }
   } catch (e) { console.warn('加载对话历史失败', e) }
 }
@@ -327,7 +358,13 @@ const send = async () => {
   // 立即设置标志，防止并发调用
   sendInProgress = true
   inputText.value = ''
-  messages.value.push({ role: 'user', content: text, thinking: [], thinkingOpen: false })
+  messages.value.push({ 
+    role: 'user', 
+    content: text, 
+    thinking: [], 
+    thinkingOpen: false,
+    timestamp: new Date().toISOString()  // 添加用户消息时间戳
+  })
   scrollToBottom()
 
   loading.value = true
@@ -344,9 +381,17 @@ const send = async () => {
     if (!res.body) throw new Error('SSE 响应无 body，请检查后端是否返回流式数据')
 
     // AI 消息占位，thinkingOpen 初始 true（有步骤时自动展开）
-    const aiMsg = { role: 'assistant', content: '', streaming: true, thinking: [], thinkingOpen: true }
-    messages.value.push(aiMsg)
-    streamingMsg.value = aiMsg
+    const aiMsgIndex = messages.value.length  // 记录索引而不是对象引用
+    messages.value.push({ 
+      role: 'assistant', 
+      content: '', 
+      streaming: true, 
+      thinking: [], 
+      thinkingOpen: true,
+      timestamp: new Date().toISOString(),
+      _startTs: Date.now()
+    })
+    streamingMsg.value = messages.value[aiMsgIndex]
 
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
@@ -357,6 +402,10 @@ const send = async () => {
     const handleEvent = (payload) => {
       const evType = payload.type
       const data = payload.data || {}
+      
+      // 始终从数组中获取最新的消息对象
+      const aiMsg = messages.value[aiMsgIndex]
+      if (!aiMsg) return
 
       // HelloAgents 官方 8 种事件类型
       if (evType === 'llm_chunk') {
@@ -367,14 +416,19 @@ const send = async () => {
             receivedFirstDelta = true
           }
           aiMsg.content += chunk
+          
+          // 强制触发 Vue 响应式更新
+          messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
+          streamingMsg.value = messages.value[aiMsgIndex]
+          console.log(`[响应式更新] content长度=${aiMsg.content.length}, 最新内容="${aiMsg.content.slice(-50)}"`)
           scrollToBottom()
         }
       } else if (evType === 'agent_finish') {
-        // result 已通过 synthetic llm_chunk 发送，此处只更新耗时，不覆盖已有内容
-        // 仅当内容完全为空时才兜底填充（防御性措施）
         const result = data.result ?? ''
         if (result && !aiMsg.content.trim()) aiMsg.content = result
         aiMsg.duration_ms = data.duration_ms ?? (Date.now() - (aiMsg._startTs || Date.now()))
+        messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
+        streamingMsg.value = messages.value[aiMsgIndex]
       } else if (evType === 'step_start') {
         currentStep = {}
       } else if (evType === 'tool_call_finish') {
@@ -397,48 +451,99 @@ const send = async () => {
           } else {
             aiMsg.thinking.push({ ...currentStep })
           }
+          messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
+          streamingMsg.value = messages.value[aiMsgIndex]
           scrollToBottom()
         }
       } else if (evType === 'error') {
         aiMsg.content = `⚠️ ${data.error ?? '未知错误'}`
+        messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
+        streamingMsg.value = messages.value[aiMsgIndex]
       }
     }
 
-    aiMsg._startTs = Date.now()
-
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-
-      // 解析 SSE：event: xxx 与 data: {...} 成对出现
-      const parts = buffer.split(/\n\n+/)
-      buffer = parts.pop() ?? ''
-
-      for (const block of parts) {
-        let dataLine = ''
-        for (const line of block.split('\n')) {
-          const t = line.trim()
-          if (t.startsWith('data: ')) dataLine = t.slice(6)
+    let eventCount = 0
+    let lastUpdateTime = Date.now()
+    
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) {
+          console.log(`[SSE流完成] 共接收 ${eventCount} 个事件`)
+          break
         }
-        if (!dataLine || dataLine === '[DONE]') continue
-        try {
-          const payload = JSON.parse(dataLine)
-          handleEvent(payload)
-        } catch (e) {
-          if (dataLine) {
-            aiMsg.content += dataLine
+        
+        // 解码数据块
+        const chunk = decoder.decode(value, { stream: true })
+        buffer += chunk
+        console.log(`[SSE接收] 块大小=${chunk.length}字节, 缓冲区=${buffer.length}字节`)
+        
+        // 按 \n\n 分割 SSE 事件
+        const lines = buffer.split('\n\n')
+        
+        // 保留最后一个不完整的块在缓冲区
+        buffer = lines.pop() || ''
+        
+        // 处理完整的事件块
+        for (const eventBlock of lines) {
+          if (!eventBlock.trim()) continue
+          
+          let eventType = ''
+          let dataLine = ''
+          
+          // 解析 SSE 格式: event: xxx\ndata: {...}
+          for (const line of eventBlock.split('\n')) {
+            const trimmed = line.trim()
+            if (trimmed.startsWith('event: ')) {
+              eventType = trimmed.slice(7)
+            } else if (trimmed.startsWith('data: ')) {
+              dataLine = trimmed.slice(6)
+            }
+          }
+          
+          if (!dataLine) continue
+          
+          try {
+            const payload = JSON.parse(dataLine)
+            if (!payload.type && eventType) {
+              payload.type = eventType
+            }
+            
+            eventCount++
+            console.log(`[SSE事件 #${eventCount}] type=${payload.type}, data=`, payload.data)
+            
+            // 处理事件
+            handleEvent(payload)
+            
+            // 使用 requestAnimationFrame 确保 DOM 实时更新（不阻塞）
+            requestAnimationFrame(() => {
+              scrollToBottom()
+            })
+            
+            // 限制日志频率，避免控制台刷屏
+            const now = Date.now()
+            if (now - lastUpdateTime > 100) {
+              lastUpdateTime = now
+            }
+          } catch (parseErr) {
+            console.warn(`[SSE解析失败] 事件#${eventCount}:`, parseErr, 'data:', dataLine)
           }
         }
-        // 每处理一个事件后立即更新 DOM，实现真实逐字流式效果
-        // 这是关键：不能等到所有 chunk 都收集完再更新
-        scrollToBottom()
-        await nextTick()
       }
+    } catch (streamErr) {
+      console.error(`[SSE流错误]:`, streamErr)
+      throw streamErr
+    } finally {
+      // 流结束，更新 streaming 状态
+      console.log(`[SSE] 流式响应完成，共接收 ${eventCount} 个事件`)
+      const finalMsg = messages.value[aiMsgIndex]
+      if (finalMsg) {
+        finalMsg.streaming = false
+        messages.value.splice(aiMsgIndex, 1, { ...finalMsg })
+        console.log(`[SSE] 消息状态已更新为 completed，消息ID: ${finalMsg.id}`)
+      }
+      streamingMsg.value = null
     }
-
-    aiMsg.streaming = false
-    streamingMsg.value = null
 
   } catch (err) {
     console.error('🔴 流式接口错误:', err)
@@ -447,8 +552,13 @@ const send = async () => {
     console.error('🔴 错误堆栈:', err.stack)
     
     if (err.name === 'AbortError') {
-      // 用户中止
-      console.log('🟡 用户中止请求')
+      // 用户中止（页面切换/手动停止）- 静默处理，不显示错误
+      console.log('🟡 用户中止请求（页面切换或手动停止）')
+      // 移除流式消息占位符
+      if (streamingMsg.value) {
+        messages.value = messages.value.filter(m => m !== streamingMsg.value)
+        streamingMsg.value = null
+      }
     } else {
       console.warn('流式接口失败，降级到普通接口', err)
       try {
@@ -487,15 +597,31 @@ const send = async () => {
   }
 }
 
-watch([() => props.isActive, () => props.userId], ([active, uid]) => {
-  if (active && uid) loadHistory()
+watch([() => props.isActive, () => props.userId], ([active, uid], [prevActive, prevUid]) => {
+  // 页面激活时加载历史
+  if (active && uid) {
+    loadHistory()
+  }
+  // 🔧 页面失活时不再中断请求，让后端继续完成
+  // 这样切换回来时可以看到完整的历史记录
 }, { immediate: true })
 
 onUnmounted(() => {
-  abortCtrl?.abort()
+  // 静默中断 SSE 连接（不显示错误）
+  if (abortCtrl) {
+    try {
+      abortCtrl.abort()
+    } catch (e) {
+      // 忽略中断错误
+    }
+  }
   if (isRecording.value && recognition) {
     isRecording.value = false
-    recognition.stop()
+    try {
+      recognition.stop()
+    } catch (e) {
+      // 忽略停止错误
+    }
   }
 })
 </script>
@@ -553,7 +679,8 @@ onUnmounted(() => {
 }
 .msg-row.user { flex-direction: row-reverse; }
 
-.msg-avatar { font-size: 24px; flex-shrink: 0; margin-top: 2px; }
+.msg-avatar { font-size: 24px; flex-shrink: 0; margin-top: 2px; overflow: hidden; }
+.avatar-img { width: 100%; height: 100%; object-fit: cover; border-radius: 10px; }
 
 /* 每条 AI 消息的竖向容器（思考块 + 气泡） */
 .msg-col {
@@ -717,11 +844,12 @@ onUnmounted(() => {
   font-weight: 500;
 }
 .md-content :deep(pre) {
-  background: linear-gradient(135deg, #1e1e1e 0%, #2d2d2d 100%);
-  color: #d4d4d4;
+  background: linear-gradient(135deg, #f5f5f7 0%, #f0f0f5 100%);
+  color: #2c3e50;
   padding: 14px; border-radius: 10px; overflow-x: auto; margin: 10px 0;
-  border: 1px solid #3d3d3d;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  border: 1px solid #e0e0e6;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  font-family: 'Fira Code', 'Consolas', monospace;
 }
 .md-content :deep(pre code) { background: none; padding: 0; color: inherit; }
 .md-content :deep(blockquote) {
@@ -855,5 +983,93 @@ onUnmounted(() => {
 .send-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* ── 结构化题目卡片 ── */
+.question-card {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 16px;
+  color: white;
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+}
+
+.question-header {
+  margin-bottom: 16px;
+}
+
+.question-title {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0 0 12px 0;
+  line-height: 1.4;
+}
+
+.question-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.difficulty {
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  color: white;
+  text-transform: uppercase;
+}
+
+.tag {
+  background: rgba(255, 255, 255, 0.2);
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+.question-requirements {
+  margin-bottom: 12px;
+}
+
+.question-requirements h4 {
+  margin: 0 0 8px 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.question-requirements ol {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.question-requirements li {
+  margin-bottom: 6px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.question-tips {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  border-left: 3px solid rgba(255, 255, 255, 0.5);
+}
+
+.tips-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.raw-content {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.2);
 }
 </style>

@@ -634,8 +634,8 @@ class GetMasteryReportTool(Tool):
             description=(
                 "生成用户当前的知识点掌握度报告。"
                 "包含：各级别标签统计（expert/proficient/learning/novice）、"
-                "整体正确率、总做题数、薄弱点列表。"
-                "用户说'我的掌握情况'/'复习报告'/'哪些地方还不熟'时调用。"
+                "整体正确率、总做题数、薄弱点列表、具体薄弱题目、推荐复习题目。"
+                "用户说'我的掌握情况'/'复习报告'/'哪些地方还不熟'/'推荐我复习什么'时调用。"
             ),
         )
 
@@ -654,18 +654,55 @@ class GetMasteryReportTool(Tool):
                      "total_attempts": i["total_attempts"]}
                     for i in items
                 ]
+            
+            # 获取具体的薄弱题目（得分 < 3 的最近做题）
+            weak_records = sqlite_service.get_weak_study_records(
+                user_id, 
+                tags=[i["tag"] for i in (by_level.get("novice", []) + by_level.get("learning", []))],
+                limit=5
+            )
+            weak_questions = [
+                {
+                    "question_text": (rec.get("question_text") or "")[:100],
+                    "score": rec["score"],
+                    "ai_feedback": (rec.get("ai_feedback") or "")[:150],
+                    "studied_at": rec.get("studied_at", ""),
+                    "tags": rec.get("topic_tags") or []
+                }
+                for rec in weak_records
+            ]
+            
+            # 获取推荐复习的题目（遗忘曲线到期的题目）
+            due_reviews = sqlite_service.get_due_reviews(user_id, limit=3)
+            review_questions = [
+                {
+                    "question_id": str(r["question_id"]),
+                    "question_text": (r.get("question_text") or "")[:100],
+                    "last_score": r.get("score", 0),
+                    "due_date": r.get("next_review_at", ""),
+                    "tags": json.loads(r.get("topic_tags") or "[]")
+                }
+                for r in due_reviews
+            ]
+            
+            weak_tags = [
+                i["tag"] for i in
+                (by_level.get("novice", [])
+                 + by_level.get("learning", []))
+            ][:10]
+            
             report = {
                 "total_questions_practiced": summary["total_questions_practiced"],
-                "overall_avg_score": summary["overall_avg_score"],
-                "correct_rate_pct": summary["correct_rate"],
+                "overall_avg_score": round(summary["overall_avg_score"], 2),
+                "correct_rate_pct": round(summary["correct_rate"], 1),
                 "mastery_by_level": by_level,
-                "weak_tags": [
-                    i["tag"] for i in
-                    (by_level.get("novice", [])
-                     + by_level.get("learning", []))
-                ][:10],
+                "weak_tags": weak_tags,
+                "weak_questions": weak_questions,
+                "review_questions": review_questions,
                 "advice": (
-                    "建议重点练习薄弱标签，每天坚持 3-5 道题。"
+                    f"您的正确率为 {summary['correct_rate']:.0f}%。"
+                    + f"薄弱标签：{', '.join(weak_tags[:3])}。"
+                    + "建议重点练习这些标签，每天坚持 3-5 道题。"
                     if summary["correct_rate"] < 70
                     else "整体掌握良好，继续保持！"
                 ),
