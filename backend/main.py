@@ -2125,11 +2125,10 @@ async def re_extract_all_posts(batch_size: int | None = Query(default=None, ge=1
         _re_extract_cond = "status IN ('done','error') AND raw_content IS NOT NULL"
         with sqlite3.connect(sqlite_service.db_path) as conn:
             conn.row_factory = sqlite3.Row
+            # 删除题库中所有来自爬虫的题目（不限 batch_size），与弹窗「删除所有已提取的面试题」一致
             rows = conn.execute(
                 f"""SELECT task_id, source_url FROM crawl_tasks
-                   WHERE {_re_extract_cond}
-                   LIMIT ?""",
-                (batch_size,),
+                   WHERE {_re_extract_cond}""",
             ).fetchall()
         tasks = [dict(r) for r in rows]
         if not tasks:
@@ -2149,7 +2148,8 @@ async def re_extract_all_posts(batch_size: int | None = Query(default=None, ge=1
                 cur = conn.execute("DELETE FROM questions WHERE source_url=?", (url,))
                 deleted_questions += cur.rowcount
             conn.execute(
-                f"""UPDATE crawl_tasks SET status='fetched', questions_count=0, error_msg=NULL, extraction_source=NULL
+                f"""UPDATE crawl_tasks SET status='fetched', questions_count=0, error_msg=NULL, extraction_source=NULL,
+                    extract_duration_min=NULL
                    WHERE {_re_extract_cond}
                    AND source_url IN (""" + ",".join("?" * len(urls)) + ")",
                 urls,
@@ -2614,7 +2614,8 @@ async def refetch_xhs_body(task_id: str = Query(..., description="任务 ID")):
 
         image_paths = download_images(image_urls, task_id)
 
-    sqlite_service.update_task_content(task_id, post_title=title, raw_content=content, image_paths=image_paths)
+    post_time = pw_data.get("post_time") or ""
+    sqlite_service.update_task_content(task_id, post_title=title, raw_content=content, image_paths=image_paths, post_time=post_time)
 
     logger.info(f"[API] 重抓正文成功 task_id={task_id} title={title[:40]}... ({len(content)} 字)")
 
@@ -2837,7 +2838,40 @@ def get_crawl_task_detail(task_id: str):
     return d
 
 
+@app.delete("/api/crawler/tasks/{task_id}")
+def delete_crawl_task(task_id: str):
+    """删除指定帖子及其关联数据（题目、日志、图片等）。"""
+    deleted = sqlite_service.delete_by_task_id(task_id)
+    if deleted < 0:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"status": "ok", "message": f"已删除帖子及 {deleted} 道题目", "questions_deleted": deleted}
 
+
+@app.post("/api/crawler/tasks/delete-batch")
+def delete_crawl_tasks_batch(body: dict):
+    """批量删除帖子及其关联数据。请求体: { "task_ids": ["uuid1", ...] }"""
+    task_ids = body.get("task_ids") or []
+    if not isinstance(task_ids, list):
+        task_ids = []
+    total_deleted = 0
+    posts_deleted = 0
+    not_found = []
+    for tid in task_ids[:100]:
+        if not tid or not isinstance(tid, str):
+            continue
+        d = sqlite_service.delete_by_task_id(tid)
+        if d >= 0:
+            posts_deleted += 1
+            total_deleted += d
+        else:
+            not_found.append(tid)
+    return {
+        "status": "ok",
+        "message": f"已删除 {posts_deleted} 条帖子、{total_deleted} 道题目",
+        "posts_deleted": posts_deleted,
+        "questions_deleted": total_deleted,
+        "not_found": not_found,
+    }
 
 
 # ══════════════════════════════════════════════════════════════

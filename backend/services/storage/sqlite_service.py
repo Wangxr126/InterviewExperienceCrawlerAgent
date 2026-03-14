@@ -1318,12 +1318,14 @@ class SqliteService:
                            raw_content: Optional[str] = None, image_paths: Optional[List[str]] = None,
                            extraction_source: str = "", agent_used_tool: Optional[bool] = None,
                            extract_duration_min: Optional[float] = None,
-                           trace_session_id: Optional[str] = None):
+                           trace_session_id: Optional[str] = None,
+                           clear_extract_duration: bool = False):
         """更新任务状态。raw_content/image_paths 为 None 时不更新该列（保留原文），避免误覆盖。
         extraction_source: content=正文提取, image=图片OCR提取（帖子维度）
         agent_used_tool: MinerAgent 是否进行了工具调用（True/False/None=不更新）
-        extract_duration_min: LLM 提取耗时（分钟），None=不更新
-        trace_session_id: Miner Agent 推理 trace 的 session_id，用于链接查看 HTML"""
+        extract_duration_min: LLM 提取耗时（分钟，含两阶段总时间），None=不更新
+        trace_session_id: Miner Agent 推理 trace 的 session_id，用于链接查看 HTML
+        clear_extract_duration: 为 True 时清空 extract_duration_min（重置待提取时用）"""
         import json as _json
         sets = ["status=?", "questions_count=?", "error_msg=?", "extraction_source=?", "processed_at=CURRENT_TIMESTAMP"]
         params: list = [status, questions_count, error_msg, extraction_source or None]
@@ -1339,7 +1341,9 @@ class SqliteService:
         if agent_used_tool is not None:
             sets.append("agent_used_tool=?")
             params.append(1 if agent_used_tool else 0)
-        if extract_duration_min is not None:
+        if clear_extract_duration:
+            sets.append("extract_duration_min=NULL")
+        elif extract_duration_min is not None:
             sets.append("extract_duration_min=?")
             params.append(round(extract_duration_min, 2))
         params.append(task_id)
@@ -1348,18 +1352,28 @@ class SqliteService:
             conn.commit()
 
     def update_task_content(self, task_id: str, post_title: str, raw_content: str,
-                            image_paths: List[str] = None):
-        """重抓正文后更新任务：标题、正文、图片路径，并重置为 fetched 待提取"""
+                            image_paths: List[str] = None, post_time: str = None):
+        """重抓正文后更新任务：标题、正文、图片路径，并重置为 fetched 待提取。post_time 为帖子发表时间，None 表示不更新"""
         import json as _json
         img_val = _json.dumps(image_paths or [], ensure_ascii=False) if image_paths else ""
-        with self._get_conn() as conn:
-            conn.execute("""
-                UPDATE crawl_tasks SET post_title=?, raw_content=?, image_paths=?,
-                    status='fetched', error_msg=NULL, questions_count=0,
-                    extraction_source=NULL, processed_at=CURRENT_TIMESTAMP
-                WHERE task_id=?
-            """, (post_title or "", raw_content or "", img_val, task_id))
-            conn.commit()
+        if post_time is not None:
+            with self._get_conn() as conn:
+                conn.execute("""
+                    UPDATE crawl_tasks SET post_title=?, raw_content=?, image_paths=?, post_time=?,
+                        status='fetched', error_msg=NULL, questions_count=0,
+                        extraction_source=NULL, extract_duration_min=NULL, processed_at=CURRENT_TIMESTAMP
+                    WHERE task_id=?
+                """, (post_title or "", raw_content or "", img_val, post_time or "", task_id))
+                conn.commit()
+        else:
+            with self._get_conn() as conn:
+                conn.execute("""
+                    UPDATE crawl_tasks SET post_title=?, raw_content=?, image_paths=?,
+                        status='fetched', error_msg=NULL, questions_count=0,
+                        extraction_source=NULL, extract_duration_min=NULL, processed_at=CURRENT_TIMESTAMP
+                    WHERE task_id=?
+                """, (post_title or "", raw_content or "", img_val, task_id))
+                conn.commit()
 
     def is_url_crawled(self, url: str) -> bool:
         """检查 URL 是否已爬取（已入队或已处理）"""
@@ -1368,6 +1382,14 @@ class SqliteService:
                 "SELECT id FROM crawl_tasks WHERE source_url=?", (url,)
             ).fetchone()
             return row is not None
+
+    def delete_by_task_id(self, task_id: str) -> int:
+        """按 task_id 删除帖子及关联数据。先查 source_url 再调用 delete_by_source_url。返回删除的题目数量，未找到返回 -1。"""
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT source_url FROM crawl_tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not row:
+            return -1
+        return self.delete_by_source_url(row["source_url"])
 
     def delete_by_source_url(self, source_url: str) -> int:
         """

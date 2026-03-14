@@ -317,9 +317,11 @@ def _process_pending_tasks(batch_size: int = None):
                 extraction_src = "image" if agent_used_tool else "content"
                 crawl_task_id = row["id"] if "id" in row.keys() else None
                 count = _save_questions(questions, crawl_task_id=crawl_task_id, skip_neo4j=not agent_succeeded)
-                _dur = round(time.time()-_t0, 1)
-                sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round(_dur/60, 2), trace_session_id=trace_session_id)
-                logger.info(f"  ✅ 提取完成: {count} 道题目入库，耗时 {_dur/60:.1f}min" + ("（仅 SQLite，未写入 Graph）" if not agent_succeeded else "") + (f"（来源：{'图片' if agent_used_tool else '正文'}）" if agent_used_tool else ""))
+                # 耗时 = 两阶段总时间（Stage1 本地 + Stage2 豆包），单位分钟
+                _dur = round(time.time() - _t0, 1)
+                _dur_min = round(_dur / 60, 2)
+                sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=_dur_min, trace_session_id=trace_session_id)
+                logger.info(f"  ✅ 提取完成: {count} 道题目入库，耗时 {_dur_min}min（两阶段总时间）" + ("（仅 SQLite，未写入 Graph）" if not agent_succeeded else "") + (f"（来源：{'图片' if agent_used_tool else '正文'}）" if agent_used_tool else ""))
                 logger.info("")
                 processed += count
                 continue
@@ -414,8 +416,8 @@ def process_single_task(task_id: str) -> Dict:
             conn.commit()
             logger.info(f"[SingleTask] 已删除旧题目 {old_count} 道")
 
-    # 重置状态为 fetched，确保后续写库逻辑正确
-    sqlite_service.update_task_status(task_id, "fetched", raw_content=raw_content, image_paths=image_paths)
+    # 重置状态为 fetched，清空耗时（后续提取完成时会重新记录两阶段总时间）
+    sqlite_service.update_task_status(task_id, "fetched", raw_content=raw_content, image_paths=image_paths, clear_extract_duration=True)
 
     _t0 = time.time()
     try:
@@ -451,9 +453,10 @@ def process_single_task(task_id: str) -> Dict:
         extraction_src = "image" if agent_used_tool else "content"
         crawl_task_id = task.get("id") if isinstance(task, dict) else None
         count = _save_questions(questions, crawl_task_id=crawl_task_id, skip_neo4j=not agent_succeeded)
-        _dur = round(time.time() - _t0, 1)
-        sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round(_dur / 60, 2), trace_session_id=trace_session_id)
-        logger.info(f"[SingleTask] 完成 task_id={task_id}: {count} 道题目入库, ocr_called={agent_used_tool}" + ("（仅 SQLite）" if not agent_succeeded else ""))
+        # 耗时 = 两阶段总时间（Stage1 + Stage2），单位分钟
+        _dur_min = round((time.time() - _t0) / 60, 2)
+        sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=_dur_min, trace_session_id=trace_session_id)
+        logger.info(f"[SingleTask] 完成 task_id={task_id}: {count} 道题目入库, 耗时 {_dur_min}min, ocr_called={agent_used_tool}" + ("（仅 SQLite）" if not agent_succeeded else ""))
         return {
             "status": "ok",
             "message": f"提取完成，{count} 道题目入库" + ("（含 OCR 识别图片）" if agent_used_tool else ""),

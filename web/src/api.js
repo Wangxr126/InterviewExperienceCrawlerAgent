@@ -228,6 +228,22 @@ export const api = {
     return r.json()
   },
 
+  /** 删除单个帖子及关联数据 */
+  async deleteTask(taskId) {
+    const r = await fetch(`${BASE}/api/crawler/tasks/${taskId}`, { method: 'DELETE' })
+    return r.json()
+  },
+
+  /** 批量删除帖子及关联数据 */
+  async deleteTasksBatch(taskIds) {
+    const r = await fetch(`${BASE}/api/crawler/tasks/delete-batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task_ids: taskIds }),
+    })
+    return r.json()
+  },
+
   // ── 定时任务管理 ──────────────────────────────────────
   async getSchedulerJobs(params = '') {
     const r = await fetch(`${BASE}/api/scheduler/jobs${params}`)

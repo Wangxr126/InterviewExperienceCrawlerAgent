@@ -67,7 +67,7 @@ def _patched_json_loads(s, *args, **kwargs):
         return _stdlib_json.loads(s, *args, **kwargs)
     except _stdlib_json.JSONDecodeError as e:
         err_str = str(e)
-        if any(x in err_str for x in ("Unterminated string", "Expecting value", "Invalid control character")):
+        if any(x in err_str for x in ("Unterminated string", "Expecting value", "Invalid control character", "Expecting ',' delimiter")):
             try:
                 repaired = _repair_tool_arguments_json(s)
                 result = _stdlib_json.loads(repaired, *args, **kwargs)
@@ -100,6 +100,7 @@ def apply_patch():
             "hello_agents.agents.simple_agent",
             "hello_agents.agents.reflection_agent",
             "hello_agents.agents.plan_solve_agent",
+            "backend.agents.two_stage_miner_agent",
         ):
             try:
                 import importlib

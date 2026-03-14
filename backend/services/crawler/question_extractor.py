@@ -652,12 +652,20 @@ def extract_questions_from_post(
                 )
             # 情况B：上次解析失败（空/格式错误）
             elif not items or status != "ok":
+                _err_hint = ""
+                try:
+                    from backend.agents.two_stage_miner_agent import _last_extraction_error
+                    if _last_extraction_error:
+                        _err_hint = f"\n\n**上次失败原因**：{_last_extraction_error}\n请针对上述错误修正输出，确保 JSON 合法。"
+                except Exception:
+                    pass
                 attempt_prompt = user_prompt + (
                     f"\n\n【第{attempt}次重试 - 重要纠错】"
                     "上一次你的回复不是合法的 JSON 数组，解析失败。"
                     "这次必须只输出 JSON 数组本身，直接以 [ 开头、以 ] 结尾，"
                     "不要有任何前缀、说明、Markdown 格式或代码块。"
                     "即使面经是叙述性格式，也必须从中归纳题目并输出 JSON 数组。"
+                    f"{_err_hint}"
                 )
             # 情况C：上次提取 < 3 道且有图片但未调用 OCR → 强制提示先 OCR
             elif len(items) < 3 and image_paths and not agent_used_tool:
@@ -669,10 +677,18 @@ def extract_questions_from_post(
                 )
             # 情况D：其他重试
             else:
+                _err_hint = ""
+                try:
+                    from backend.agents.two_stage_miner_agent import _last_extraction_error
+                    if _last_extraction_error:
+                        _err_hint = f"\n\n**上次失败原因**：{_last_extraction_error}\n请针对上述错误修正输出。"
+                except Exception:
+                    pass
                 attempt_prompt = user_prompt + (
                     f"\n\n【第{attempt}次重试 - 重要纠错】"
                     "上一次提取的题目数量不足或格式有误。"
                     "这次必须只输出 JSON 数组本身，直接以 [ 开头、以 ] 结尾，确保提取所有题目。"
+                    f"{_err_hint}"
                 )
         raw, ocr_called, is_unrelated = _call_llm_with_agent(
             content=full_content,

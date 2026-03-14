@@ -210,6 +210,11 @@
               批量重新提取 ({{ selectedTaskIds.length }})
             </el-button>
           </el-tooltip>
+          <el-tooltip v-if="selectedTaskIds.length > 0" content="删除勾选的帖子及题目（不可恢复）" placement="bottom">
+            <el-button size="small" type="danger" :loading="deleteBatchLoading" @click="deleteBatchTasks">
+              批量删除 ({{ selectedTaskIds.length }})
+            </el-button>
+          </el-tooltip>
           <el-button size="small" type="danger" plain @click="showClearAllDialog = true">清除所有</el-button>
         </div>
       </div>
@@ -289,10 +294,10 @@
             <span v-else style="color:#c0c4cc">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="耗时" prop="extract_duration_min" width="75" align="center" sortable="custom">
+        <el-table-column label="耗时" prop="extract_duration_min" width="85" align="center" sortable="custom">
           <template #default="{ row }">
-            <span v-if="row.extract_duration_min != null" class="duration-value">{{ row.extract_duration_min }}min</span>
-            <span v-else class="duration-empty">—</span>
+            <span v-if="row.extract_duration_min != null" class="duration-value" :title="`两阶段总时间（Stage1+Stage2）`">{{ formatDuration(row.extract_duration_min) }}</span>
+            <span v-else class="duration-empty" title="未记录（历史记录或提取中）">—</span>
           </template>
         </el-table-column>
         <el-table-column label="提取时间" prop="processed_at" width="115" align="center" sortable="custom">
@@ -303,7 +308,8 @@
         </el-table-column>
         <el-table-column label="发表时间" prop="post_time" width="115" align="center" sortable="custom">
           <template #default="{ row }">
-            <span style="font-size:11px;white-space:nowrap">{{ (row.post_time || row.discovered_at)?.slice(0,16) || '—' }}</span>
+            <span v-if="row.post_time" style="font-size:11px;white-space:nowrap">{{ row.post_time?.slice(0,16) }}</span>
+            <span v-else style="color:#c0c4cc;font-size:12px">—</span>
           </template>
         </el-table-column>
       </el-table>
@@ -450,7 +456,7 @@
 
 <script setup>
 import { ref, reactive, computed, watch, onMounted, onUnmounted, onActivated } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { WarningFilled, Loading, QuestionFilled, Document } from '@element-plus/icons-vue'
 import { api } from '../api.js'
 
@@ -501,6 +507,7 @@ const refetchLoading        = ref(null)  // task_id 正在重抓正文
 const taskTableRef           = ref(null)
 const selectedTaskIds        = ref([])
 const reExtractBatchLoading  = ref(false)
+const deleteBatchLoading     = ref(false)
 
 const form = reactive({ keywords: '', maxPages: 5, xhsCount: 20 })
 
@@ -686,6 +693,13 @@ const handleSearch = () => {
 
 const onTaskSelectionChange = (rows) => {
   selectedTaskIds.value = rows.map(r => r.task_id).filter(Boolean)
+}
+
+/** 耗时格式化：保留 2 位小数，避免 10.06166666666667min 等异常显示 */
+const formatDuration = (min) => {
+  if (min == null) return '—'
+  const n = Number(min)
+  return (isNaN(n) ? '—' : n.toFixed(2) + 'min')
 }
 
 const loadTasks = async () => {
@@ -1041,6 +1055,40 @@ const reExtractBatch = async () => {
     ElMessage.error('批量重新提取请求失败')
   } finally {
     reExtractBatchLoading.value = false
+  }
+}
+
+const deleteBatchTasks = async () => {
+  const ids = selectedTaskIds.value
+  if (!ids?.length) {
+    ElMessage.warning('请先勾选要删除的帖子')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(`确定删除选中的 ${ids.length} 条帖子及其题目？此操作不可恢复。`, '批量删除确认', {
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch {
+    return
+  }
+  deleteBatchLoading.value = true
+  try {
+    const d = await api.deleteTasksBatch(ids)
+    if (d?.status === 'ok') {
+      ElMessage.success(d.message || `已删除 ${ids.length} 条`)
+      taskTableRef.value?.clearSelection()
+      selectedTaskIds.value = []
+      await loadStats()
+      await loadTasks()
+    } else {
+      ElMessage.error(d?.message || d?.detail || '批量删除失败')
+    }
+  } catch {
+    ElMessage.error('批量删除请求失败')
+  } finally {
+    deleteBatchLoading.value = false
   }
 }
 

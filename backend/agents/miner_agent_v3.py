@@ -150,9 +150,12 @@ class MinerAgentV3(ReActAgent):
             - ocr_called: 是否调用了 ocr_images
             - is_unrelated: LLM 是否主动调用了 mark_unrelated
         """
-        # 两阶段模式：使用专门的两阶段提取器
+        # 两阶段模式：使用专门的两阶段提取器（支持重试时注入纠错指令）
         if self._mode == "two_stage":
-            return self._two_stage_extractor.extract(content, has_image, company, position)
+            return self._two_stage_extractor.extract(
+                content, has_image, company, position,
+                user_input_override=user_input_override,
+            )
         
         # 单阶段模式和结构化输出模式：使用 ReActAgent
         user_input = user_input_override or format_miner_user_prompt(

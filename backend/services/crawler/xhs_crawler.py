@@ -404,13 +404,23 @@ async def _fetch_xhs_with_playwright(url: str, headless: bool = True) -> Dict | 
                         const title = note.title || '';
                         const desc = note.desc || '';
                         const images = (note.imageList || []).map(i => i.urlDefault || i.url || '').filter(Boolean);
-                        return { title, content: desc, image_urls: images };
+                        const ts = note.time || note.lastModifyTime || note.createTime || 0;
+                        return { title, content: desc, image_urls: images, time_ms: ts };
                     }
                 } catch {}
                 return null;
             }""")
             if data and (data.get("content") or "").strip():
                 await browser.close()
+                # 将 time_ms 转为 post_time 字符串（北京时间）
+                post_time = ""
+                if data.get("time_ms"):
+                    try:
+                        from backend.utils.time_utils import timestamp_ms_to_beijing
+                        post_time = timestamp_ms_to_beijing(int(data["time_ms"]))
+                    except Exception:
+                        pass
+                data["post_time"] = post_time
                 return data
 
             # DOM 兜底：正文区域
@@ -425,7 +435,7 @@ async def _fetch_xhs_with_playwright(url: str, headless: bool = True) -> Dict | 
                     if src and "http" in src:
                         img_urls.append(src)
                 await browser.close()
-                return {"title": (title or "").strip(), "content": (content or "").strip(), "image_urls": img_urls}
+                return {"title": (title or "").strip(), "content": (content or "").strip(), "image_urls": img_urls, "post_time": ""}
         except Exception as e:
             logger.debug(f"Playwright 兜底抓取失败（可能是 event loop 问题）: {url[:60]}")
         await browser.close()
@@ -463,6 +473,18 @@ async def _async_fetch_details(links: List[str]) -> List[Dict]:
             if hasattr(post, "images") and post.images:
                 images = list(post.images)
 
+            # 尝试从 xhs-crawl post 对象提取 post_time（帖子发表时间）
+            post_time = ""
+            for attr in ("time", "last_modify_time", "create_time", "lastModifyTime", "createTime"):
+                val = getattr(post, attr, None)
+                if val:
+                    try:
+                        from backend.utils.time_utils import timestamp_ms_to_beijing
+                        post_time = timestamp_ms_to_beijing(int(val))
+                        break
+                    except Exception:
+                        pass
+
             # 「页面不见了」类：xhs-crawl 遇防爬返回占位页，用 Playwright 兜底
             if _is_page_not_found_result(title, content):
                 logger.info(f"xhs-crawl 返回「页面不见了」，尝试 Playwright 兜底: {url[:60]}...")
@@ -471,6 +493,7 @@ async def _async_fetch_details(links: List[str]) -> List[Dict]:
                     title = pw_data.get("title") or title
                     content = pw_data.get("content") or content
                     images = pw_data.get("image_urls") or images
+                    post_time = pw_data.get("post_time", "") or post_time
                     logger.info(f"Playwright 兜底成功: {title[:30]}... ({len(content)} 字)")
                 else:
                     logger.warning(f"Playwright 兜底失败，保留空正文: {url[:60]}...")
@@ -489,6 +512,7 @@ async def _async_fetch_details(links: List[str]) -> List[Dict]:
                 "image_count": len(images),
                 "source_url": url,
                 "source_platform": "xiaohongshu",
+                "post_time": post_time,
             })
             logger.info(f"XHS 获取详情 [{idx}/{len(links)}]: {clean_title[:30]} ({len(content)}字, {len(images)}图)")
             await asyncio.sleep(random.uniform(3, 6))

@@ -36,6 +36,7 @@ def save_xhs_post(
         post_title=title,
         post_type=post.get("post_type", ""),
         discover_keyword=post.get("discover_keyword", ""),
+        post_time=post.get("post_time", ""),
     )
     if not task_id:
         return None

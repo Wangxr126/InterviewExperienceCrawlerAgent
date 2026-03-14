@@ -10,7 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
 
-from hello_agents import ReActAgent
+from hello_agents import SimpleAgent
+from backend.agents.miner_react_agent import MinerReActAgent
 from hello_agents.core.llm import HelloAgentsLLM
 from hello_agents.core.config import Config as HelloAgentsConfig
 from hello_agents.tools import ToolRegistry
@@ -26,6 +27,9 @@ from backend.agents.prompts.two_stage_prompts import (
 logger = logging.getLogger(__name__)
 
 UNRELATED_SIGNAL = "__UNRELATED__"
+
+# 上次提取失败时的错误信息，供重试时注入 prompt
+_last_extraction_error: str | None = None
 
 
 class TwoStageExtractor:
@@ -76,7 +80,7 @@ class TwoStageExtractor:
             max_concurrent_tools=2,
         )
 
-        self.rough_agent = ReActAgent(
+        self.rough_agent = MinerReActAgent(
             name="Rough Extractor",
             llm=self.rough_llm,
             tool_registry=registry,
@@ -84,6 +88,23 @@ class TwoStageExtractor:
             max_steps=settings.miner_max_steps,
             config=_agent_config,
         )
+
+        # Stage 2：SimpleAgent（纯对话，无工具），豆包精加工
+        if settings.miner_stage2_base_url and settings.miner_stage2_model:
+            self.enrich_llm = HelloAgentsLLM(
+                model=settings.miner_stage2_model,
+                api_key=settings.miner_stage2_api_key or "sk-dummy",
+                base_url=settings.miner_stage2_base_url,
+                temperature=settings.miner_stage2_temperature,
+                timeout=settings.miner_stage2_timeout,
+            )
+            self.enrich_agent = SimpleAgent(
+                name="Enrich Extractor",
+                llm=self.enrich_llm,
+                system_prompt=ENRICH_SYSTEM_PROMPT,
+            )
+        else:
+            self.enrich_agent = None
 
         logger.info(
             "[TwoStageExtractor] 初始化完成 "
@@ -96,9 +117,13 @@ class TwoStageExtractor:
         has_image: bool = False,
         company: str = "",
         position: str = "",
+        user_input_override: str = None,
     ) -> Tuple[str, bool, bool]:
         """
         两阶段提取
+
+        Args:
+            user_input_override: 重试时注入的纠错指令（含上次失败原因），为 None 时自动格式化
 
         Returns:
             (answer, ocr_called, is_unrelated)
@@ -106,13 +131,16 @@ class TwoStageExtractor:
             - ocr_called: 是否调用了 ocr_images
             - is_unrelated: 是否无关帖子
         """
+        global _last_extraction_error
+        _last_extraction_error = None
+
         # ========== Stage 1：粗提取（本地） ==========
         logger.info("[TwoStageExtractor] 开始 Stage 1：粗提取（本地）")
         logger.info(
             "[TwoStageExtractor] 预计 2-5 分钟（OCR ~1 分钟 + 模型生成 1-3 分钟），请勿中断"
         )
 
-        user_input = format_miner_user_prompt(
+        user_input = user_input_override or format_miner_user_prompt(
             content=content,
             has_image=has_image,
             company=company or "",
@@ -155,24 +183,40 @@ class TwoStageExtractor:
             logger.info(f"[TwoStageExtractor] Stage 1 完成，提取到 {len(rough_questions)} 道题")
 
         except Exception as e:
+            _last_extraction_error = str(e)
             logger.error(f"[TwoStageExtractor] Stage 1 异常: {e}")
             return "", self._ocr_called, False
 
-        # ========== Stage 2：精加工（豆包 API，仅传题目文本） ==========
-        logger.info("[TwoStageExtractor] 开始 Stage 2：精加工 model=%s", settings.miner_stage2_model)
+        # 规范化字段名：模型可能返回 question/answer/category，需映射为 question_text/answer_text/question_type
+        rough_questions = [self._normalize_question_item(q) for q in rough_questions if isinstance(q, dict)]
+        rough_questions = [q for q in rough_questions if q]
 
+        # 仅当提取到有效题目 > 0 时才执行 Stage 2
+        valid_questions = [q for q in rough_questions if q.get("question_text")]
+        if not valid_questions:
+            logger.info("[TwoStageExtractor] Stage 1 无有效题目，跳过 Stage 2，直接返回")
+            for q in rough_questions:
+                if isinstance(q, dict):
+                    q["raw_answer"] = q.get("answer_text", "")
+            return json.dumps(rough_questions, ensure_ascii=False), self._ocr_called, False
+
+        # ========== Stage 2：精加工（SimpleAgent，豆包 API） ==========
+        if not self.enrich_agent:
+            logger.info("[TwoStageExtractor] 未配置 Stage 2，直接返回 Stage 1 结果")
+            for q in rough_questions:
+                if isinstance(q, dict):
+                    q["raw_answer"] = q.get("answer_text", "")
+            return json.dumps(rough_questions, ensure_ascii=False), self._ocr_called, False
+
+        logger.info("[TwoStageExtractor] 开始 Stage 2：精加工 model=%s", settings.miner_stage2_model)
         try:
             questions_text = "\n".join(
                 f"{i+1}. {q.get('question_text', '')}"
-                for i, q in enumerate(rough_questions)
-                if isinstance(q, dict)
+                for i, q in enumerate(valid_questions)
             )
             enrich_input = ENRICH_USER_PROMPT_TEMPLATE.format(questions_text=questions_text)
-
-            enrich_result = self._call_doubao_enrich(
-                system_prompt=ENRICH_SYSTEM_PROMPT,
-                user_prompt=enrich_input,
-            )
+            enrich_result = self.enrich_agent.run(enrich_input)
+            enrich_result = (enrich_result or "").strip()
 
             if enrich_result:
                 _preview = enrich_result 
@@ -181,7 +225,7 @@ class TwoStageExtractor:
                 enrich_result = self._extract_json_if_direct_reply(enrich_result)
 
                 # 合并 Stage 2 的 answer_text 与 Stage 1 的元数据（下游需要完整 7 字段）
-                enrich_result = self._merge_stage2_with_stage1(enrich_result, rough_questions)
+                enrich_result = self._merge_stage2_with_stage1(enrich_result, valid_questions)
 
                 # 保存两阶段对比数据（用于微调）
                 self._save_two_stage_log(
@@ -199,7 +243,8 @@ class TwoStageExtractor:
         # 降级：返回 Stage 1 结果，补充 raw_answer（与 answer_text 相同）
         try:
             for q in rough_questions:
-                q["raw_answer"] = q.get("answer_text", "")
+                if isinstance(q, dict):
+                    q["raw_answer"] = q.get("answer_text", "")
             return json.dumps(rough_questions, ensure_ascii=False), self._ocr_called, False
         except Exception:
             return rough_result, self._ocr_called, False
@@ -234,36 +279,6 @@ class TwoStageExtractor:
             return json.dumps(merged, ensure_ascii=False)
         except Exception:
             return enrich_result
-
-    def _call_doubao_enrich(self, system_prompt: str, user_prompt: str) -> str:
-        """调用豆包 API 进行精加工（OpenAI 兼容接口），使用 settings.miner_stage2_* 配置"""
-        from openai import OpenAI
-
-        api_key = settings.miner_stage2_api_key
-        base_url = settings.miner_stage2_base_url
-        model = settings.miner_stage2_model
-        logger.debug("[TwoStageExtractor] Stage 2 请求 model=%s base_url=%s", model, base_url)
-
-        if not base_url:
-            raise ValueError("未配置 MINER_STAGE2_BASE_URL 或 MINER_REMOTE_BASE_URL，无法调用豆包")
-
-        client = OpenAI(
-            api_key=api_key or "sk-dummy",
-            base_url=base_url,
-            timeout=settings.miner_stage2_timeout,
-        )
-
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=settings.miner_stage2_temperature,
-            max_tokens=settings.miner_stage2_max_tokens or 4096,
-        )
-
-        return (resp.choices[0].message.content or "").strip()
 
     def _save_two_stage_log(
         self,
@@ -384,6 +399,15 @@ class TwoStageExtractor:
         """兜底：模型输出 Markdown 而非调用 Finish 时，从 Markdown 中提取题目列表"""
         import re
 
+        # 对话式/帮助菜单回复：模型输出「请问您需要」「我可以帮您」等，非面试题，直接返回空
+        _conversational_markers = (
+            "请问您需要", "我可以帮您", "需要什么帮助", "您需要我", "请告诉我您",
+            "解释这个面试状态的含义", "提供针对", "面试准备建议", "帮您规划", "其他您需要的帮助",
+        )
+        if any(m in text for m in _conversational_markers):
+            logger.warning("[TwoStageExtractor] Markdown 兜底跳过：检测到对话式/帮助菜单回复，非面试题")
+            return []
+
         # 分类标题黑名单（如 1. 项目经验类、2. 高级系统设计类），避免误提
         SECTION_HEADER_SUFFIXES = ("类", "题", "类问题", "问题")
         SECTION_HEADER_WHITELIST = (
@@ -405,9 +429,17 @@ class TwoStageExtractor:
                 return True
             return False
 
+        def _is_help_menu_item(qt: str) -> bool:
+            """过滤帮助菜单/选项类文本（如「解释xxx的含义」「提供xxx建议」），非面试题"""
+            _help_patterns = (
+                "解释", "提供", "帮您", "帮您规划", "其他您需要", "请问您",
+                "面试状态的含义", "面试准备建议", "面试步骤", "您需要的帮助",
+            )
+            return any(p in qt for p in _help_patterns)
+
         def _make_item(qt: str) -> dict:
             qt = qt.strip()
-            if len(qt) < 2 or _is_section_header(qt):
+            if len(qt) < 2 or _is_section_header(qt) or _is_help_menu_item(qt):
                 return None
             return {
                 "question_text": qt,
@@ -539,7 +571,7 @@ class TwoStageExtractor:
                             chunk = TwoStageExtractor._repair_json(text[i : j + 1])
                             try:
                                 obj = json.loads(chunk)
-                                if isinstance(obj, dict) and obj.get("question_text"):
+                                if isinstance(obj, dict) and (obj.get("question_text") or obj.get("question")):
                                     results.append(obj)
                             except json.JSONDecodeError:
                                 pass
@@ -549,6 +581,44 @@ class TwoStageExtractor:
             else:
                 i += 1
         return results
+
+    def _normalize_question_item(self, q: dict) -> dict | None:
+        """规范化题目字段：模型可能用 question/answer/category，映射为 question_text/answer_text/question_type"""
+        if not isinstance(q, dict):
+            return None
+        qt = q.get("question_text") or q.get("question") or ""
+        if not qt or not isinstance(qt, str):
+            return None
+        at = q.get("answer_text") or q.get("answer") or ""
+        qtype = (
+            q.get("question_type")
+            or q.get("category")
+            or q.get("role")
+            or q.get("type")  # 兼容 LLM 输出 "type": "project"/"theory"
+            or "基础类"
+        )
+        # category/type 英文映射为中文类型
+        if qtype in ("AI", "ai"):
+            qtype = "AI类"
+        elif qtype in ("Engineering", "engineering", "project"):
+            qtype = "工程类"
+        elif qtype in ("Algorithm", "algorithm"):
+            qtype = "算法类"
+        elif qtype in ("theory", "Theory"):
+            qtype = "基础类"
+        elif qtype in ("soft_skill", "SoftSkill"):
+            qtype = "软技能"
+        elif qtype not in ("算法类", "AI类", "工程类", "基础类", "软技能"):
+            qtype = "基础类"
+        return {
+            "question_text": qt.strip(),
+            "answer_text": (at if isinstance(at, str) else str(at)).strip() or f"（待补充）{qt[:50]}",
+            "difficulty": q.get("difficulty") if q.get("difficulty") in ("easy", "medium", "hard") else "medium",
+            "question_type": qtype,
+            "topic_tags": q.get("topic_tags") if isinstance(q.get("topic_tags"), list) else [],
+            "company": q.get("company") or "",
+            "position": q.get("position") or "",
+        }
 
     @staticmethod
     def _repair_json(text: str) -> str:
@@ -562,6 +632,24 @@ class TwoStageExtractor:
         s = re.sub(r'"answer\s*:\s*text"', '"answer_text"', s, flags=re.IGNORECASE)
         # 移除尾随逗号（在 ] 或 } 前的逗号）
         s = re.sub(r',\s*([}\]])', r'\1', s)
+        # 修复 "question"/"question_text" 后的无效值（如 "question":㏜、乱码、缺引号）
+        s = re.sub(
+            r'("question_text"|"question")\s*:\s*([^"\[\]{}ntf0-9\-][^\n"]*)',
+            r'\1: ""',
+            s,
+        )
+        # 修复 "answer"/"answer_text" 后的无效值（同上，避免 JSON 解析失败）
+        s = re.sub(
+            r'("answer_text"|"answer")\s*:\s*([^"\[\]{}ntf0-9\-][^\n"]*)',
+            r'\1: ""',
+            s,
+        )
+        # 修复缺失逗号："" 与下一键 "key" 之间无逗号时补上（支持无空格，如 "value""key"）
+        s = re.sub(r'""\s*"', r' "", "', s)
+        # 修复数组元素间缺失逗号：} 与 { 之间（如 }  { 或 }\n{）
+        s = re.sub(r'}\s*{', r'},{', s)
+        # 替换字符串内的中文引号/智能引号，避免解析为 JSON 边界
+        s = s.replace("\u201c", '"').replace("\u201d", '"')
         return s
 
     @staticmethod
@@ -593,10 +681,11 @@ class TwoStageExtractor:
                     depth -= 1
                     if depth == 0:
                         candidate = clean[start : i + 1]
+                        repaired = TwoStageExtractor._repair_json(candidate)
                         try:
-                            parsed = json.loads(candidate)
-                            if isinstance(parsed, list) and len(candidate) > len(best):
-                                best = candidate
+                            parsed = json.loads(repaired)
+                            if isinstance(parsed, list) and len(repaired) > len(best):
+                                best = repaired
                         except json.JSONDecodeError:
                             pass
                         break
