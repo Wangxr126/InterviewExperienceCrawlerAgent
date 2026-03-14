@@ -699,6 +699,26 @@ class _Settings:
     def nowcoder_cookie(self) -> str:
         return _get("NOWCODER_COOKIE")
 
+    @property
+    def crawler_source(self) -> str:
+        """爬虫来源：local=本地后端爬虫 | mcp=远程 MCP Content Fetcher"""
+        return _get("CRAWLER_SOURCE", "local").lower()
+
+    @property
+    def mcp_content_fetcher_url(self) -> str:
+        """MCP Content Fetcher 根 URL（CRAWLER_SOURCE=mcp 时生效）"""
+        return _get("MCP_CONTENT_FETCHER_URL", "https://mcp-content-fetcher.onrender.com").rstrip("/")
+
+    @property
+    def mcp_content_fetcher_timeout(self) -> int:
+        """MCP Content Fetcher 请求超时秒数"""
+        return _get_int("MCP_CONTENT_FETCHER_TIMEOUT", 30)
+
+    @property
+    def smithery_api_key(self) -> str:
+        """Smithery API Key（通过 Smithery 网关时用于鉴权）"""
+        return _get("SMITHERY_API_KEY", "")
+
     # ── 10. 调度器 ────────────────────────────────────────────────
     @property
     def scheduler_enable_nowcoder(self) -> bool:

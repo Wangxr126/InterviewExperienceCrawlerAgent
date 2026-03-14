@@ -28,6 +28,20 @@ logger = logging.getLogger(__name__)
 
 UNRELATED_SIGNAL = "__UNRELATED__"
 
+# 模型输出非 JSON 时，重试注入的纠错指令
+_JSON_RETRY_INSTRUCTION = """
+
+## ⚠️ 重要纠错（上次输出不符合要求）
+你上次的输出不是合法的 JSON 格式（可能是 Markdown、解释性文字或带前缀/后缀）。
+请严格按照以下要求重新输出：
+- **必须是纯 JSON 数组**，直接以 `[` 开头、`]` 结尾
+- **严禁** Markdown 格式（如 ###、####、-、*、** 等）
+- **严禁** ```json 代码块包裹
+- **严禁** 任何解释、说明、总结、洞察等自然语言
+- 不管有多少道题（10道、30道、50道），都必须用 JSON 数组格式输出，禁止用 Markdown 列表
+- 直接输出题目列表，不要任何前缀或后缀
+"""
+
 # 上次提取失败时的错误信息，供重试时注入 prompt
 _last_extraction_error: str | None = None
 
@@ -119,12 +133,14 @@ class TwoStageExtractor:
         company: str = "",
         position: str = "",
         user_input_override: str = None,
+        _retry_count: int = 0,
     ) -> Tuple[str, bool, bool]:
         """
         两阶段提取
 
         Args:
             user_input_override: 重试时注入的纠错指令（含上次失败原因），为 None 时自动格式化
+            _retry_count: 内部重试计数，防止无限递归
 
         Returns:
             (answer, ocr_called, is_unrelated)
@@ -185,9 +201,23 @@ class TwoStageExtractor:
                 except Exception:
                     pass
                 rough_questions = self._parse_json_fallback(rough_result)
-                if not rough_questions:
-                    # 兜底：模型输出 Markdown 而非 JSON 时，尝试从 Markdown 提取题目
-                    rough_questions = self._parse_markdown_to_questions(rough_result)
+                if not rough_questions and _retry_count == 0:
+                    # 不兜底 Markdown，改为强制重试：要求模型用 JSON 重新输出
+                    logger.warning("[TwoStageExtractor] Stage 1 输出非 JSON，触发重试（禁止 Markdown）")
+                    retry_prompt = format_miner_user_prompt(
+                        content=content,
+                        has_image=has_image,
+                        company=company or "",
+                        position=position or "",
+                    ) + _JSON_RETRY_INSTRUCTION
+                    return self.extract(
+                        content=content,
+                        has_image=has_image,
+                        company=company,
+                        position=position,
+                        user_input_override=retry_prompt,
+                        _retry_count=1,
+                    )
                 if not rough_questions:
                     raise je
             logger.info(f"[TwoStageExtractor] Stage 1 完成，提取到 {len(rough_questions)} 道题")
@@ -407,155 +437,6 @@ class TwoStageExtractor:
                     return
         except Exception as e:
             logger.debug(f"[TwoStageExtractor] 无法从工具计数追踪 OCR: {e}")
-
-    @staticmethod
-    def _parse_markdown_to_questions(text: str) -> list:
-        """兜底：模型输出 Markdown 而非调用 Finish 时，从 Markdown 中提取题目列表"""
-        import re
-
-        # 对话式/帮助菜单回复：模型输出「请问您需要」「我可以帮您」等，非面试题，直接返回空
-        _conversational_markers = (
-            "请问您需要", "我可以帮您", "需要什么帮助", "您需要我", "请告诉我您",
-            "解释这个面试状态的含义", "提供针对", "面试准备建议", "帮您规划", "其他您需要的帮助",
-        )
-        if any(m in text for m in _conversational_markers):
-            logger.warning("[TwoStageExtractor] Markdown 兜底跳过：检测到对话式/帮助菜单回复，非面试题")
-            return []
-
-        # 分类标题黑名单（如 1. 项目经验类、2. 高级系统设计类），避免误提
-        SECTION_HEADER_SUFFIXES = ("类", "题", "类问题", "问题")
-        SECTION_HEADER_WHITELIST = (
-            "项目经验类", "高级系统设计类", "数据库事务类", "数据库索引类",
-            "网络协议类", "手撕编程题", "结构化面试问题列表", "字节后端开发实习二面问题",
-        )
-
-        def _is_section_header(qt: str) -> bool:
-            qt = qt.strip()
-            if len(qt) < 2 or len(qt) > 25:
-                return False
-            # XXX类、XXX题 结尾
-            if qt.endswith(SECTION_HEADER_SUFFIXES) and len(qt) <= 12:
-                return True
-            if qt in SECTION_HEADER_WHITELIST:
-                return True
-            # 共N题、共22题 等
-            if re.match(r"^共\d+[题道]?$", qt):
-                return True
-            return False
-
-        def _is_help_menu_item(qt: str) -> bool:
-            """过滤帮助菜单/选项类文本（如「解释xxx的含义」「提供xxx建议」），非面试题"""
-            _help_patterns = (
-                "解释", "提供", "帮您", "帮您规划", "其他您需要", "请问您",
-                "面试状态的含义", "面试准备建议", "面试步骤", "您需要的帮助",
-            )
-            return any(p in qt for p in _help_patterns)
-
-        def _make_item(qt: str) -> dict:
-            qt = qt.strip()
-            if len(qt) < 2 or _is_section_header(qt) or _is_help_menu_item(qt):
-                return None
-            return {
-                "question_text": qt,
-                "answer_text": f"（待补充）{qt[:50]}...",
-                "difficulty": "medium",
-                "question_type": "基础类",
-                "topic_tags": [],
-                "company": "",
-                "position": "",
-            }
-
-        skip_patterns = (
-            r"^#+\s",  # 标题
-            r"^来自",  # 来自华为备忘录
-            r"^NOTE\s*$",
-            r"^字节\S*$",  # 纯「字节xxx」短行（如字节二面）
-            r"^实习\S*$",
-            r"^面经\s*$",
-            r"^\*\*注\*\*",
-            r"^>",
-            r"^\*\*\d+[\.、]\s*[\u4e00-\u9fa5]+[类题]\s*\*\*",  # **1. 项目经验类** 等
-            r"^\*\*[一二三四五六七八九十\d]+[\.、]",  # **一、**二、**1. 等小节标题
-            r"^[\u4e00-\u9fa5]+[类题]\s*$",  # 纯「XXX类」「XXX题」短行
-        )
-        results = []
-        seen = set()  # 去重：question_text 规范化后
-        lines = text.split("\n")
-
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            # ### 1. 题目 格式（豆包等模型常用，需在 skip 前处理）
-            m = re.match(r"^#+\s*(\d+)[\.、]\s*(.+)$", stripped)
-            if m:
-                qt = m.group(2).strip().rstrip("。？?")
-                if len(qt) >= 3:
-                    item = _make_item(qt)
-                    if item:
-                        key = qt[:80]
-                        if key not in seen:
-                            seen.add(key)
-                            results.append(item)
-                continue
-            if any(re.match(p, stripped, re.I) for p in skip_patterns):
-                continue
-            # 1. 题目 或 9. 题目 或 10. 题目（排除 **1. 项目经验类** 等分类标题）
-            m = re.match(r"^\s*(\d+)[\.、]\s*(.+)$", stripped)
-            if m:
-                qt = m.group(2).strip().rstrip("。？?")
-                if len(qt) >= 3:
-                    item = _make_item(qt)
-                    if item:
-                        key = qt[:80]  # 去重键
-                        if key not in seen:
-                            seen.add(key)
-                            results.append(item)
-                continue
-            # - **题目**：描述 或 * **题目**：描述
-            m = re.match(r"^\s*[-*]\s*\*\*(.+?)\*\*[：:]\s*(.+)$", stripped)
-            if m:
-                title = m.group(1).strip()
-                desc = m.group(2).strip()
-                qt = f"{title}：{desc}" if desc else title
-                if len(qt) >= 3:
-                    item = _make_item(qt)
-                    if item:
-                        key = qt[:80]
-                        if key not in seen:
-                            seen.add(key)
-                            results.append(item)
-                continue
-            # 手撕：xxx
-            m = re.match(r"^手撕[：:]\s*(.+)$", stripped)
-            if m:
-                qt = m.group(1).strip()
-                if len(qt) >= 5:
-                    item = _make_item(qt)
-                    if item:
-                        key = qt[:80]
-                        if key not in seen:
-                            seen.add(key)
-                            results.append(item)
-                continue
-            # - 纯文本题目（无 **），需像问句
-            m = re.match(r"^\s*[-*]\s+(.+)$", stripped)
-            if m:
-                qt = m.group(1).strip().rstrip("。？?")
-                if len(qt) >= 5 and any(
-                    k in qt for k in ("?", "？", "什么", "如何", "为什么", "简述", "介绍", "说明", "项目")
-                ):
-                    item = _make_item(qt)
-                    if item:
-                        key = qt[:80]
-                        if key not in seen:
-                            seen.add(key)
-                            results.append(item)
-                continue
-
-        if results:
-            logger.info(f"[TwoStageExtractor] Markdown 兜底解析成功，提取到 {len(results)} 道题")
-        return results
 
     @staticmethod
     def _parse_json_fallback(text: str) -> list:

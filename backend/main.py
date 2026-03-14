@@ -477,7 +477,8 @@ async def startup_event():
     _print_miner_config_once()
     _print_agent_llm_config()
     crawl_scheduler.start()
-    logger.info("爬虫调度器已启动")
+    _src = getattr(_s, "crawler_source", "local")
+    logger.info(f"爬虫调度器已启动 | 牛客抓取来源={_src}")
 
     # 同步预热 LLM，确保首次请求不因冷启动超时
     if _s.llm_warmup_enabled and _s.llm_base_url:

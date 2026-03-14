@@ -70,6 +70,7 @@
         <el-button type="success" size="default" :loading="bothLoading" @click.prevent="crawlBoth" class="crawl-both-btn">
           🚀 同时获取牛客 + 小红书
         </el-button>
+        <p class="crawl-both-hint">牛客：同步发现链接，后台线程抓取正文；小红书：独立子进程启动，需在弹出浏览器中扫码登录。</p>
       </div>
       <!-- 抓取进度：牛客/小红书获取帖子后轮询显示 -->
       <div v-if="crawlPolling" class="progress-bar-wrap">
@@ -788,7 +789,7 @@ const crawl = async (platform) => {
   }
 
   if (platform === 'xiaohongshu') {
-    xhsLoading.value = true; xhsMsg.value = null; crawlPolling.value = false
+    xhsLoading.value = true; xhsMsg.value = null; ncResult.value = null; crawlPolling.value = false
     try {
       await loadStats()
       crawlInitialDone.value = doneCount.value
@@ -807,7 +808,7 @@ const crawl = async (platform) => {
   }
 
   // 牛客：发现立即返回，LLM 提取在后台运行
-  ncLoading.value = true; ncResult.value = null; ncCrawlLog.value = []; crawlPolling.value = false
+  ncLoading.value = true; ncResult.value = null; xhsMsg.value = null; ncCrawlLog.value = []; crawlPolling.value = false
   try {
     const d = await api.triggerCrawl(body)
     ncCrawlLog.value = d.discovered_links || []
@@ -1379,6 +1380,12 @@ watch(crawlPolling, (polling) => {
 .crawl-both-btn {
   font-weight: 600;
   padding: 10px 24px;
+}
+.crawl-both-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-sub, #909399);
+  line-height: 1.4;
 }
 .crawl-btn {
   font-weight: 600;

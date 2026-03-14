@@ -51,6 +51,12 @@ class CrawlerTool(Tool):
         domain = urlparse(url).netloc
 
         try:
+            # CRAWLER_SOURCE=mcp 时使用远程 MCP Content Fetcher（支持牛客、小红书及通用页面）
+            from backend.config.config import settings
+            if getattr(settings, "crawler_source", "local") == "mcp":
+                return self._crawl_via_mcp(url)
+
+            # 本地模式：仅支持牛客、小红书
             if "nowcoder.com" in domain:
                 return self._crawl_nowcoder(url)
             elif "xiaohongshu.com" in domain:
@@ -58,8 +64,37 @@ class CrawlerTool(Tool):
             else:
                 return f"❌ 暂不支持该域名抓取: {domain}。目前仅支持 nowcoder.com 和 xiaohongshu.com"
         except Exception as e:
-            logger.error(f"抓取失败 {url}: {e}")
+            logger.exception("[MCP/本地] 抓取失败 | url=%s | error=%s", url, str(e))
             return f"❌ 抓取发生异常: {str(e)}"
+
+    # -------------------------------------------------------
+    # MCP. 远程 MCP Content Fetcher（CRAWLER_SOURCE=mcp）
+    # -------------------------------------------------------
+    def _crawl_via_mcp(self, url: str) -> str:
+        from backend.config.config import settings
+        from backend.services.crawler.mcp_content_client import fetch_content_via_mcp
+
+        base_url = getattr(settings, "mcp_content_fetcher_url", "")
+        timeout = getattr(settings, "mcp_content_fetcher_timeout", 30)
+        api_key = getattr(settings, "smithery_api_key", "") or None
+        if not base_url:
+            logger.error("[MCP] MCP_CONTENT_FETCHER_URL 未配置，无法使用远程抓取")
+            return "❌ MCP_CONTENT_FETCHER_URL 未配置，无法使用远程抓取"
+
+        logger.info("[MCP] CrawlerTool 使用 MCP 模式 | url=%s | base=%s", url, base_url)
+        data = fetch_content_via_mcp(base_url, url, timeout=timeout, api_key=api_key)
+        platform = data.get("platform", "generic")
+        platform_cn = "牛客网" if platform == "nowcoder" else ("小红书" if platform == "xiaohongshu" else platform)
+        title = data.get("title", "无标题")
+        content = data.get("content", "")
+        result = f"【来源】{platform_cn}\n【标题】{title}\n【链接】{url}\n【正文】\n{content}"
+        metadata = data.get("metadata") or {}
+        if metadata:
+            parts = [f"{k}: {v}" for k, v in metadata.items() if v]
+            if parts:
+                result += f"\n【元信息】{', '.join(parts)}"
+        logger.info("[MCP] CrawlerTool 抓取完成 | url=%s | platform=%s", url, platform)
+        return result
 
     # -------------------------------------------------------
     # A. 牛客网爬取逻辑（复用 nowcoder_crawler 完整实现）

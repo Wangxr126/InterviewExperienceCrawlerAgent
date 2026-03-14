@@ -159,7 +159,9 @@ def _process_pending_tasks(batch_size: int = None):
       fetched  → LLM 提取题目 → done / error
     """
     batch_size = batch_size or cfg.PROCESS_BATCH_SIZE
-    logger.info(f"⚙️  开始处理任务队列（最多 {batch_size} 条）...")
+    crawler_source = getattr(settings, "crawler_source", "local")
+    pending = sqlite_service.get_pending_tasks(platform="nowcoder", limit=batch_size)
+    logger.info(f"⚙️  开始处理任务队列（最多 {batch_size} 条）| 获取来源={crawler_source} | pending牛客={len(pending)}条")
 
     processed = 0  # 入库题目总数
     extract_ok = 0  # 成功提取的帖子数
@@ -167,11 +169,13 @@ def _process_pending_tasks(batch_size: int = None):
     extract_unrelated = 0  # 无关帖数
 
     # ── Step 1: pending → 抓取详情（仅牛客）──────────────────
-    pending = sqlite_service.get_pending_tasks(platform="nowcoder", limit=batch_size)
+    # 注意：MCP 抓取仅在「有 pending 牛客任务」时执行；0 条则跳过
+    if not pending:
+        logger.info("⏭️  无 pending 牛客任务，跳过 Step1（MCP/本地抓取）")
     if pending:
         _bsep = '═' * 20
         logger.info(f"{_bsep}>>> Step1: 抓取详情 开始 <<<{_bsep}")
-        logger.info(f"📥 开始抓取详情，本批 {len(pending)} 条 pending 任务")
+        logger.info(f"📥 开始抓取详情，本批 {len(pending)} 条 pending 任务 | 获取来源={crawler_source}")
     for task in pending:
         task_id = task["task_id"]
         url = task["source_url"]
@@ -182,9 +186,22 @@ def _process_pending_tasks(batch_size: int = None):
         last_err = None
         for attempt in range(1, max_retries + 1):
             try:
-                from backend.services.crawler.nowcoder_crawler import NowcoderCrawler
-                crawler = NowcoderCrawler(cookie=cfg.NOWCODER_COOKIE)
-                content, image_urls = crawler.fetch_post_content_full(url)
+                if crawler_source == "mcp":
+                    from backend.services.crawler.mcp_content_client import fetch_content_via_mcp
+                    base_url = getattr(settings, "mcp_content_fetcher_url", "")
+                    timeout = getattr(settings, "mcp_content_fetcher_timeout", 30)
+                    api_key = getattr(settings, "smithery_api_key", "") or None
+                    if base_url:
+                        data = fetch_content_via_mcp(base_url, url, timeout=timeout, api_key=api_key)
+                        content = data.get("content", "") or ""
+                        image_urls = data.get("image_urls") or []
+                    else:
+                        logger.warning("[MCP] MCP_CONTENT_FETCHER_URL 未配置，回退本地爬虫")
+                        crawler_source = "local"
+                if crawler_source != "mcp":
+                    from backend.services.crawler.nowcoder_crawler import NowcoderCrawler
+                    crawler = NowcoderCrawler(cookie=cfg.NOWCODER_COOKIE)
+                    content, image_urls = crawler.fetch_post_content_full(url)
                 if content and len(content) >= 50:
                     break  # 成功，跳出重试
                 last_err = f"正文内容太短({len(content) if content else 0}字，需≥50字)"
@@ -207,7 +224,7 @@ def _process_pending_tasks(batch_size: int = None):
                     raw_content=content,
                     image_paths=image_paths,
                 )
-                logger.info(f"✅抓取content成功 [{title[:40]}]: 正文{len(content)}字, 图片{len(image_paths)}张")
+                logger.info(f"✅抓取content成功 [{title[:40]}]: 正文{len(content)}字, 图片{len(image_paths)}张 | 获取来源={crawler_source}")
             else:
                 logger.warning(f"⚠️ 正文内容为空或太短，已重试{max_retries}次，跳过: {title[:40]}")
                 sqlite_service.update_task_status(task_id, "error", error_msg=last_err or "正文太短")
@@ -267,7 +284,6 @@ def _process_pending_tasks(batch_size: int = None):
 
         _t0 = time.time()
         try:
-            from backend.config.config import settings
             extract_retries = getattr(settings, "extract_retries_on_failure", 3) if image_paths else 0
             questions, status, agent_used_tool, agent_succeeded, trace_session_id = [], "empty", False, True, None
 
