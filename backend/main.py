@@ -299,6 +299,13 @@ from backend.agents.orchestrator import get_orchestrator
 from backend.services.storage.sqlite_service import sqlite_service
 
 from backend.services.scheduling.scheduler import crawl_scheduler
+from backend.services.crawler.task_executor import (
+    execute as task_execute,
+    get_source_info as task_get_source_info,
+    prepare_extract_pending,
+    prepare_retry_errors,
+    prepare_re_extract_all,
+)
 
 
 
@@ -517,21 +524,17 @@ async def serve_frontend():
 
 
 @app.get("/api/config")
-
 def get_config():
-
-    """前端配置：默认用户 ID、Agent 最大步数等（来自 .env）"""
-
+    """前端配置：默认用户 ID、Agent 最大步数、爬虫/OCR 来源等（来自 .env）"""
     from backend.config.config import settings as _s
-
+    from backend.services.crawler.task_executor import get_source_info
     return {
-
         "default_user_id": _s.default_user_id,
-
         "interviewer_max_steps": _s.interviewer_max_steps,
-
         "crawler_process_batch_size": _s.crawler_process_batch_size,
-
+        "crawler_source": _s.crawler_source,
+        "ocr_method": _s.ocr_method,
+        "source_info": get_source_info(),
     }
 
 
@@ -1316,24 +1319,22 @@ class CrawlTriggerRequest(BaseModel):
 
 
 @app.get("/api/crawler/stats")
-
 def get_crawler_stats():
-
-    """获取爬虫调度器状态及统计信息"""
-
-    return crawl_scheduler.get_stats()
+    """获取爬虫调度器状态及统计信息，含 source_info 便于区分本地/MCP"""
+    return {**crawl_scheduler.get_stats(), "source_info": task_get_source_info()}
 
 
 
 
 
 @app.get("/api/crawler/extraction-status")
-
 def get_extraction_status():
-
-    """获取后台提取是否正在运行（前端刷新后可据此恢复进度显示）"""
-
-    return {"running": _extraction_running, "initial_by_platform": _extraction_initial_by_platform}
+    """获取后台提取是否正在运行（前端刷新后可据此恢复进度显示），含 source_info 便于区分本地/MCP"""
+    return {
+        "running": _extraction_running,
+        "initial_by_platform": _extraction_initial_by_platform,
+        "source_info": task_get_source_info(),
+    }
 
 
 def _read_extraction_trace_steps():
@@ -1498,77 +1499,36 @@ async def trigger_crawler(req: CrawlTriggerRequest):
 
 
     if req.platform == "nowcoder":
-
-        # 发现帖子（HTTP 请求，通常几秒）
-
         try:
-
-            added, discovered_links = await asyncio.wait_for(
-
+            result = await asyncio.wait_for(
                 loop.run_in_executor(
-
                     None,
-
-                    lambda: crawl_scheduler.trigger_nowcoder_discovery(
-
-                        keywords=req.keywords,
-
-                        max_pages=req.max_pages,
-
-                    )
-
+                    lambda: task_execute("nowcoder_discovery", "button", keywords=req.keywords, max_pages=req.max_pages),
                 ),
-
-                timeout=120,  # 发现阶段 2 分钟足够
-
+                timeout=120,
             )
-
         except asyncio.TimeoutError:
-
             logger.warning("牛客帖子发现超时（120s）")
-
             raise HTTPException(status_code=504, detail="牛客帖子发现超时，请减少爬取页数后重试。")
-
-
-
-        # LLM 提取题目（慢，使用本地 Ollama 时可能每帖需分钟级）
-
-        # → 在后台线程中异步执行，立即返回给前端，无需等待
-
+        added = result["discovered"]
+        discovered_links = result.get("discovered_links", [])
         if req.process and added > 0:
-
             def _bg_process():
-
                 try:
-
-                    cnt = crawl_scheduler.trigger_process_tasks(batch_size=added + 5)
-
-                    logger.info(f"牛客后台提取完成：{cnt} 道题目入库")
-
+                    task_execute("process_tasks", "button", batch_size=added + 5)
+                    logger.info(f"牛客后台提取完成")
                 except Exception as e:
-
                     logger.error(f"牛客后台提取失败: {e}", exc_info=True)
-
             threading.Thread(target=_bg_process, daemon=True).start()
-
-
-
         tip = f"发现 {added} 条新帖子" + ("，LLM 提取已在后台进行，完成后可刷新任务列表" if req.process and added > 0 else "")
-
         return {
-
             "status": "ok",
-
             "platform": "nowcoder",
-
             "discovered": added,
-
             "discovered_links": discovered_links or [],
-
-            "questions_added": -1,  # 后台异步，此时尚未完成
-
+            "questions_added": -1,
             "message": tip,
-
+            "source_info": result.get("source_info", task_get_source_info()),
         }
 
 
@@ -1629,22 +1589,14 @@ async def trigger_crawler(req: CrawlTriggerRequest):
         )
 
         return {
-
             "status": "ok",
-
             "platform": "xiaohongshu",
-
             "discovered": -1,
-
             "questions_added": -1,
-
             "message": "🌸 小红书爬取已以独立子进程启动，请在弹出的浏览器中完成扫码登录。完成后可在「任务队列」查看进度。",
-
             "background": True,
-
+            "source_info": task_get_source_info(),
         }
-
-
 
     else:
 
@@ -1655,160 +1607,60 @@ async def trigger_crawler(req: CrawlTriggerRequest):
 
 
 @app.post("/api/crawler/process")
-
 async def process_crawler_queue(batch_size: int | None = Query(default=None, ge=1, le=200)):
-
     """手动触发任务处理队列（同步处理队列，阻塞等待）"""
-
     batch_size = batch_size if batch_size is not None else _cfg.crawler_process_batch_size
-
     logger.info(f"[API] 同步处理队列 被调用 batch_size={batch_size}")
-
     import asyncio
-
     loop = asyncio.get_event_loop()
-
-    count = await loop.run_in_executor(
-
+    result = await loop.run_in_executor(
         None,
-
-        lambda: crawl_scheduler.trigger_process_tasks(batch_size=batch_size)
-
+        lambda: task_execute("process_tasks", "button", batch_size=batch_size),
     )
-
-    stats = sqlite_service.get_crawl_stats()
-
-    logger.info(f"[API] 同步处理队列 完成 questions_added={count}")
-
-    return {"status": "ok", "questions_added": count, "queue_stats": stats}
+    logger.info(f"[API] 同步处理队列 完成 questions_added={result.get('questions_added', 0)}")
+    return result
 
 
 
 
 
 @app.post("/api/crawler/extract-pending")
-
 async def extract_pending_posts(batch_size: int | None = Query(default=None, ge=1, le=200)):
-
-    """
-
-    异步提取所有 fetched 状态（已爬取正文但尚未提取题目）的帖子。
-
-    立即返回启动确认，LLM 提取在后台线程执行。
-
-    """
-
+    """异步提取所有 fetched 状态（已爬取正文但尚未提取题目）的帖子。立即返回启动确认，LLM 提取在后台线程执行。"""
     batch_size = batch_size if batch_size is not None else _cfg.crawler_process_batch_size
-
     logger.info(f"[API] 提取未处理帖子 被调用 batch_size={batch_size}")
-
-    import threading
-
-    import sqlite3
-
-
-
-    # 查询当前 fetched 数量
-
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-
-        row = conn.execute(
-
-            "SELECT COUNT(*) FROM crawl_tasks WHERE status='fetched'"
-
-        ).fetchone()
-
-    pending_count = row[0] if row else 0
-
-
-
+    pending_count, initial_by_platform = prepare_extract_pending()
     if pending_count == 0:
-
         logger.info("[API] 提取未处理帖子 无待处理，直接返回")
-
-        return {"status": "ok", "message": "没有待提取的帖子（状态为 fetched 的记录为 0）", "pending": 0}
-
-
-
+        return {
+            "status": "ok",
+            "message": "没有待提取的帖子（状态为 fetched 的记录为 0）",
+            "pending": 0,
+            "source_info": task_get_source_info(),
+        }
     logger.info(f"[API] 提取未处理帖子 启动后台线程，待处理 {pending_count} 条")
-
     global _extraction_running, _extraction_initial_by_platform
 
-
-
-    # 查询各平台 fetched 数量作为初始值
-
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-
-        conn.row_factory = sqlite3.Row
-
-        rows = conn.execute(
-
-            "SELECT source_platform, COUNT(*) as cnt FROM crawl_tasks WHERE status='fetched' GROUP BY source_platform"
-
-        ).fetchall()
-
-    initial_by_platform = {r["source_platform"]: r["cnt"] for r in rows}
-
-
-
-    def _bg():
-
-        global _extraction_running, _extraction_initial_by_platform
-
-        try:
-
-            _extraction_running = True
-
-            _extraction_initial_by_platform = initial_by_platform
-
-            cnt = crawl_scheduler.trigger_process_tasks(batch_size=batch_size)
-
-            logger.info(f"[API] 提取未处理帖子 后台完成：{cnt} 道题目入库")
-
-        except Exception as e:
-
-            logger.error(f"后台提取失败: {e}", exc_info=True)
-
-        finally:
-
-            _extraction_running = False
-
-            _extraction_initial_by_platform = {}
-
-
-
-    # 使用 asyncio.create_task 创建后台任务，不阻塞事件循环
     async def _bg_async():
         global _extraction_running, _extraction_initial_by_platform
         try:
             _extraction_running = True
             _extraction_initial_by_platform = initial_by_platform
-            # 使用 asyncio.to_thread 将同步任务放到线程池执行
-            cnt = await asyncio.to_thread(
-                crawl_scheduler.trigger_process_tasks,
-                batch_size=batch_size
-            )
-            logger.info(f"[API] 提取未处理帖子 后台完成：{cnt} 道题目入库")
+            await asyncio.to_thread(task_execute, "process_tasks", "button", batch_size=batch_size)
+            logger.info(f"[API] 提取未处理帖子 后台完成")
         except Exception as e:
             logger.error(f"后台提取失败: {e}", exc_info=True)
         finally:
             _extraction_running = False
             _extraction_initial_by_platform = {}
 
-    # 创建后台任务，不等待完成
     asyncio.create_task(_bg_async())
-
     logger.info(f"[后台任务] ▶ 启动 LLM提取任务 | 待处理 {pending_count} 条 | batch_size={batch_size}")
-
     return {
-
         "status": "ok",
-
         "message": f"已启动后台提取，共 {pending_count} 条待处理帖子，batch_size={batch_size}",
-
         "pending": pending_count,
-
+        "source_info": task_get_source_info(),
     }
 
 
@@ -1816,296 +1668,63 @@ async def extract_pending_posts(batch_size: int | None = Query(default=None, ge=
 
 
 @app.post("/api/crawler/clean-data")
-
 async def clean_unrelated_data(batch_size: int | None = Query(default=None, ge=1, le=200)):
-
-    """
-
-    清洗无关帖：
-    1. 直接删除所有 unrelated 状态的帖子（LLM 提取时已判断无关）
-    2. 对 done 状态帖子用 LLM 二次判断，无关则删除
-
-    返回：checked 检查数，deleted 删除数。
-
-    """
-
-    import sqlite3
-
-    from backend.services.crawler.question_extractor import check_contents_related_batch
-
-
-
+    """清洗无关帖：1) 直接删除 unrelated 状态；2) 对 done 帖子用 LLM 二次判断，无关则删除。"""
     batch_size = batch_size if batch_size is not None else _cfg.crawler_process_batch_size
-
     logger.info(f"[API] 清洗数据 被调用 batch_size={batch_size}")
-
-    deleted_total = 0
-
-
-
-    # ── Step 1: 直接删除所有 unrelated 状态帖子 ──────────────────────
-
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-
-        conn.row_factory = sqlite3.Row
-
-        unrelated_rows = conn.execute(
-
-            "SELECT task_id, source_url, post_title FROM crawl_tasks WHERE status='unrelated'"
-
-        ).fetchall()
-
-
-
-    for r in unrelated_rows:
-
-        url = r["source_url"]
-
-        title = (r["post_title"] or "")[:40]
-
-        cnt = sqlite_service.delete_by_source_url(url)
-
-        deleted_total += cnt
-
-        logger.warning(f"  [unrelated] 直接删除无关帖: {title} | url={url[:80]} | 删除 {cnt} 题")
-
-
-
-    logger.info(f"[API] 清洗数据 Step1 完成: 删除 {len(unrelated_rows)} 条 unrelated 帖，{deleted_total} 道题")
-
-
-
-    # ── Step 2: 对 done 帖子用 LLM 二次判断 ─────────────────────────
-
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-
-        conn.row_factory = sqlite3.Row
-
-        rows = conn.execute(
-
-            """SELECT task_id, source_url, raw_content, post_title
-
-               FROM crawl_tasks WHERE status='done' AND raw_content IS NOT NULL
-
-               LIMIT ?""",
-
-            (batch_size,),
-
-        ).fetchall()
-
-
-
-    if not rows:
-
-        if not unrelated_rows:
-
-            logger.info("[API] 清洗数据 无可清洗记录")
-
-            return {"status": "ok", "message": "没有可清洗的记录", "checked": 0, "deleted": 0}
-
-        stats = sqlite_service.get_crawl_stats()
-
-        msg = f"已清洗 {len(unrelated_rows)} 条无关帖，删除 {deleted_total} 道无关题目"
-
-        logger.info(f"[API] 清洗数据 完成: {msg}")
-
-        return {"status": "ok", "message": msg, "checked": len(unrelated_rows), "deleted": deleted_total, "queue_stats": stats}
-
-
-
-    tasks = [dict(r) for r in rows]
-
-    contents = [t["raw_content"] or "" for t in tasks]
-
-    BATCH = 5
-
-
-
-    for i in range(0, len(contents), BATCH):
-
-        chunk = contents[i : i + BATCH]
-
-        chunk_tasks = tasks[i : i + BATCH]
-
-        results = check_contents_related_batch(chunk)
-
-        for j, related in enumerate(results):
-
-            if not related:
-
-                url = chunk_tasks[j]["source_url"]
-
-                title = (chunk_tasks[j].get("post_title") or "")[:40]
-
-                cnt = sqlite_service.delete_by_source_url(url)
-
-                deleted_total += cnt
-
-                logger.warning(f"  [done→删除] 内容与面经无关: {title}... | url={url[:80]} | 删除 {cnt} 题")
-
-
-
-    stats = sqlite_service.get_crawl_stats()
-
-    total_checked = len(unrelated_rows) + len(tasks)
-
-    msg = f"已检查 {total_checked} 条（{len(unrelated_rows)} 条无关帖 + {len(tasks)} 条已完成），删除 {deleted_total} 道无关题目" if deleted_total else f"已检查 {total_checked} 条，均与面经相关"
-
-    logger.info(f"[API] 清洗数据 完成: {msg}")
-
-    return {"status": "ok", "message": msg, "checked": total_checked, "deleted": deleted_total, "queue_stats": stats}
+    result = await asyncio.to_thread(task_execute, "clean_data", "button", batch_size=batch_size)
+    logger.info(f"[API] 清洗数据 完成: {result.get('message', '')}")
+    return result
 
 
 
 
 
 @app.post("/api/crawler/retry-errors")
-
 async def retry_error_posts(batch_size: int | None = Query(default=None, ge=1, le=200)):
-
-    """
-
-    将 error 状态且有正文的帖子重置为 fetched，后台异步 LLM 提取。
-
-    将 error 状态且无正文的帖子重置为 pending，等待重新抓取。
-
-    """
-
+    """将 error 且有正文的帖子重置为 fetched 后台提取；无正文的重置为 pending 重新抓取。"""
     batch_size = batch_size if batch_size is not None else _cfg.crawler_process_batch_size
-
     logger.info(f"[API] 重试失败帖子 被调用 batch_size={batch_size}")
-
-    import threading, sqlite3
-
-
-
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-
-        # 先修正误标为 error 的无关帖（mark_unrelated 调用后应标 unrelated，避免被重试）
-        fix_unrelated = conn.execute(
-            """UPDATE crawl_tasks SET status='unrelated', error_msg='LLM 判断与面经无关'
-               WHERE status='error' AND (
-                 error_msg LIKE '%正文无有效面试题%'
-                 OR error_msg LIKE '%正文无面试题%'
-                 OR error_msg LIKE '%LLM 判断与面经无关%'
-               )"""
-        ).rowcount
-        if fix_unrelated:
-            conn.commit()
-            logger.info(f"[API] 重试前修正 {fix_unrelated} 条误标为失败的无关帖 → unrelated")
-
-        # 有正文或有图片：重置为 fetched，进行 LLM 提取（会自动触发 OCR）
-        r1 = conn.execute(
-
-            "UPDATE crawl_tasks SET status='fetched', error_msg=NULL "
-
-            "WHERE status='error' AND ("
-
-            "  raw_content IS NOT NULL "
-
-            "  OR (image_paths IS NOT NULL AND image_paths != '[]')"
-
-            ")"
-
-        )
-
-        to_extract = r1.rowcount
-
-        # 无正文且无图片：重置为 pending，重新抓取
-
-        r2 = conn.execute(
-
-            "UPDATE crawl_tasks SET status='pending', error_msg=NULL "
-
-            "WHERE status='error' "
-
-            "AND (raw_content IS NULL OR trim(raw_content) = '') "
-
-            "AND (image_paths IS NULL OR image_paths = '[]')"
-
-        )
-
-        to_fetch = r2.rowcount
-
-        conn.commit()
-
-
-
-    total = to_extract + to_fetch
-
+    to_extract, to_fetch, total, initial_by_platform = prepare_retry_errors()
     if total == 0:
-
         logger.info("[API] 重试失败帖子 无可重试，直接返回")
-
-        return {"status": "ok", "message": "没有可重试的帖子（error 记录为 0）", "reset": 0}
-
-
-
+        return {
+            "status": "ok",
+            "message": "没有可重试的帖子（error 记录为 0）",
+            "reset": 0,
+            "source_info": task_get_source_info(),
+        }
     logger.info(f"[API] 重试失败帖子 重置 {total} 条，启动后台线程")
-
     global _extraction_running, _extraction_initial_by_platform
 
-
-
-    # 重试后查询各平台 fetched 数量
-
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-
-        conn.row_factory = sqlite3.Row
-
-        rows = conn.execute(
-
-            "SELECT source_platform, COUNT(*) as cnt FROM crawl_tasks WHERE status='fetched' GROUP BY source_platform"
-
-        ).fetchall()
-
-    initial_by_platform = {r["source_platform"]: r["cnt"] for r in rows} if rows else {"nowcoder": total, "xiaohongshu": 0}
-
-
-
     def _bg():
-
         global _extraction_running, _extraction_initial_by_platform
-
         try:
-
             _extraction_running = True
-
             _extraction_initial_by_platform = initial_by_platform
-
-            cnt = crawl_scheduler.trigger_process_tasks(batch_size=batch_size)
-
-            logger.info(f"[API] 重试失败帖子 后台完成：{cnt} 道题目入库")
-
+            task_execute("process_tasks", "button", batch_size=batch_size)
+            logger.info(f"[API] 重试失败帖子 后台完成")
         except Exception as e:
-
             logger.error(f"重试失败: {e}")
-
         finally:
-
             _extraction_running = False
-
             _extraction_initial_by_platform = {}
 
-
-
+    import threading
     _t = threading.Thread(target=_bg, daemon=True)
-
     _t.start()
-
     logger.info(f"[后台线程] ▶ 启动 重试提取线程 tid={_t.ident} | 重置 {total} 条 | batch_size={batch_size}")
-
     msg_parts = []
-
     if to_extract:
-
         msg_parts.append(f"{to_extract} 条待重新提取")
-
     if to_fetch:
-
         msg_parts.append(f"{to_fetch} 条待重新抓取")
-
-    return {"status": "ok", "message": "；".join(msg_parts), "reset": total}
+    return {
+        "status": "ok",
+        "message": "；".join(msg_parts),
+        "reset": total,
+        "source_info": task_get_source_info(),
+    }
 
 
 
@@ -2113,115 +1732,46 @@ async def retry_error_posts(batch_size: int | None = Query(default=None, ge=1, l
 
 @app.post("/api/crawler/re-extract-all")
 async def re_extract_all_posts(batch_size: int | None = Query(default=None, ge=1, le=200)):
-    """
-    重新提取所有问题：将「已完成」或「失败」且有正文的帖子重置为待提取，删除旧题目，后台重新 LLM 提取。
-    准备阶段在线程中执行，避免阻塞事件循环影响提交作答等用户操作。
-    """
+    """重新提取所有问题：删除旧题目、重置为待提取，后台重新 LLM 提取。"""
     batch_size = batch_size if batch_size is not None else _cfg.crawler_process_batch_size
     logger.info(f"[API] 重新提取所有问题 被调用 batch_size={batch_size}")
-
-    import sqlite3
-
-    def _prepare_sync():
-        _re_extract_cond = "status IN ('done','error') AND raw_content IS NOT NULL"
-        with sqlite3.connect(sqlite_service.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            # 删除题库中所有来自爬虫的题目（不限 batch_size），与弹窗「删除所有已提取的面试题」一致
-            rows = conn.execute(
-                f"""SELECT task_id, source_url FROM crawl_tasks
-                   WHERE {_re_extract_cond}""",
-            ).fetchall()
-        tasks = [dict(r) for r in rows]
-        if not tasks:
-            return None, 0, []
-
-        urls = [t["source_url"] for t in tasks]
-        deleted_questions = 0
-        try:
-            from backend.services.storage.neo4j_service import neo4j_service
-            for url in urls:
-                neo4j_service.delete_questions_by_source_url(url)
-        except Exception as e:
-            logger.warning("Neo4j 删除题目失败（SQLite 将照常删除）: %s", e)
-
-        with sqlite3.connect(sqlite_service.db_path) as conn:
-            for url in urls:
-                cur = conn.execute("DELETE FROM questions WHERE source_url=?", (url,))
-                deleted_questions += cur.rowcount
-            conn.execute(
-                f"""UPDATE crawl_tasks SET status='fetched', questions_count=0, error_msg=NULL, extraction_source=NULL,
-                    extract_duration_min=NULL
-                   WHERE {_re_extract_cond}
-                   AND source_url IN (""" + ",".join("?" * len(urls)) + ")",
-                urls,
-            )
-            conn.commit()
-        return tasks, deleted_questions, urls
-
-    tasks, deleted_questions, urls = await asyncio.to_thread(_prepare_sync)
-    if not tasks:
-        return {"status": "ok", "message": "没有可重新提取的帖子（done/error 且含正文）", "reset": 0}
-
-    logger.info(f"[API] 重新提取所有问题 重置 {len(tasks)} 条，删除 {deleted_questions} 道旧题目，启动后台提取")
-
+    reset_count, deleted_questions, initial_by_platform = await asyncio.to_thread(prepare_re_extract_all)
+    if reset_count == 0:
+        return {
+            "status": "ok",
+            "message": "没有可重新提取的帖子（done/error 且含正文）",
+            "reset": 0,
+            "source_info": task_get_source_info(),
+        }
+    logger.info(f"[API] 重新提取所有问题 重置 {reset_count} 条，删除 {deleted_questions} 道旧题目，启动后台提取")
     global _extraction_running, _extraction_initial_by_platform
-
-    import threading
     from backend.services.crawler import question_extractor
-
     _run_suffix = now_beijing_str("%Y%m%d_%H%M%S")
     question_extractor._llm_log_run_suffix = _run_suffix
     logger.info(f"[API] 重新提取 LLM 日志将写入: llm_prompt_log_{_run_suffix}.jsonl")
 
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT source_platform, COUNT(*) as cnt FROM crawl_tasks WHERE status='fetched' GROUP BY source_platform"
-        ).fetchall()
-    initial_by_platform = {r["source_platform"]: r["cnt"] for r in rows} if rows else {}
-
-
-
     def _bg():
-
         global _extraction_running, _extraction_initial_by_platform
-
         try:
-
             _extraction_running = True
-
             _extraction_initial_by_platform = initial_by_platform
-
-            cnt = crawl_scheduler.trigger_process_tasks(batch_size=batch_size)
-
-            logger.info(f"[API] 重新提取所有问题 后台完成：{cnt} 道题目入库")
-
+            task_execute("process_tasks", "button", batch_size=batch_size)
+            logger.info(f"[API] 重新提取所有问题 后台完成")
         except Exception as e:
-
             logger.error(f"重新提取失败: {e}", exc_info=True)
-
         finally:
-
             _extraction_running = False
-
             _extraction_initial_by_platform = {}
-
             question_extractor._llm_log_run_suffix = None
 
-
-
+    import threading
     threading.Thread(target=_bg, daemon=True).start()
-
     return {
-
         "status": "ok",
-
-        "message": f"已重置 {len(tasks)} 条帖子（删除 {deleted_questions} 道旧题），开始重新提取",
-
-        "reset": len(tasks),
-
+        "message": f"已重置 {reset_count} 条帖子（删除 {deleted_questions} 道旧题），开始重新提取",
+        "reset": reset_count,
         "questions_deleted": deleted_questions,
-
+        "source_info": task_get_source_info(),
     }
 
 

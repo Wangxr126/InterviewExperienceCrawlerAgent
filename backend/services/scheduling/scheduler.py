@@ -677,23 +677,21 @@ class CrawlScheduler:
             logger.error(f"[定时任务] 未知调度类型: {schedule_type}")
             return
 
-        # 任务执行函数
+        # 任务执行函数（统一走 TaskExecutor，便于区分本地/MCP）
         def _make_job_fn(jid, jtype, jparams):
             def job_fn():
                 try:
+                    from backend.services.crawler.task_executor import execute as task_execute
                     if jtype == "nowcoder_discovery":
-                        _run_nowcoder_discovery(
+                        task_execute("nowcoder_discovery", "scheduled",
                             keywords=jparams.get("nowcoder_keywords"),
-                            max_pages=jparams.get("nowcoder_max_pages")
-                        )
+                            max_pages=jparams.get("nowcoder_max_pages"))
                     elif jtype == "xhs_discovery":
-                        _run_xhs_discovery(
-                            headless=jparams.get("xhs_headless", True)
-                        )
+                        task_execute("xhs_discovery", "scheduled",
+                            headless=jparams.get("xhs_headless", True))
                     elif jtype == "process_tasks":
-                        _process_pending_tasks(
-                            batch_size=jparams.get("process_batch_size")
-                        )
+                        task_execute("process_tasks", "scheduled",
+                            batch_size=jparams.get("process_batch_size"))
                     else:
                         logger.error(f"[定时任务] 未知任务类型: {jtype}")
                 except Exception as e:

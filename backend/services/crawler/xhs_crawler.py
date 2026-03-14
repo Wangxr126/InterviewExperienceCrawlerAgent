@@ -445,20 +445,71 @@ async def _fetch_xhs_with_playwright(url: str, headless: bool = True) -> Dict | 
 # ── xhs-crawl 获取帖子详情 ────────────────────────────────────
 
 async def _async_fetch_details(links: List[str]) -> List[Dict]:
-    """异步批量获取小红书帖子详情"""
+    """异步批量获取小红书帖子详情。CRAWLER_SOURCE=mcp 时优先用 MCP 抓取，失败则回退 xhs-crawl/Playwright"""
+    cfg = _cfg()
+    crawler_source = getattr(cfg, "crawler_source", "local")
+    use_mcp = (
+        crawler_source == "mcp"
+        and getattr(cfg, "mcp_content_fetcher_url", "")
+    )
+
     try:
         from xhs_crawl import XHSSpider
     except ImportError:
-        logger.error("xhs_crawl 未安装: pip install xhs-crawl")
-        return []
+        XHSSpider = None
+        if not use_mcp:
+            logger.error("xhs_crawl 未安装: pip install xhs-crawl")
+            return []
 
-    # 静默 xhs_crawl 内部日志（避免重复打印搜索流程日志）
     logging.getLogger("xhs_crawl").setLevel(logging.WARNING)
-    spider = XHSSpider()
+    spider = XHSSpider() if XHSSpider else None  # MCP 失败时用作兜底
+
     posts: List[Dict] = []
 
     for idx, url in enumerate(links, 1):
         try:
+            # MCP 优先：CRAWLER_SOURCE=mcp 时先尝试 MCP
+            mcp_data = None
+            if use_mcp:
+                try:
+                    from backend.services.crawler.mcp_content_client import fetch_content_via_mcp
+                    base_url = getattr(cfg, "mcp_content_fetcher_url", "")
+                    timeout = getattr(cfg, "mcp_content_fetcher_timeout", 30)
+                    api_key = getattr(cfg, "smithery_api_key", "") or None
+                    data = await asyncio.to_thread(
+                        fetch_content_via_mcp, base_url, url, timeout, api_key
+                    )
+                    content = (data.get("content") or "").strip()
+                    if content and len(content) >= 50:
+                        mcp_data = {
+                            "title": (data.get("title") or "").strip(),
+                            "content": content,
+                            "image_urls": data.get("image_urls") or [],
+                            "post_time": "",
+                        }
+                        logger.info(f"XHS 获取详情 [{idx}/{len(links)}]: {mcp_data['title'][:30]} ({len(content)}字, {len(mcp_data['image_urls'])}图) | 获取来源=mcp")
+                except Exception as e:
+                    logger.debug(f"[MCP] 小红书抓取失败，回退本地: {url[:50]}... {e}")
+
+            if mcp_data:
+                posts.append({
+                    "title": mcp_data["title"],
+                    "content": mcp_data["content"],
+                    "author": "",
+                    "image_urls": mcp_data["image_urls"],
+                    "image_count": len(mcp_data["image_urls"]),
+                    "source_url": url,
+                    "source_platform": "xiaohongshu",
+                    "post_time": mcp_data.get("post_time", ""),
+                })
+                await asyncio.sleep(random.uniform(1, 3))
+                continue
+
+            # 本地：xhs-crawl 或 Playwright
+            if not spider:
+                logger.warning("xhs_crawl 未安装且 MCP 未返回有效内容，跳过")
+                continue
+
             post = await spider.get_post_data(url)
             if not post:
                 continue
@@ -520,7 +571,8 @@ async def _async_fetch_details(links: List[str]) -> List[Dict]:
         except Exception as e:
             logger.error(f"XHS 获取详情异常 {url}: {e}")
 
-    await spider.close()
+    if spider:
+        await spider.close()
     return posts
 
 

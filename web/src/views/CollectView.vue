@@ -4,6 +4,14 @@
     <div class="card stats-section">
       <div class="section-header">
         <h2 class="section-title">数据采集</h2>
+        <div class="source-info-badges" v-if="sourceInfo.crawler_source || sourceInfo.ocr_method">
+          <el-tooltip content="正文抓取来源：local=本地爬虫，mcp=远程 MCP Content Fetcher" placement="bottom">
+            <el-tag size="small" type="info">正文: {{ sourceInfo.crawler_source === 'mcp' ? 'MCP' : '本地' }}</el-tag>
+          </el-tooltip>
+          <el-tooltip content="图片 OCR 方式：ollama_vl/qwen_vl=本地或云API，mcp=MCP 图像提取器" placement="bottom">
+            <el-tag size="small" type="info">OCR: {{ sourceInfo.ocr_method === 'mcp' ? 'MCP' : '本地/云' }}</el-tag>
+          </el-tooltip>
+        </div>
         <el-button size="small" :loading="statsLoading" @click="async () => { await loadStats(); await loadTasks() }">刷新</el-button>
       </div>
       <div v-if="statsList.length" class="stats-row">
@@ -61,7 +69,7 @@
               <el-button type="primary" size="default" :loading="xhsLoading" @click.prevent="crawl('xiaohongshu')" class="crawl-btn">
                 获取帖子
               </el-button>
-              <span class="crawl-hint">需扫码登录</span>
+              <span class="crawl-hint">根据keyWord爬取链接需扫码登录，爬取内容使用MCP</span>
             </div>
           </div>
         </div>
@@ -462,6 +470,8 @@ import { WarningFilled, Loading, QuestionFilled, Document } from '@element-plus/
 import { api } from '../api.js'
 
 const rawStats = ref({})
+/** 当前正文抓取/图片 OCR 来源（local=本地, mcp=MCP），便于区分执行环境 */
+const sourceInfo = ref({})
 const extractPolling = ref(false)
 const extractInitialByPlatform = ref({})  // { nowcoder: 5, xiaohongshu: 17 }
 let extractPollTimer = null
@@ -623,6 +633,7 @@ const loadStats = async (silent = false) => {
   try {
     const d = await api.getCrawlerStats()
     rawStats.value = d.crawl_stats || {}
+    sourceInfo.value = d.source_info || {}
     if (Array.isArray(d.keywords)) keywordOptions.value = d.keywords
   } catch {
     if (!silent) ElMessage.error('获取统计失败')
@@ -1226,8 +1237,9 @@ watch(crawlPolling, (polling) => {
   max-width: 1300px;
   margin: 0 auto;
 }
-.section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 8px; }
 .section-title { font-size: 16px; font-weight: 600; color: var(--text-main); margin: 0; }
+.source-info-badges { display: flex; gap: 6px; }
 .stats-section .section-title { font-size: 18px; }
 
 /* 1. 统计区域 - 更紧凑的网格 */
