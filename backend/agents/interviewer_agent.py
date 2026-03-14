@@ -8,14 +8,14 @@
   • session 由项目 SQLite 管理，每次 chat 前从 SQLite 加载历史到 history_manager
 
 工具职责：
-  recall_memory               ← 首次对话/话题切换时主动查用户背景
+  recognize_intent            ← 【第一步必须】意图识别，提取 intent + slots
   get_session_context         ← 本次会话统计
   get_recommended_question    ← 出题
   find_similar_questions      ← 举一反三/换个问法
   filter_questions            ← 按条件筛题
   manage_note                 ← 笔记 CRUD
   get_mastery_report          ← 查掌握度报告
-  get_knowledge_recommendation← 学习资源推荐
+  get_knowledge_recommendation← ③延伸知识点（GraphRAG+RAG）
   analyze_resume              ← 分析简历
 """
 import logging
@@ -50,7 +50,7 @@ class InterviewerAgent(ReActAgent):
     职责边界：
     - 只做「需要语言理解和推理」的对话/出题/解释/笔记/掌握度查询
     - 确定性副作用（SM-2 更新、记忆写入、session 入库）全部由 Orchestrator 代码层保证
-    - 记忆读取通过 recall_memory 工具主动触发，而非 Orchestrator 注入
+    - 记忆读取通过 get_mastery_report / get_session_context 按需触发
     """
 
     def __init__(self, user_id: str = "default"):

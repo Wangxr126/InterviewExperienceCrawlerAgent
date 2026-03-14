@@ -142,8 +142,14 @@
           <el-button type="danger" :loading="cleanLoading" @click.prevent="cleanData">清洗无关帖</el-button>
         </el-tooltip>
       </div>
-      <!-- 处理进度：提取进行中时轮询显示，牛客和小红书分开 -->
-      <div v-if="extractPolling" class="extract-progress-wrap">
+      <div v-if="!extractPolling && extractMsg" class="result-msg" :class="extractMsg.ok ? 'ok' : 'err'">
+        {{ extractMsg.text }}
+      </div>
+    </div>
+
+    <!-- 提取进度 + SSE 推理过程（独立卡片，位于 LLM 提取 与 帖子记录 之间） -->
+    <div v-if="extractPolling" class="card extract-progress-card">
+      <div class="extract-progress-wrap">
         <div v-for="item in extractProgressByPlatform" :key="item.platform" class="extract-progress-item">
           <span class="extract-platform-label">{{ item.label }}</span>
           <div class="extract-progress-bar">
@@ -156,9 +162,16 @@
         <div v-if="extractProgressByPlatform.length === 0" class="extract-progress-item">
           <span class="extract-progress-text">处理中...</span>
         </div>
-      </div>
-      <div v-else-if="extractMsg" class="result-msg" :class="extractMsg.ok ? 'ok' : 'err'">
-        {{ extractMsg.text }}
+        <div class="extract-trace-box">
+          <div class="extract-trace-title">🧠 实时推理过程</div>
+          <div v-if="extractTraceSteps.length > 0" class="extract-trace-steps">
+            <div v-for="(s, i) in extractTraceSteps" :key="i" class="extract-trace-step" :class="s.type">
+              <span class="step-num">第 {{ s.step }} 步</span>
+              <span class="step-text">{{ s.text }}</span>
+            </div>
+          </div>
+          <div v-else class="extract-trace-placeholder">等待 Miner Agent 推理中…（SSE 实时推送）</div>
+        </div>
       </div>
     </div>
 
@@ -189,35 +202,47 @@
           <el-select v-model="taskKeyword" placeholder="关键词" clearable size="small" style="width:100px">
             <el-option v-for="kw in keywordOptions" :key="kw" :label="kw" :value="kw" />
           </el-select>
-          <el-button size="small" @click="taskPage=1;loadTasks()">查询</el-button>
+          <el-input v-model="taskTitleSearch" placeholder="标题搜索" clearable size="small" style="width:140px" @keyup.enter="handleSearch" />
+          <el-button size="small" @click="handleSearch">查询</el-button>
           <el-button size="small" @click="async () => { await loadStats(); await loadTasks() }">刷新</el-button>
+          <el-tooltip v-if="selectedTaskIds.length > 0" content="对勾选的帖子重新提取题目（单条或多条均可）" placement="bottom">
+            <el-button size="small" type="primary" :loading="reExtractBatchLoading" @click="reExtractBatch">
+              批量重新提取 ({{ selectedTaskIds.length }})
+            </el-button>
+          </el-tooltip>
           <el-button size="small" type="danger" plain @click="showClearAllDialog = true">清除所有</el-button>
         </div>
       </div>
-      <el-table :data="tasks" size="small" class="post-table" stripe
+      <el-table ref="taskTableRef" :data="tasks" size="small" class="post-table" stripe
         @sort-change="onSortChange"
+        @selection-change="onTaskSelectionChange"
         :default-sort="{ prop: 'id', order: 'descending' }"
       >
+        <el-table-column type="selection" width="50" align="center"
+  
+        >
+          <template #header>操作</template>
+        </el-table-column>
         <el-table-column label="ID" prop="id" width="60" align="center" sortable="custom" />
-        <el-table-column label="平台" prop="source_platform" width="82" sortable="custom">
+        <el-table-column label="平台" prop="source_platform" width="70" sortable="custom">
           <template #default="{ row }">
             <el-tag :type="row.source_platform === 'xiaohongshu' ? 'danger' : 'warning'" size="small">
               {{ row.source_platform === 'xiaohongshu' ? '小红书' : '牛客' }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="关键词" prop="discover_keyword" width="100" show-overflow-tooltip sortable="custom">
+        <el-table-column label="关键词" prop="discover_keyword" width="80" show-overflow-tooltip sortable="custom">
           <template #default="{ row }">{{ row.discover_keyword || '—' }}</template>
         </el-table-column>
-        <el-table-column label="标题" prop="post_title" min-width="100" show-overflow-tooltip sortable="custom">
+        <el-table-column label="标题" prop="post_title" min-width="160" show-overflow-tooltip sortable="custom">
           <template #default="{ row }">
             <a :href="row.source_url" target="_blank" style="color:var(--primary);text-decoration:none;font-size:13px">
               {{ row.post_title || row.source_url.slice(-30) }}
             </a>
           </template>
         </el-table-column>
-        <el-table-column label="公司" prop="company" width="72" show-overflow-tooltip sortable="custom" />
-        <el-table-column label="正文" prop="content_len" width="68" align="center" sortable="custom">
+        <el-table-column label="公司" prop="company" width="70" show-overflow-tooltip sortable="custom" />
+        <el-table-column label="正文" prop="content_len" width="65" align="center" sortable="custom">
           <template #default="{ row }">
             <el-link v-if="(row.content_len ?? 0) > 0" type="primary" :underline="false" style="font-size:12px"
                      @click="openContentDialog(row)">
@@ -226,7 +251,7 @@
             <span v-else style="color:#c0c4cc;font-size:12px">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="状态" prop="status" width="74" align="center" sortable="custom">
+        <el-table-column label="状态" prop="status" width="65" align="center" sortable="custom">
           <template #default="{ row }">
             <el-tag :type="STATUS_TAG[row.status]" size="small">{{ STATUS_LABEL[row.status] || row.status }}</el-tag>
           </template>
@@ -247,28 +272,38 @@
             <span v-else style="color:#c0c4cc">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="工具调用" prop="agent_used_tool" width="90" align="center" sortable="custom">
+        <el-table-column label="工具" prop="agent_used_tool" width="65" align="center" sortable="custom">
           <template #default="{ row }">
-            <el-tag v-if="row.agent_used_tool === 1" type="success" size="small">✓ 是</el-tag>
-            <el-tag v-else-if="row.agent_used_tool === 0 && row.status === 'done'" type="info" size="small">否</el-tag>
+            <el-tag v-if="row.agent_used_tool === 1" type="success" size="small">✓</el-tag>
+            <el-tag v-else-if="row.agent_used_tool === 0 && row.status === 'done'" type="info" size="small">×</el-tag>
             <span v-else style="color:#c0c4cc">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="耗时" prop="extract_duration_sec" width="72" align="center" sortable="custom">
+        <el-table-column label="Trace" width="50" align="center">
           <template #default="{ row }">
-            <span v-if="row.extract_duration_sec != null" style="font-size:12px;color:var(--text-main)">{{ row.extract_duration_sec }}s</span>
+            <el-tooltip v-if="row.trace_session_id" content="查看推理过程" placement="top">
+              <el-link :href="`/api/crawler/trace/${row.trace_session_id}`" target="_blank" :underline="false">
+                <el-icon :size="18"><Document /></el-icon>
+              </el-link>
+            </el-tooltip>
+            <span v-else style="color:#c0c4cc">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="耗时" prop="extract_duration_min" width="75" align="center" sortable="custom">
+          <template #default="{ row }">
+            <span v-if="row.extract_duration_min != null" class="duration-value">{{ row.extract_duration_min }}min</span>
+            <span v-else class="duration-empty">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="提取时间" prop="processed_at" width="115" align="center" sortable="custom">
+          <template #default="{ row }">
+            <span v-if="row.processed_at" style="font-size:11px;white-space:nowrap">{{ row.processed_at?.slice(0,16) }}</span>
             <span v-else style="color:#c0c4cc;font-size:12px">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="提取时间" prop="processed_at" width="110" align="center" sortable="custom">
+        <el-table-column label="发表时间" prop="post_time" width="115" align="center" sortable="custom">
           <template #default="{ row }">
-            <span v-if="row.processed_at" style="font-size:11px">{{ row.processed_at?.slice(0,16) }}</span>
-            <span v-else style="color:#c0c4cc;font-size:12px">—</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="发现时间" prop="discovered_at" width="110" align="center" sortable="custom">
-          <template #default="{ row }">
-            <span style="font-size:11px">{{ row.discovered_at?.slice(0,16) }}</span>
+            <span style="font-size:11px;white-space:nowrap">{{ (row.post_time || row.discovered_at)?.slice(0,16) || '—' }}</span>
           </template>
         </el-table-column>
       </el-table>
@@ -402,8 +437,8 @@
           <div class="q-body">
             <div class="q-text">{{ q.question_text }}</div>
             <div class="q-meta-row">
-              <span v-if="q.topic_tags?.length" class="q-tags">
-              <el-tag v-for="t in q.topic_tags" :key="t" size="small" style="margin-right:4px">{{ t }}</el-tag>
+              <span v-if="normalizeTags(q.topic_tags).length" class="q-tags">
+                <el-tag v-for="t in normalizeTags(q.topic_tags)" :key="t" size="small" style="margin-right:4px">{{ t }}</el-tag>
               </span>
             </div>
           </div>
@@ -416,13 +451,16 @@
 <script setup>
 import { ref, reactive, computed, watch, onMounted, onUnmounted, onActivated } from 'vue'
 import { ElMessage } from 'element-plus'
-import { WarningFilled, Loading, QuestionFilled } from '@element-plus/icons-vue'
+import { WarningFilled, Loading, QuestionFilled, Document } from '@element-plus/icons-vue'
 import { api } from '../api.js'
 
 const rawStats = ref({})
 const extractPolling = ref(false)
 const extractInitialByPlatform = ref({})  // { nowcoder: 5, xiaohongshu: 17 }
 let extractPollTimer = null
+const extractTraceSteps = ref([])  // Miner Agent 推理过程（Thought/工具调用）
+let extractTraceTimer = null
+let extractTraceEventSource = null
 const tasks    = ref([])
 const statsLoading   = ref(false)
 const ncLoading      = ref(false)
@@ -440,6 +478,7 @@ const extractMsg = ref(null)
 const taskFilter    = ref('')
 const taskPlatform  = ref('')
 const taskKeyword   = ref('')
+const taskTitleSearch = ref('')
 const keywordOptions = ref([])
 const taskPage      = ref(1)
 const taskPageSize  = ref(20)
@@ -459,6 +498,9 @@ const crawlDiscovered       = ref(0)
 const crawlInitialDone      = ref(0)
 let crawlPollTimer          = null
 const refetchLoading        = ref(null)  // task_id 正在重抓正文
+const taskTableRef           = ref(null)
+const selectedTaskIds        = ref([])
+const reExtractBatchLoading  = ref(false)
 
 const form = reactive({ keywords: '', maxPages: 5, xhsCount: 20 })
 
@@ -637,12 +679,22 @@ const onSortChange = ({ prop, order }) => {
   loadTasks()
 }
 
+const handleSearch = () => {
+  taskPage.value = 1
+  loadTasks()
+}
+
+const onTaskSelectionChange = (rows) => {
+  selectedTaskIds.value = rows.map(r => r.task_id).filter(Boolean)
+}
+
 const loadTasks = async () => {
   try {
     const d = await api.getCrawlerTasks({
       status: taskFilter.value,
       platform: taskPlatform.value,
       keyword: taskKeyword.value,
+      title: taskTitleSearch.value,
       limit: taskPageSize.value,
       offset: (taskPage.value - 1) * taskPageSize.value,
       sort_by: taskSortBy.value || undefined,
@@ -809,6 +861,13 @@ const extractPending = async () => {
 const stopExtractPolling = () => {
   if (extractPollTimer) clearInterval(extractPollTimer)
   extractPollTimer = null
+  if (extractTraceTimer) clearInterval(extractTraceTimer)
+  extractTraceTimer = null
+  if (extractTraceEventSource) {
+    extractTraceEventSource.close()
+    extractTraceEventSource = null
+  }
+  extractTraceSteps.value = []
   extractPolling.value = false
 }
 
@@ -826,6 +885,15 @@ const openContentDialog = async (row) => {
   } finally {
     contentLoading.value = false
   }
+}
+
+/** 规范化 topic_tags：支持数组或 JSON 字符串 */
+const normalizeTags = (v) => {
+  if (Array.isArray(v)) return v
+  if (typeof v === 'string') {
+    try { return JSON.parse(v || '[]') } catch { return [] }
+  }
+  return []
 }
 
 const openQuestionsDialog = async (row) => {
@@ -951,6 +1019,31 @@ const canRefetchXhs = (row) => {
   return empty || pageNotFound
 }
 
+const reExtractBatch = async () => {
+  const ids = selectedTaskIds.value
+  if (!ids?.length) {
+    ElMessage.warning('请先勾选要重新提取的帖子')
+    return
+  }
+  reExtractBatchLoading.value = true
+  try {
+    const d = await api.reExtractBatch(ids)
+    if (d?.status === 'ok') {
+      ElMessage.success(d.message || `已提交 ${ids.length} 条，后台执行中`)
+      taskTableRef.value?.clearSelection()
+      selectedTaskIds.value = []
+      await loadStats()
+      await loadTasks()
+    } else {
+      ElMessage.warning(d?.message || d?.detail || '批量重新提取失败')
+    }
+  } catch {
+    ElMessage.error('批量重新提取请求失败')
+  } finally {
+    reExtractBatchLoading.value = false
+  }
+}
+
 const refetchXhsBody = async (row) => {
   if (!row?.task_id) return
   refetchLoading.value = row.task_id
@@ -1000,10 +1093,17 @@ onActivated(async () => {
 
 onUnmounted(() => { stopExtractPolling(); stopCrawlPolling() })
 
-// 提取进行中时轮询显示进度（不自动刷新表格，避免体验差）
+// 提取进行中时：轮询进度 + SSE 实时展示推理过程
 watch(extractPolling, (polling) => {
   if (extractPollTimer) clearInterval(extractPollTimer)
   extractPollTimer = null
+  if (extractTraceTimer) clearInterval(extractTraceTimer)
+  extractTraceTimer = null
+  if (extractTraceEventSource) {
+    extractTraceEventSource.close()
+    extractTraceEventSource = null
+  }
+  extractTraceSteps.value = []
   if (polling) {
     extractPollTimer = setInterval(async () => {
       await loadStats(true)
@@ -1012,6 +1112,44 @@ watch(extractPolling, (polling) => {
         stopExtractPolling()
       }
     }, 5000)
+    // 连接 SSE 流式获取推理过程（实时展示）
+    const streamUrl = `${import.meta.env.DEV ? '' : ''}/api/crawler/extraction-trace-stream`
+    try {
+      extractTraceEventSource = new EventSource(streamUrl)
+      extractTraceEventSource.addEventListener('trace', (e) => {
+        try {
+          const d = JSON.parse(e.data || '{}')
+          if (d.steps && d.steps.length > 0) extractTraceSteps.value = d.steps
+        } catch { /* ignore */ }
+      })
+      extractTraceEventSource.addEventListener('done', () => {
+        extractTraceEventSource?.close()
+        extractTraceEventSource = null
+      })
+      extractTraceEventSource.onerror = () => {
+        extractTraceEventSource?.close()
+        extractTraceEventSource = null
+        // 降级为轮询
+        const pollTrace = async () => {
+          try {
+            const d = await api.getExtractionTrace()
+            if (d.steps && d.steps.length > 0) extractTraceSteps.value = d.steps
+          } catch { /* ignore */ }
+        }
+        pollTrace()
+        extractTraceTimer = setInterval(pollTrace, 2000)
+      }
+    } catch {
+      // SSE 不可用时降级为轮询
+      const pollTrace = async () => {
+        try {
+          const d = await api.getExtractionTrace()
+          if (d.steps && d.steps.length > 0) extractTraceSteps.value = d.steps
+        } catch { /* ignore */ }
+      }
+      pollTrace()
+      extractTraceTimer = setInterval(pollTrace, 2000)
+    }
   }
 })
 
@@ -1036,7 +1174,7 @@ watch(crawlPolling, (polling) => {
 .collect-page {
   padding: 0 8px 24px;
   /*数据采集页面宽度 */
-  max-width: 1200px;
+  max-width: 1300px;
   margin: 0 auto;
 }
 .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
@@ -1271,13 +1409,13 @@ watch(crawlPolling, (polling) => {
 .badge-warn { background: #fef3c7; color: #b45309; }
 .badge-err { background: #fee2e2; color: #b91c1c; }
 
-/* LLM 提取进度条：牛客和小红书分开显示 */
+/* 提取进度 + SSE 推理过程（独立卡片，位于 LLM 提取 与 帖子记录 之间） */
+.extract-progress-card {
+  padding: 24px 28px;
+  margin-bottom: 20px;
+}
 .extract-progress-wrap {
-  margin-top: 24px;
-  padding: 20px 24px;
-  background: linear-gradient(135deg, rgba(91, 110, 245, 0.08) 0%, rgba(91, 110, 245, 0.04) 100%);
-  border-radius: 14px;
-  border: 1px solid rgba(91, 110, 245, 0.15);
+  padding: 0;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -1312,6 +1450,46 @@ watch(crawlPolling, (polling) => {
   font-weight: 600;
   white-space: nowrap;
 }
+.extract-trace-box {
+  margin-top: 16px;
+  padding: 12px 16px;
+  background: rgba(91, 110, 245, 0.06);
+  border: 1px solid rgba(91, 110, 245, 0.2);
+  border-radius: 8px;
+}
+.extract-trace-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-main);
+  margin-bottom: 10px;
+}
+.extract-trace-placeholder {
+  font-size: 12px;
+  color: var(--text-sub);
+  font-style: italic;
+}
+.extract-trace-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.extract-trace-step {
+  font-size: 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.extract-trace-step .step-num {
+  color: var(--text-sub);
+  flex-shrink: 0;
+}
+.extract-trace-step .step-text {
+  color: var(--text-main);
+  word-break: break-word;
+}
+.extract-trace-step.thought .step-text { color: #5b6ef5; }
+.extract-trace-step.tool .step-text { color: #e6a23c; }
+.extract-trace-step.finish .step-text { color: #67c23a; font-weight: 600; }
 .extract-section .result-msg { margin-top: 24px; }
 
 /* 4. 表格 */
@@ -1378,6 +1556,10 @@ watch(crawlPolling, (polling) => {
 }
 
 .table-empty { text-align: center; color: var(--text-sub); padding: 40px 20px; font-size: 14px; }
+.duration-value,
+.duration-empty { font-size: 12px; }
+.duration-value { color: var(--text-main); }
+.duration-empty { color: #c0c4cc; }
 .pagination-wrap { margin-top: 16px; display: flex; justify-content: center; }
 
 /* 自定义分页器 */

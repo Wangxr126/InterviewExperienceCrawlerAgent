@@ -115,6 +115,7 @@ def _run_nowcoder_discovery(keywords: List[str] = None, max_pages: int = None) -
                 difficulty=p.get("difficulty", ""),
                 post_type=p.get("post_type", ""),
                 discover_keyword=p.get("discover_keyword", ""),
+                post_time=p.get("post_time", ""),
             )
             if task_id:
                 added += 1
@@ -160,7 +161,10 @@ def _process_pending_tasks(batch_size: int = None):
     batch_size = batch_size or cfg.PROCESS_BATCH_SIZE
     logger.info(f"⚙️  开始处理任务队列（最多 {batch_size} 条）...")
 
-    processed = 0
+    processed = 0  # 入库题目总数
+    extract_ok = 0  # 成功提取的帖子数
+    extract_error = 0  # 失败的帖子数
+    extract_unrelated = 0  # 无关帖数
 
     # ── Step 1: pending → 抓取详情（仅牛客）──────────────────
     pending = sqlite_service.get_pending_tasks(platform="nowcoder", limit=batch_size)
@@ -246,8 +250,9 @@ def _process_pending_tasks(batch_size: int = None):
         _sep = '─' * 60
         _title_short = post_title[:35] if len(post_title) <= 35 else post_title[:32] + "..."
 
-        # 正文为空且无图片 → 跳过
+            # 正文为空且无图片 → 跳过
         if not raw_content and not image_paths:
+            extract_error += 1
             logger.info(f"{_sep}")
             logger.info(f"  [{platform}] {_title_short} | 正文=0字 | 图片=0张 | {task_id}")
             logger.info(f"  🔗 {url}")
@@ -262,55 +267,71 @@ def _process_pending_tasks(batch_size: int = None):
 
         _t0 = time.time()
         try:
-            # MinerAgent（function-calling 模式）自主决定是否调用 ocr_images 工具：
-            # - 正文有题目 → 直接调用 Finish 返回 JSON
-            # - 正文无题目但有图片 → 自主调用 ocr_images → 再调用 Finish 返回 JSON
-            questions, status, agent_used_tool = extract_questions_from_post(
-                content=raw_content,
-                platform=platform,
-                company=row["company"] or "",
-                position=row["position"] or "",
-                business_line=row["business_line"] or "",
-                difficulty=row["difficulty"] or "",
-                source_url=url,
-                post_title=row["post_title"] or "",
-                extraction_source="content",
-                image_paths=image_paths,
-                task_id=task_id,
-            )
+            from backend.config.config import settings
+            extract_retries = getattr(settings, "extract_retries_on_failure", 3) if image_paths else 0
+            questions, status, agent_used_tool, agent_succeeded, trace_session_id = [], "empty", False, True, None
+
+            for extract_attempt in range(extract_retries + 1):
+                # MinerAgent（function-calling 模式）自主决定是否调用 ocr_images 工具
+                questions, status, agent_used_tool, agent_succeeded, trace_session_id = extract_questions_from_post(
+                    content=raw_content,
+                    platform=platform,
+                    company=row["company"] or "",
+                    position=row["position"] or "",
+                    business_line=row["business_line"] or "",
+                    difficulty=row["difficulty"] or "",
+                    source_url=url,
+                    post_title=row["post_title"] or "",
+                    extraction_source="content",
+                    image_paths=image_paths,
+                    task_id=task_id,
+                )
+                if questions or status == "unrelated":
+                    break
+                if extract_attempt < extract_retries and (status in ("parse_error", "empty", "model_refused")):
+                    logger.warning(f"  提取失败（{status}），第 {extract_attempt + 1}/{extract_retries + 1} 次重试...")
+                    time.sleep(2)
+            if not questions and extract_retries > 0 and status in ("parse_error", "empty"):
+                logger.warning(f"  ⚠️ 重试 {extract_retries} 次后仍提取失败: {url}")
 
             # 帖子与面经无关 → 标记 unrelated（专用状态，参与「清洗无关帖」操作）
             if status == "unrelated":
-                sqlite_service.update_task_status(task_id, "unrelated", error_msg="LLM 判断与面经无关", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2))
+                extract_unrelated += 1
+                sqlite_service.update_task_status(task_id, "unrelated", error_msg="LLM 判断与面经无关", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2), trace_session_id=trace_session_id)
                 logger.warning(f"  ⚠️ 无关帖，已标记 unrelated")
                 logger.info("")
                 continue
 
             # LLM 解析失败 → 标记 error
             if status == "parse_error":
-                sqlite_service.update_task_status(task_id, "error", error_msg="LLM 返回无法解析为 JSON", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2))
+                extract_error += 1
+                sqlite_service.update_task_status(task_id, "error", error_msg="LLM 返回无法解析为 JSON", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2), trace_session_id=trace_session_id)
                 logger.error(f"  ❌ LLM 返回无法解析为 JSON")
                 logger.info("")
                 continue
 
-            # 提取到题目 → 入库
+            # 提取到题目 → 入库（降级成功时仅 SQLite，不写入 Graph）
             if questions:
-                extraction_src = "image" if image_paths and not raw_content.strip() else "content"
+                extract_ok += 1
+                # 根据是否调用了OCR来判断题目来源
+                extraction_src = "image" if agent_used_tool else "content"
                 crawl_task_id = row["id"] if "id" in row.keys() else None
-                count = _save_questions(questions, crawl_task_id=crawl_task_id)
+                count = _save_questions(questions, crawl_task_id=crawl_task_id, skip_neo4j=not agent_succeeded)
                 _dur = round(time.time()-_t0, 1)
-                sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round(_dur/60, 2))
-                logger.info(f"  ✅ 提取完成: {count} 道题目入库，耗时 {_dur/60:.1f}min")
+                sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round(_dur/60, 2), trace_session_id=trace_session_id)
+                logger.info(f"  ✅ 提取完成: {count} 道题目入库，耗时 {_dur/60:.1f}min" + ("（仅 SQLite，未写入 Graph）" if not agent_succeeded else "") + (f"（来源：{'图片' if agent_used_tool else '正文'}）" if agent_used_tool else ""))
                 logger.info("")
                 processed += count
                 continue
 
             # MinerAgent 正文+OCR 均无题目 → 标记 error 保留记录
-            sqlite_service.update_task_status(task_id, "error", error_msg="正文+OCR 均无题目（暂不删除）", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2))
+            extract_error += 1
+            sqlite_service.update_task_status(task_id, "error", error_msg="正文+OCR 均无题目（暂不删除）", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2), trace_session_id=trace_session_id)
             logger.warning(f"  ⚠️ 正文+OCR 均无题目，已标记 error")
             logger.info("")
 
         except Exception as e:
+            extract_error += 1
             import traceback
             sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200], raw_content=raw_content, extract_duration_min=round((time.time()-_t0)/60, 2))
             logger.error(
@@ -323,7 +344,10 @@ def _process_pending_tasks(batch_size: int = None):
         logger.info(f"{_bsep}>>> Step2: LLM提取 结束 <<<{_bsep}")
         logger.info("")
 
-    logger.info(f"⚙️  本轮处理完成，入库题目 {processed} 道")
+    if fetched_rows:
+        logger.info(f"⚙️  本轮处理完成：本批 {len(fetched_rows)} 条，成功 {extract_ok} 条（入库 {processed} 道题），失败 {extract_error} 条，无关 {extract_unrelated} 条")
+    else:
+        logger.info(f"⚙️  本轮处理完成，入库题目 {processed} 道")
 
     # 最终统计
     final_error_count = len(sqlite_service.get_tasks_by_status("error", limit=1000))
@@ -393,8 +417,9 @@ def process_single_task(task_id: str) -> Dict:
     # 重置状态为 fetched，确保后续写库逻辑正确
     sqlite_service.update_task_status(task_id, "fetched", raw_content=raw_content, image_paths=image_paths)
 
+    _t0 = time.time()
     try:
-        questions, status, agent_used_tool = extract_questions_from_post(
+        questions, status, agent_used_tool, agent_succeeded, trace_session_id = extract_questions_from_post(
             content=raw_content,
             platform=platform,
             company=task.get("company") or "",
@@ -409,24 +434,26 @@ def process_single_task(task_id: str) -> Dict:
         )
     except Exception as e:
         import traceback
-        sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200], raw_content=raw_content)
+        sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200], raw_content=raw_content, extract_duration_min=round((time.time() - _t0) / 60, 2))
         logger.error(f"[SingleTask] 提取异常 task_id={task_id}: {e}\n{traceback.format_exc()}")
         return {"status": "error", "message": str(e)[:300], "questions_added": 0, "ocr_called": False}
 
     if status == "unrelated":
-        sqlite_service.update_task_status(task_id, "error", error_msg="LLM 判断与面经无关", raw_content=raw_content, agent_used_tool=agent_used_tool)
+        sqlite_service.update_task_status(task_id, "unrelated", error_msg="LLM 判断与面经无关", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time() - _t0) / 60, 2), trace_session_id=trace_session_id)
         return {"status": "ok", "message": "LLM 判断内容与面经无关", "questions_added": 0, "ocr_called": agent_used_tool}
 
     if status == "parse_error":
-        sqlite_service.update_task_status(task_id, "error", error_msg="LLM 返回无法解析为 JSON", raw_content=raw_content, agent_used_tool=agent_used_tool)
+        sqlite_service.update_task_status(task_id, "error", error_msg="LLM 返回无法解析为 JSON", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time() - _t0) / 60, 2), trace_session_id=trace_session_id)
         return {"status": "error", "message": "LLM 返回格式错误，无法解析", "questions_added": 0, "ocr_called": agent_used_tool}
 
     if questions:
-        extraction_src = "image" if image_paths and not raw_content.strip() else "content"
+        # 根据是否调用了 OCR 工具判断题目来源（与批量提取逻辑一致）
+        extraction_src = "image" if agent_used_tool else "content"
         crawl_task_id = task.get("id") if isinstance(task, dict) else None
-        count = _save_questions(questions, crawl_task_id=crawl_task_id)
-        sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool)
-        logger.info(f"[SingleTask] 完成 task_id={task_id}: {count} 道题目入库, ocr_called={agent_used_tool}")
+        count = _save_questions(questions, crawl_task_id=crawl_task_id, skip_neo4j=not agent_succeeded)
+        _dur = round(time.time() - _t0, 1)
+        sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round(_dur / 60, 2), trace_session_id=trace_session_id)
+        logger.info(f"[SingleTask] 完成 task_id={task_id}: {count} 道题目入库, ocr_called={agent_used_tool}" + ("（仅 SQLite）" if not agent_succeeded else ""))
         return {
             "status": "ok",
             "message": f"提取完成，{count} 道题目入库" + ("（含 OCR 识别图片）" if agent_used_tool else ""),
@@ -434,7 +461,7 @@ def process_single_task(task_id: str) -> Dict:
             "ocr_called": agent_used_tool,
         }
 
-    sqlite_service.update_task_status(task_id, "error", error_msg="正文+OCR 均无题目", raw_content=raw_content, agent_used_tool=agent_used_tool)
+    sqlite_service.update_task_status(task_id, "error", error_msg="正文+OCR 均无题目", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time() - _t0) / 60, 2), trace_session_id=trace_session_id)
     return {"status": "ok", "message": "未提取到题目（正文和图片均无面试题内容）", "questions_added": 0, "ocr_called": agent_used_tool}
 
 
@@ -449,11 +476,12 @@ def _get_embedding(text: str) -> Optional[List[float]]:
         return None
 
 
-def _save_questions(questions: List[Dict], crawl_task_id: Optional[int] = None) -> int:
+def _save_questions(questions: List[Dict], crawl_task_id: Optional[int] = None, skip_neo4j: bool = False) -> int:
     """
     将提取的题目写入 SQLite（主存储）+ Neo4j（知识图谱，可选）。
     Neo4j 不可用时静默跳过，不影响 SQLite 入库。
     crawl_task_id: 关联 crawl_tasks.id，便于根据帖子 id 查原帖。
+    skip_neo4j: 为 True 时跳过 Graph 写入（降级成功时使用，仅入库 SQLite）。
     返回成功入库数量。
     """
     saved = 0
@@ -469,16 +497,17 @@ def _save_questions(questions: List[Dict], crawl_task_id: Optional[int] = None) 
             )
 
             # ── SQLite（主存储，必须成功）───────────────────
+            # answer_text=豆包答案（展示用），raw_answer=原答案（Stage1，two_stage 时）
             extraction_source = q.get("extraction_source", "content")
             with sqlite_service._get_conn() as conn:
                 conn.execute("""
                     INSERT OR IGNORE INTO questions
-                        (q_id, question_text, answer_text, difficulty, question_type,
+                        (q_id, question_text, answer_text, raw_answer, difficulty, question_type,
                          source_platform, source_url, company, position, business_line,
                          topic_tags, extraction_source, crawl_task_id, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """, (
-                    q["q_id"], q["question_text"], q.get("answer_text", ""),
+                    q["q_id"], q["question_text"], q.get("answer_text", ""), q.get("raw_answer", ""),
                     q.get("difficulty", "medium"), q.get("question_type", "技术题"),
                     q.get("source_platform", ""), q.get("source_url", ""),
                     q.get("company", ""), q.get("position", ""), q.get("business_line", ""),
@@ -489,10 +518,12 @@ def _save_questions(questions: List[Dict], crawl_task_id: Optional[int] = None) 
                 conn.commit()
 
             # ── Neo4j（知识图谱 + 向量索引 + 变体边维护）─────────
-            if neo4j_service.available:
+            if neo4j_service.available and not skip_neo4j:
                 embedding = _get_embedding(q["question_text"])
                 if embedding:
-                    similar = neo4j_service.check_duplicate(embedding, threshold=0.85)
+                    similar = neo4j_service.check_duplicate(
+                        embedding, threshold=settings.retrieval_check_duplicate_threshold
+                    )
                     neo4j_service.add_question(
                         q_id=q["q_id"],
                         text=q["question_text"],
@@ -506,6 +537,7 @@ def _save_questions(questions: List[Dict], crawl_task_id: Optional[int] = None) 
                             "position": q.get("position", ""),
                             "source_platform": q.get("source_platform", ""),
                             "source": q.get("source_url", ""),
+                            "raw_answer": q.get("raw_answer", ""),
                         }
                     )
                     if similar and str(similar.get("id")) != str(q["q_id"]):

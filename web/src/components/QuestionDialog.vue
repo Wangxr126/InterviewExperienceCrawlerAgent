@@ -75,7 +75,7 @@ const submitting = ref(false)
 const evalResult = ref(null)
 const showAnswer = ref(false)
 const standardAnswer = computed(() =>
-  props.question?.answer_text || props.question?.reference_answer || ''
+  props.question?.answer_text || props.question?.reference_answer || evalResult.value?.standard_answer || ''
 )
 
 // 分点答案：1. 2. 或 一、二、 或 （1）（2）等每条占一行，格式清晰
@@ -101,15 +101,41 @@ watch(visible, (v) => {
   }
 })
 
-const submit = () => {
+const submit = async () => {
   if (!myAnswer.value.trim()) { ElMessage.warning('请先输入你的答案'); return }
   if (!props.question?.q_id) { ElMessage.warning('题目 ID 缺失，无法记录'); return }
+  
   submitting.value = true
   evalResult.value = null
+  
   try {
     const userAnswer = myAnswer.value.trim()
-    visible.value = false
-    emit('submit-complete', { question: props.question, userAnswer })
+    
+    // 调用后端 submit_answer 接口
+    const { api } = await import('../api.js')
+    const result = await api.submitAnswer({
+      user_id: props.userId,
+      session_id: props.sessionId || `sess_${Date.now()}`,
+      question_id: props.question.q_id,
+      question_text: props.question.question_text,
+      user_answer: userAnswer,
+      question_tags: props.question.topic_tags || []
+    })
+    
+    // 显示评估结果
+    evalResult.value = result
+    ElMessage.success(`已提交！得分：${result.score}/5`)
+    
+    // 触发完成事件（用于刷新列表等）
+    emit('submit-complete', { 
+      question: props.question, 
+      userAnswer,
+      result 
+    })
+    
+  } catch (error) {
+    console.error('提交答案失败:', error)
+    ElMessage.error(error.message || '提交失败，请重试')
   } finally {
     submitting.value = false
   }

@@ -3,7 +3,7 @@ Miner Agent - 信息挖掘师（ReAct版）
 职责：从面经原文中智能挖掘结构化信息
 
 使用 hello-agents 框架的 ReActAgent，内置 Thought + Finish 工具。
-按框架 16 项能力配置：Trace、熔断器、工具截断、TodoWrite、DevLog、子代理等。
+按框架能力配置：Trace、熔断器、工具截断等。Miner 禁用 TodoWrite/DevLog，避免模型误用任务规划工具占用步数。
 """
 import logging
 import re
@@ -67,11 +67,9 @@ class MinerAgent(ReActAgent):
             context_window=128000,
             compression_threshold=0.8,
             min_retain_rounds=5,
-            # TodoWrite + DevLog（多步提取可记录进度）
-            todowrite_enabled=True,
-            todowrite_persistence_dir=f"{_data_dir}/todos",
-            devlog_enabled=True,
-            devlog_persistence_dir=f"{_data_dir}/devlogs",
+            # TodoWrite/DevLog 禁用：Miner 只需 ocr_images→Finish，避免模型误用任务规划工具占用步数
+            todowrite_enabled=False,
+            devlog_enabled=False,
             # Skills（可选，面经提取可复用）
             skills_enabled=True,
             skills_dir=_skills_dir,
@@ -90,7 +88,7 @@ class MinerAgent(ReActAgent):
             max_concurrent_tools=2,
         )
 
-        max_steps = getattr(settings, "miner_max_steps", 5)
+        max_steps = settings.miner_max_steps
 
         # 初始化父类（ReActAgent）
         super().__init__(
@@ -153,8 +151,21 @@ class MinerAgent(ReActAgent):
                             break
                     break
 
-            # 检查是否是无关信号
-            if UNRELATED_SIGNAL in result_text:
+            # 检查是否是无关信号（含 mark_unrelated 工具调用，LLM 可能只输出自然语言不含 __UNRELATED__）
+            mark_unrelated_called = False
+            for attr in ('_tool_call_history', 'tool_call_history', 'history'):
+                history = getattr(self, attr, None)
+                if history:
+                    for tc in history:
+                        name = (
+                            tc.get('tool_name') or tc.get('name') or (tc.get('function') or {}).get('name', '')
+                        ) if isinstance(tc, dict) else getattr(tc, 'name', '')
+                        if name == 'mark_unrelated':
+                            mark_unrelated_called = True
+                            break
+                    if mark_unrelated_called:
+                        break
+            if UNRELATED_SIGNAL in result_text or mark_unrelated_called:
                 logger.debug(f"[MinerAgent] 执行完成，输出长度: {len(result_text)}, ocr_called={self._ocr_called}, is_unrelated=True")
                 return UNRELATED_SIGNAL, self._ocr_called, True
 

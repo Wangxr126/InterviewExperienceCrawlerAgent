@@ -84,7 +84,8 @@
                 <span v-else class="text-muted">—</span>
               </template>
             </el-table-column>
-            <el-table-column label="创建时间" prop="created_at" width="180" />
+            <el-table-column label="创建时间" prop="created_at" width="160" />
+            <el-table-column label="修改时间" prop="modified_at" width="160" />
           </el-table>
           
           <el-pagination 
@@ -113,6 +114,7 @@
             </div>
             <div class="header-right">
               <span class="time-info">创建：{{ currentSample.created_at }}</span>
+              <span v-if="currentSample.modified_at" class="time-info">修改：{{ currentSample.modified_at }}</span>
               <span v-if="currentSample.labeled_at" class="time-info">标注：{{ currentSample.labeled_at }}</span>
             </div>
           </div>
@@ -177,18 +179,33 @@
               </div>
             </div>
 
-            <!-- 中栏：小模型输出 -->
+            <!-- 中栏：Stage1 本地 Qwen3 / Stage2 豆包 对比 -->
             <div class="editor-panel">
               <div class="panel-header">
-                <span class="panel-title">② 小模型提取结果</span>
-                <span class="panel-subtitle">（{{ llmQuestionCount }} 道题）</span>
-                <el-button @click="copyLlmRaw" size="small" style="margin-left: auto;">
+                <span class="panel-title">② Stage1 本地 Qwen3</span>
+                <span class="panel-subtitle">（{{ stage1QuestionCount }} 道题）</span>
+                <el-button @click="copyStage1" size="small" style="margin-left: auto;">
                   📋 复制
                 </el-button>
               </div>
               <div class="panel-content json-viewer">
                 <vue-json-pretty 
-                  :data="parseJson(currentSample.llm_raw)"
+                  :data="parseJson(currentSample.stage1_output)"
+                  :deep="99"
+                  :showLength="true"
+                  :showLine="true"
+                />
+              </div>
+              <div v-if="currentSample.stage2_output" class="panel-header" style="margin-top:12px">
+                <span class="panel-title">Stage2 豆包 API</span>
+                <span class="panel-subtitle">（{{ stage2QuestionCount }} 道题）</span>
+                <el-button @click="copyStage2" size="small" style="margin-left: auto;">
+                  📋 复制到编辑区
+                </el-button>
+              </div>
+              <div v-if="currentSample.stage2_output" class="panel-content json-viewer">
+                <vue-json-pretty 
+                  :data="parseJson(currentSample.stage2_output)"
                   :deep="99"
                   :showLength="true"
                   :showLine="true"
@@ -196,10 +213,10 @@
               </div>
             </div>
 
-            <!-- 右栏：大模型辅助 + 编辑 -->
+            <!-- 右栏：标注编辑 + 大模型辅助 -->
             <div class="editor-panel">
               <div class="panel-header">
-                <span class="panel-title">③ 大模型辅助生成</span>
+                <span class="panel-title">③ 标注编辑</span>
                 <el-button 
                   type="primary" 
                   @click="callAssist"
@@ -241,7 +258,7 @@
       <!-- Tab 3: 日志文件 -->
       <el-tab-pane label="📂 导入日志" name="logs">
         <div class="logs-container">
-          <div class="section-title">微调/llm_logs/ 下的日志文件</div>
+          <div class="section-title">Miner 两阶段日志（Stage1 Qwen3 + Stage2 豆包）及 llm_logs</div>
           <el-table :data="logFiles" class="logs-table">
             <el-table-column label="模型" prop="model" width="180" />
             <el-table-column label="文件名" prop="filename" />
@@ -254,7 +271,55 @@
               </template>
             </el-table-column>
           </el-table>
-          <div class="tip-text">💡 点击「查看」预览案例，点击「导入」将该文件的记录写入数据库，重复记录自动跳过</div>
+          <div class="tip-text">💡 Miner 两阶段日志（miner_two_stage_log.jsonl）优先，含本地 Qwen3 与豆包 API 对比；点击「导入」写入数据库，重复记录自动跳过</div>
+        </div>
+      </el-tab-pane>
+
+      <!-- Tab 4: 上传 FAQ -->
+      <el-tab-pane label="📤 上传FAQ" name="faq">
+        <div class="faq-upload-container">
+          <div class="section-title">上传 FAQ 文件（问题+答案）</div>
+          <div class="faq-upload-desc">
+            支持 CSV / JSON / JSONL / TXT 格式。每行或每条为「问题 + 答案」。
+            CSV 列名可为 question/answer、question_text/answer_text、问题/答案。
+          </div>
+          <el-checkbox v-model="faqSaveToBank" class="faq-checkbox">保存到题库（SQLite + Neo4j）</el-checkbox>
+          <el-checkbox v-model="faqSaveToFinetune" class="faq-checkbox">写入微调样本（用于模型 SFT）</el-checkbox>
+          <el-upload
+            ref="faqUploadRef"
+            :auto-upload="false"
+            :limit="1"
+            :on-change="onFaqFileChange"
+            :show-file-list="true"
+            accept=".csv,.json,.jsonl,.txt"
+            drag
+          >
+            <el-icon class="el-icon--upload"><upload-filled /></el-icon>
+            <div class="el-upload__text">将文件拖到此处，或<em>点击上传</em></div>
+            <template #tip>
+              <div class="el-upload__tip">支持 .csv, .json, .jsonl, .txt</div>
+            </template>
+          </el-upload>
+          <el-button
+            v-if="faqSelectedFile"
+            type="primary"
+            size="large"
+            :loading="faqUploading"
+            @click="submitFaqUpload"
+            class="faq-submit-btn"
+          >
+            {{ faqUploading ? '上传中...' : '上传并导入' }}
+          </el-button>
+          <div v-if="faqResult" class="faq-result">
+            <el-alert
+              :title="`解析 ${faqResult.parsed} 条，题库 ${faqResult.bank_saved} 条，微调 ${faqResult.finetune_saved} 条`"
+              :type="faqResult.errors?.length ? 'warning' : 'success'"
+              show-icon
+            />
+            <div v-if="faqResult.errors?.length" class="faq-errors">
+              <div v-for="(err, i) in faqResult.errors" :key="i">{{ err }}</div>
+            </div>
+          </div>
         </div>
       </el-tab-pane>
     </el-tabs>
@@ -300,13 +365,30 @@
           
           <div class="preview-section" v-if="sample.llm_raw_obj">
             <div class="preview-section-title">
-              小模型提取结果
+              Stage1 本地 Qwen3
               <span class="preview-question-count" v-if="Array.isArray(sample.llm_raw_obj)">
                 （{{ sample.llm_raw_obj.length }} 道题）
               </span>
             </div>
             <vue-json-pretty 
               :data="sample.llm_raw_obj"
+              :deep="99"
+              :showLength="false"
+              :showLine="false"
+              :showDoubleQuotes="false"
+              :highlightMouseoverNode="true"
+              :collapsedOnClickBrackets="true"
+            />
+          </div>
+          <div class="preview-section" v-if="sample.stage2_obj">
+            <div class="preview-section-title">
+              Stage2 豆包 API
+              <span class="preview-question-count" v-if="Array.isArray(sample.stage2_obj)">
+                （{{ sample.stage2_obj.length }} 道题）
+              </span>
+            </div>
+            <vue-json-pretty 
+              :data="sample.stage2_obj"
               :deep="99"
               :showLength="false"
               :showLine="false"
@@ -324,7 +406,7 @@
 
 <script setup>
 import { ref, computed, onMounted, onActivated } from 'vue'
-import { Refresh, Loading } from '@element-plus/icons-vue'
+import { Refresh, Loading, UploadFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import VueJsonPretty from 'vue-json-pretty'
 import 'vue-json-pretty/lib/styles.css'
@@ -337,6 +419,55 @@ const api = {
     headers: { 'Content-Type': 'application/json' }, 
     body: JSON.stringify(body) 
   }).then(r => r.json()),
+}
+
+// FAQ 上传
+const faqSaveToBank = ref(true)
+const faqSaveToFinetune = ref(true)
+const faqUploadRef = ref(null)
+const faqSelectedFile = ref(null)
+const faqUploading = ref(false)
+const faqResult = ref(null)
+
+const onFaqFileChange = (file) => {
+  faqSelectedFile.value = file.raw
+  faqResult.value = null
+}
+
+const submitFaqUpload = async () => {
+  if (!faqSelectedFile.value) {
+    ElMessage.warning('请先选择文件')
+    return
+  }
+  faqUploading.value = true
+  faqResult.value = null
+  try {
+    const form = new FormData()
+    form.append('file', faqSelectedFile.value)
+    form.append('save_to_bank', faqSaveToBank.value)
+    form.append('save_to_finetune', faqSaveToFinetune.value)
+    const res = await fetch(`${BASE}/upload-faq`, {
+      method: 'POST',
+      body: form,
+    })
+    const data = await res.json()
+    if (!res.ok) {
+      ElMessage.error(data.detail || '上传失败')
+      return
+    }
+    faqResult.value = data
+    if (data.parsed > 0) {
+      ElMessage.success(`导入完成：题库 ${data.bank_saved} 条，微调 ${data.finetune_saved} 条`)
+      faqSelectedFile.value = null
+      faqUploadRef.value?.clearFiles()
+      await loadStats()
+      await loadSamples(1)
+    }
+  } catch (e) {
+    ElMessage.error('上传失败：' + e.message)
+  } finally {
+    faqUploading.value = false
+  }
 }
 
 // 统计数据
@@ -427,8 +558,9 @@ const loadSamples = async (page = currentPage.value) => {
 const onSampleClick = async (row) => {
   const detail = await api.get(`${BASE}/samples/${row.id}`)
   currentSample.value = detail
-  // 自动格式化已有的输出
-  editOutput.value = detail.assist_output ? formatJson(detail.assist_output) : ''
+  // 预填：final_output > assist_output > stage2_output（豆包结果）
+  const prefill = detail.final_output || detail.assist_output || detail.stage2_output || ''
+  editOutput.value = prefill ? formatJson(prefill) : ''
   activeTab.value = 'editor'
 }
 
@@ -461,7 +593,7 @@ const labeling = ref(false)
 const exporting = ref(false)
 
 const isModified = computed(() => {
-  const orig = currentSample.value?.assist_output || ''
+  const orig = currentSample.value?.final_output || currentSample.value?.assist_output || currentSample.value?.stage2_output || ''
   return editOutput.value.trim() !== orig.trim() && editOutput.value.trim() !== ''
 })
 
@@ -470,18 +602,23 @@ const parseJson = (str) => {
   try { return JSON.parse(str) } catch { return { error: '无效JSON', raw: str } }
 }
 
-// 计算小模型提取的题目数量
-const llmQuestionCount = computed(() => {
-  if (!currentSample.value?.llm_raw) return 0
+// Stage1 题目数量
+const stage1QuestionCount = computed(() => {
+  const raw = currentSample.value?.stage1_output
+  if (!raw) return 0
   try {
-    const parsed = JSON.parse(currentSample.value.llm_raw)
-    if (Array.isArray(parsed)) {
-      return parsed.length
-    }
-    return 0
-  } catch {
-    return 0
-  }
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.length : 0
+  } catch { return 0 }
+})
+// Stage2 题目数量
+const stage2QuestionCount = computed(() => {
+  const raw = currentSample.value?.stage2_output
+  if (!raw) return 0
+  try {
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.length : 0
+  } catch { return 0 }
 })
 
 // 解析编辑输出：如果是list，去掉首尾括号展示为对象数组
@@ -551,24 +688,22 @@ const confirmLabel = async () => {
   }
 }
 
-// 复制小模型提取结果
-const copyLlmRaw = () => {
-  const text = currentSample.value.llm_raw || ''
-  if (!text) {
-    ElMessage.warning('没有内容可复制')
-    return
-  }
-  navigator.clipboard.writeText(text).then(() => {
-    ElMessage.success('已复制到剪贴板')
-  }).catch(() => {
-    ElMessage.error('复制失败')
-  })
+const copyStage1 = () => {
+  const text = currentSample.value?.stage1_output || ''
+  if (!text) { ElMessage.warning('Stage1 无内容'); return }
+  navigator.clipboard.writeText(text).then(() => ElMessage.success('已复制')).catch(() => ElMessage.error('复制失败'))
+}
+const copyStage2 = () => {
+  const text = currentSample.value?.stage2_output || ''
+  if (!text) { ElMessage.warning('Stage2 无内容'); return }
+  editOutput.value = formatJson(text)
+  ElMessage.success('已填入编辑区')
 }
 
 const confirmNoChange = async () => {
-  // 使用小模型的输出作为最终标注
-  const llmOutput = currentSample.value.llm_raw
-  if (!llmOutput) { ElMessage.warning('小模型输出为空'); return }
+  // 使用 Stage2 豆包 或 Stage1 作为最终标注
+  const llmOutput = currentSample.value?.stage2_output || currentSample.value?.stage1_output
+  if (!llmOutput) { ElMessage.warning('Stage1/Stage2 输出为空'); return }
   
   labeling.value = true
   try {
@@ -1019,6 +1154,38 @@ onActivated(async () => {
   background: #fef3c7;
   border-radius: 8px;
   border-left: 4px solid #f59e0b;
+}
+
+/* FAQ 上传 */
+.faq-upload-container {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  max-width: 560px;
+}
+
+.faq-upload-desc {
+  font-size: 14px;
+  color: #6b7280;
+  line-height: 1.6;
+}
+
+.faq-checkbox {
+  margin-right: 16px;
+}
+
+.faq-submit-btn {
+  align-self: flex-start;
+}
+
+.faq-result {
+  margin-top: 16px;
+}
+
+.faq-errors {
+  margin-top: 8px;
+  font-size: 13px;
+  color: #b45309;
 }
 
 /* 日志预览对话框 */

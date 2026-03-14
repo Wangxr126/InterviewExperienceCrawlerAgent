@@ -171,6 +171,13 @@ try:
     logging.basicConfig(handlers=[_InterceptHandler()], level=0, force=True)
 
     _loguru_logger.info("✅ 日志系统已启动（统一格式）")
+
+    # 修复 hello_agents 工具参数 JSON 解析（Unterminated string）问题
+    try:
+        from backend.patches.tool_args_json_patch import apply_patch
+        apply_patch()
+    except Exception as _e:
+        _loguru_logger.warning("工具参数 JSON 解析补丁未应用: %s", _e)
     
     # 禁用 hello-agents 框架的工具注册日志（print 直接输出到 stdout，需 monkey-patch 静默）
     logging.getLogger("hello_agents").setLevel(logging.WARNING)
@@ -206,6 +213,12 @@ except ImportError:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
 
                        datefmt="%Y-%m-%d %H:%M:%S")
+    # loguru 未安装时仍应用工具参数 JSON 解析补丁
+    try:
+        from backend.patches.tool_args_json_patch import apply_patch
+        apply_patch()
+    except Exception:
+        pass
 
 
 
@@ -269,7 +282,7 @@ import json
 
 import requests
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Form
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -399,12 +412,17 @@ orchestrator = get_orchestrator()
 
 
 def _warmup_llm_sync():
-
     """同步预热 LLM，供启动时及 run_xhs_worker 子进程调用"""
-
     from backend.services.warmup.llm_warmup import warmup_llm
 
     warmup_llm(timeout=120)  # Ollama 冷启动可能较久
+
+
+def _warmup_embedding_rerank_sync():
+    """同步预热 Embedding + Reranker（LLM 预热之后调用）"""
+    from backend.services.warmup.model_warmup import warmup_embedding_rerank
+
+    warmup_embedding_rerank(timeout=120)
 
 
 
@@ -461,9 +479,10 @@ async def startup_event():
     crawl_scheduler.start()
     logger.info("爬虫调度器已启动")
 
-    # 同步预热 LLM，确保首次提取不因冷启动超时
+    # 同步预热 LLM + Embedding + Reranker，确保首次请求不因冷启动超时
     if _s.llm_warmup_enabled and _s.llm_base_url:
         await asyncio.to_thread(_warmup_llm_sync)
+        await asyncio.to_thread(_warmup_embedding_rerank_sync)
 
 
 @app.on_event("shutdown")
@@ -1155,6 +1174,8 @@ def get_user_mastery(user_id: str):
 
     history = sqlite_service.get_study_history(user_id, limit=10)
 
+    weakness_notes = sqlite_service.get_user_weakness_notes(user_id, limit=10)
+
     profile = sqlite_service.get_user_profile(user_id)
 
     # 兼容前端 ReportView 期望的字段（total_answered, mastered_count）
@@ -1167,6 +1188,7 @@ def get_user_mastery(user_id: str):
         "mastery_summary": summary,
         "weak_tags": weak_tags,
         "recent_history": history,
+        "weakness_notes": weakness_notes,
         "total_answered": total,
         "mastered_count": correct,
     }
@@ -1309,6 +1331,116 @@ def get_extraction_status():
     """获取后台提取是否正在运行（前端刷新后可据此恢复进度显示）"""
 
     return {"running": _extraction_running, "initial_by_platform": _extraction_initial_by_platform}
+
+
+def _read_extraction_trace_steps():
+    """读取最新 trace 文件的推理步骤，供轮询和 SSE 复用"""
+    import json
+    from pathlib import Path
+    trace_dir = Path(_cfg.backend_data_dir) / "memory" / "traces"
+    if not trace_dir.exists():
+        return [], None
+    files = sorted(trace_dir.glob("trace-s-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        return [], None
+    latest = files[0]
+    steps = []
+    try:
+        with open(latest, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                    payload = ev.get("payload") or {}
+                    event = ev.get("event")
+                    step_num = ev.get("step")
+                    if event == "tool_call":
+                        tool_name = payload.get("tool_name", "")
+                        args = payload.get("args", {})
+                        if tool_name == "Thought":
+                            steps.append({"step": step_num, "type": "thought", "text": args.get("reasoning", "")[:200]})
+                        elif tool_name == "Finish":
+                            ans = args.get("answer", "")
+                            cnt = ans.count('"question_text"') if ans else 0
+                            steps.append({"step": step_num, "type": "finish", "text": f"✅ 提取完成，共 {cnt} 道题目" if cnt else "✅ 提取完成"})
+                        elif tool_name == "ocr_images":
+                            steps.append({"step": step_num, "type": "tool", "text": "🔍 调用 OCR 识别图片..."})
+                        elif tool_name == "mark_unrelated":
+                            steps.append({"step": step_num, "type": "tool", "text": "⚠️ 标记为无关帖"})
+                        else:
+                            steps.append({"step": step_num, "type": "tool", "text": f"调用 {tool_name}"})
+                    elif event == "tool_result" and steps:
+                        last = steps[-1]
+                        if last.get("type") == "tool" and "OCR" in last.get("text", ""):
+                            last["text"] = "✅ OCR 识别完成"
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    except Exception as e:
+        logger.debug(f"读取 trace 失败: {e}")
+    session_id = latest.stem.replace("trace-", "", 1) if latest else None
+    return steps, session_id
+
+
+@app.get("/api/crawler/extraction-trace")
+def get_extraction_trace():
+    """
+    获取当前提取任务的最新推理过程（Miner Agent 的 Thought/工具调用/Finish）。
+    提取进行中时前端轮询此接口，动态展示推理步骤。
+    """
+    steps, session_id = _read_extraction_trace_steps()
+    return {"steps": steps, "session_id": session_id}
+
+
+@app.get("/api/crawler/extraction-trace-stream")
+async def get_extraction_trace_stream():
+    """
+    SSE 流式推送当前提取的推理过程，提取进行中时前端连接此接口实时展示。
+    """
+    import asyncio
+    from fastapi.responses import StreamingResponse
+
+    async def _stream():
+        last_steps_json = ""
+        for _ in range(1800):  # 最多 30 分钟
+            steps, session_id = _read_extraction_trace_steps()
+            data = json.dumps({"steps": steps, "session_id": session_id}, ensure_ascii=False)
+            if data != last_steps_json:
+                last_steps_json = data
+                yield f"event: trace\ndata: {data}\n\n"
+            if not _extraction_running:
+                yield f"event: done\ndata: {{\"done\": true}}\n\n"
+                break
+            await asyncio.sleep(1)
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/crawler/trace/{session_id}")
+def get_trace_html(session_id: str):
+    """
+    返回指定 session 的 trace HTML 文件内容，用于帖子记录表中「查看推理过程」链接。
+    session_id 格式如 s-20260314-142242-0644
+    """
+    import re as _re
+    from fastapi.responses import FileResponse
+    trace_dir = Path(_cfg.backend_data_dir) / "memory" / "traces"
+    # 安全校验：session_id 只允许字母数字和连字符
+    if not _re.match(r"^s-[a-zA-Z0-9\-]+$", session_id):
+        raise HTTPException(status_code=400, detail="无效的 session_id")
+    html_path = trace_dir / f"trace-{session_id}.html"
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail="Trace 文件不存在或已清理")
+    return FileResponse(html_path, media_type="text/html; charset=utf-8")
 
 
 
@@ -1643,11 +1775,28 @@ async def extract_pending_posts(batch_size: int | None = Query(default=None, ge=
 
 
 
-    _t = threading.Thread(target=_bg, daemon=True)
+    # 使用 asyncio.create_task 创建后台任务，不阻塞事件循环
+    async def _bg_async():
+        global _extraction_running, _extraction_initial_by_platform
+        try:
+            _extraction_running = True
+            _extraction_initial_by_platform = initial_by_platform
+            # 使用 asyncio.to_thread 将同步任务放到线程池执行
+            cnt = await asyncio.to_thread(
+                crawl_scheduler.trigger_process_tasks,
+                batch_size=batch_size
+            )
+            logger.info(f"[API] 提取未处理帖子 后台完成：{cnt} 道题目入库")
+        except Exception as e:
+            logger.error(f"后台提取失败: {e}", exc_info=True)
+        finally:
+            _extraction_running = False
+            _extraction_initial_by_platform = {}
 
-    _t.start()
+    # 创建后台任务，不等待完成
+    asyncio.create_task(_bg_async())
 
-    logger.info(f"[后台线程] ▶ 启动 LLM提取线程 tid={_t.ident} | 待处理 {pending_count} 条 | batch_size={batch_size}")
+    logger.info(f"[后台任务] ▶ 启动 LLM提取任务 | 待处理 {pending_count} 条 | batch_size={batch_size}")
 
     return {
 
@@ -1829,8 +1978,20 @@ async def retry_error_posts(batch_size: int | None = Query(default=None, ge=1, l
 
     with sqlite3.connect(sqlite_service.db_path) as conn:
 
-        # 有正文或有图片：重置为 fetched，进行 LLM 提取（会自动触发 OCR）
+        # 先修正误标为 error 的无关帖（mark_unrelated 调用后应标 unrelated，避免被重试）
+        fix_unrelated = conn.execute(
+            """UPDATE crawl_tasks SET status='unrelated', error_msg='LLM 判断与面经无关'
+               WHERE status='error' AND (
+                 error_msg LIKE '%正文无有效面试题%'
+                 OR error_msg LIKE '%正文无面试题%'
+                 OR error_msg LIKE '%LLM 判断与面经无关%'
+               )"""
+        ).rowcount
+        if fix_unrelated:
+            conn.commit()
+            logger.info(f"[API] 重试前修正 {fix_unrelated} 条误标为失败的无关帖 → unrelated")
 
+        # 有正文或有图片：重置为 fetched，进行 LLM 提取（会自动触发 OCR）
         r1 = conn.execute(
 
             "UPDATE crawl_tasks SET status='fetched', error_msg=NULL "
@@ -1948,129 +2109,72 @@ async def retry_error_posts(batch_size: int | None = Query(default=None, ge=1, l
 
 
 @app.post("/api/crawler/re-extract-all")
-
 async def re_extract_all_posts(batch_size: int | None = Query(default=None, ge=1, le=200)):
-
     """
-
     重新提取所有问题：将「已完成」或「失败」且有正文的帖子重置为待提取，删除旧题目，后台重新 LLM 提取。
-
+    准备阶段在线程中执行，避免阻塞事件循环影响提交作答等用户操作。
     """
-
     batch_size = batch_size if batch_size is not None else _cfg.crawler_process_batch_size
-
     logger.info(f"[API] 重新提取所有问题 被调用 batch_size={batch_size}")
-
-    import threading
 
     import sqlite3
 
+    def _prepare_sync():
+        _re_extract_cond = "status IN ('done','error') AND raw_content IS NOT NULL"
+        with sqlite3.connect(sqlite_service.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""SELECT task_id, source_url FROM crawl_tasks
+                   WHERE {_re_extract_cond}
+                   LIMIT ?""",
+                (batch_size,),
+            ).fetchall()
+        tasks = [dict(r) for r in rows]
+        if not tasks:
+            return None, 0, []
 
+        urls = [t["source_url"] for t in tasks]
+        deleted_questions = 0
+        try:
+            from backend.services.storage.neo4j_service import neo4j_service
+            for url in urls:
+                neo4j_service.delete_questions_by_source_url(url)
+        except Exception as e:
+            logger.warning("Neo4j 删除题目失败（SQLite 将照常删除）: %s", e)
 
-    _re_extract_cond = "status IN ('done','error') AND raw_content IS NOT NULL"
+        with sqlite3.connect(sqlite_service.db_path) as conn:
+            for url in urls:
+                cur = conn.execute("DELETE FROM questions WHERE source_url=?", (url,))
+                deleted_questions += cur.rowcount
+            conn.execute(
+                f"""UPDATE crawl_tasks SET status='fetched', questions_count=0, error_msg=NULL, extraction_source=NULL
+                   WHERE {_re_extract_cond}
+                   AND source_url IN (""" + ",".join("?" * len(urls)) + ")",
+                urls,
+            )
+            conn.commit()
+        return tasks, deleted_questions, urls
 
-
-
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-
-        conn.row_factory = sqlite3.Row
-
-        rows = conn.execute(
-
-            f"""SELECT task_id, source_url FROM crawl_tasks
-
-               WHERE {_re_extract_cond}
-
-               LIMIT ?""",
-
-            (batch_size,),
-
-        ).fetchall()
-
-    tasks = [dict(r) for r in rows]
-
-
-
+    tasks, deleted_questions, urls = await asyncio.to_thread(_prepare_sync)
     if not tasks:
-
-        logger.info("[API] 重新提取所有问题 无 done/error 记录可重提取")
-
         return {"status": "ok", "message": "没有可重新提取的帖子（done/error 且含正文）", "reset": 0}
-
-
-
-    urls = [t["source_url"] for t in tasks]
-
-    deleted_questions = 0
-
-    # 同步删除 Neo4j 题库中的题目节点
-
-    try:
-
-        from backend.services.storage.neo4j_service import neo4j_service
-
-        for url in urls:
-
-            neo4j_service.delete_questions_by_source_url(url)
-
-    except Exception as e:
-
-        logger.warning("Neo4j 删除题目失败（SQLite 将照常删除）: %s", e)
-
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-
-        for url in urls:
-
-            cur = conn.execute("DELETE FROM questions WHERE source_url=?", (url,))
-
-            deleted_questions += cur.rowcount
-
-        conn.execute(
-
-            f"""UPDATE crawl_tasks SET status='fetched', questions_count=0, error_msg=NULL, extraction_source=NULL
-
-               WHERE {_re_extract_cond}
-
-               AND source_url IN (""" + ",".join("?" * len(urls)) + ")",
-
-            urls,
-
-        )
-
-        conn.commit()
-
-
 
     logger.info(f"[API] 重新提取所有问题 重置 {len(tasks)} 条，删除 {deleted_questions} 道旧题目，启动后台提取")
 
     global _extraction_running, _extraction_initial_by_platform
 
-
-
-    # 本次重新提取使用独立日志文件（按时间戳）
-
-    from datetime import datetime
-
+    import threading
     from backend.services.crawler import question_extractor
 
     _run_suffix = now_beijing_str("%Y%m%d_%H%M%S")
-
     question_extractor._llm_log_run_suffix = _run_suffix
-
     logger.info(f"[API] 重新提取 LLM 日志将写入: llm_prompt_log_{_run_suffix}.jsonl")
 
-
-
     with sqlite3.connect(sqlite_service.db_path) as conn:
-
         conn.row_factory = sqlite3.Row
-
         rows = conn.execute(
-
             "SELECT source_platform, COUNT(*) as cnt FROM crawl_tasks WHERE status='fetched' GROUP BY source_platform"
-
         ).fetchall()
-
     initial_by_platform = {r["source_platform"]: r["cnt"] for r in rows} if rows else {}
 
 
@@ -2331,6 +2435,49 @@ async def xhs_login(wait_seconds: int = Query(120, ge=30, le=300, description="�
 
 
 
+@app.post("/api/crawler/tasks/re-extract-batch")
+async def re_extract_batch_tasks(body: dict):
+    """
+    对选中的多个任务批量重新执行 OCR + MinerAgent 提取，后台异步执行。
+    请求体: { "task_ids": ["uuid1", "uuid2", ...] }
+    """
+    import threading
+    import sqlite3
+
+    task_ids = body.get("task_ids") or []
+    if not isinstance(task_ids, list) or not task_ids:
+        raise HTTPException(status_code=400, detail="请提供 task_ids 数组")
+
+    with sqlite3.connect(sqlite_service.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        valid_ids = []
+        for tid in task_ids[:50]:  # 最多 50 条
+            if not tid or not isinstance(tid, str):
+                continue
+            row = conn.execute(
+                "SELECT task_id, post_title, length(raw_content) as clen FROM crawl_tasks WHERE task_id=?",
+                (tid,),
+            ).fetchone()
+            if row and (row["clen"] or 0) >= 50:
+                valid_ids.append(tid)
+
+    if not valid_ids:
+        raise HTTPException(status_code=400, detail="没有符合条件的任务（正文需≥50字）")
+
+    def _bg():
+        from backend.services.scheduling.scheduler import process_single_task
+        for tid in valid_ids:
+            try:
+                process_single_task(tid)
+            except Exception as e:
+                logger.error(f"[API] 批量提取异常 task_id={tid}: {e}")
+
+    t = threading.Thread(target=_bg, daemon=True)
+    t.start()
+    logger.info(f"[API] 批量重新提取已启动，共 {len(valid_ids)} 条")
+    return {"status": "ok", "message": f"已提交 {len(valid_ids)} 条，后台执行中", "count": len(valid_ids)}
+
+
 @app.post("/api/crawler/tasks/{task_id}/re-extract")
 async def re_extract_single_task(task_id: str):
     """
@@ -2341,13 +2488,14 @@ async def re_extract_single_task(task_id: str):
     - 帖子包含图片，想验证 OCR 效果
     - 调试单条任务的提取结果
 
-    立即返回启动确认，提取在后台线程执行。
+    立即返回，提取在后台线程执行，不阻塞其他 API（如提交作答、题库浏览）。
     """
     import threading
     import sqlite3
 
     # 校验 task_id 存在
     with sqlite3.connect(sqlite_service.db_path) as conn:
+        conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT task_id, status, post_title, length(raw_content) as clen FROM crawl_tasks WHERE task_id=?",
             (task_id,)
@@ -2355,40 +2503,28 @@ async def re_extract_single_task(task_id: str):
     if not row:
         raise HTTPException(status_code=404, detail=f"task_id 不存在: {task_id}")
 
-    post_title = dict(row).get("post_title") or "(无标题)"
-    content_len = dict(row).get("clen") or 0
+    post_title = row["post_title"] or "(无标题)"
+    content_len = row["clen"] or 0
     if content_len < 50:
         raise HTTPException(status_code=400, detail=f"任务正文为空或过短（{content_len}字），请先抓取正文")
 
     logger.info(f"[API] 单任务重新提取 task_id={task_id} title={post_title[:40]}...")
 
-    result_holder = {}
-
     def _bg():
         from backend.services.scheduling.scheduler import process_single_task
         try:
             result = process_single_task(task_id)
-            result_holder.update(result)
             logger.info(f"[API] 单任务提取完成 task_id={task_id}: {result}")
         except Exception as e:
             logger.error(f"[API] 单任务提取异常 task_id={task_id}: {e}")
-            result_holder.update({"status": "error", "message": str(e)})
 
     t = threading.Thread(target=_bg, daemon=True)
     t.start()
-    # 等待最多 300 秒（单任务含 OCR 通常在 30~120s 内完成）
-    t.join(timeout=300)
-
-    if t.is_alive():
-        return {
-            "status": "running",
-            "task_id": task_id,
-            "message": "提取仍在后台运行（超过 300s），请稍后刷新任务列表查看结果",
-        }
-
+    # 立即返回，不等待，避免阻塞事件循环影响提交作答等用户操作
     return {
+        "status": "ok",
         "task_id": task_id,
-        **result_holder,
+        "message": "已提交后台执行，请稍后刷新任务列表查看结果",
     }
 
 
@@ -2486,11 +2622,13 @@ def get_crawl_tasks(
 
     keyword: Optional[str] = Query(None, description="发现关键词筛选"),
 
+    title: Optional[str] = Query(None, description="帖子标题模糊搜索"),
+
     limit: int = Query(20, ge=1, le=100),
 
     offset: int = Query(0, ge=0),
 
-    sort_by: Optional[str] = Query(None, description="排序字段：id/status/questions_count/processed_at/extract_duration_sec/content_len等"),
+    sort_by: Optional[str] = Query(None, description="排序字段：id/status/questions_count/processed_at/extract_duration_min/content_len等"),
 
     sort_order: Optional[str] = Query(None, description="排序方向：asc/desc"),
 
@@ -2522,12 +2660,18 @@ def get_crawl_tasks(
 
         params.append(keyword)
 
+    if title:
+
+        where_parts.append("post_title LIKE ?")
+
+        params.append(f"%{title}%")
+
     where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
     # 排序字段白名单
     _SORT_FIELDS = {"id", "source_platform", "discover_keyword", "post_title",
                     "company", "status", "questions_count", "extraction_source",
-                    "agent_used_tool", "extract_duration_sec", "processed_at", "discovered_at"}
+                    "agent_used_tool", "extract_duration_min", "processed_at", "discovered_at", "post_time"}
     order_dir = "ASC" if sort_order and sort_order.lower() == "asc" else "DESC"
     if sort_by == "content_len":
         order_clause = f"ORDER BY length(raw_content) {order_dir}"
@@ -2552,11 +2696,11 @@ def get_crawl_tasks(
 
             f"SELECT id, task_id, source_url, source_platform, post_title, status, "
 
-            f"company, position, questions_count, discovered_at, processed_at, error_msg, "
+            f"company, position, questions_count, discovered_at, processed_at, post_time, error_msg, "
 
             f"length(raw_content) AS content_len, discover_keyword, extraction_source, "
 
-            f"extract_duration_min, agent_used_tool, extract_duration_sec "
+            f"extract_duration_min, agent_used_tool, trace_session_id "
 
             f"FROM crawl_tasks {where} {order_clause} LIMIT ? OFFSET ?",
 
@@ -2915,11 +3059,39 @@ async def finetune_preview_log(body: dict):
     预览日志文件前N条记录
     body: {log_path, limit}
     """
-    from backend.services.finetune_preview import preview_log_file
     log_path = body.get("log_path", "")
     limit = body.get("limit", 10)
     if not log_path:
         raise HTTPException(status_code=400, detail="log_path 不能为空")
-    return preview_log_file(log_path, limit)
+    return _ft.preview_log_file(log_path, limit)
+
+
+@app.post("/api/finetune/upload-faq")
+async def finetune_upload_faq(
+    file: UploadFile = File(...),
+    save_to_bank: bool = Form(True),
+    save_to_finetune: bool = Form(True),
+):
+    """
+    上传 FAQ 文件（问题+答案），支持 CSV/JSON/JSONL/TXT。
+    1. save_to_bank=True：保存到题库（SQLite + Neo4j）
+    2. save_to_finetune=True：写入微调样本，用于模型 SFT
+    """
+    import asyncio
+    content = (await file.read()).decode("utf-8", errors="replace")
+    filename = file.filename or ""
+    result = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: _ft.import_faq(
+            content=content,
+            filename=filename,
+            save_to_bank=save_to_bank,
+            save_to_finetune=save_to_finetune,
+        ),
+    )
+    if result.get("errors"):
+        # 有错误但不一定全部失败，仍返回结果
+        pass
+    return result
 
 

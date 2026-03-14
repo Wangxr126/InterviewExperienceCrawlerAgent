@@ -843,6 +843,7 @@ class NowcoderCrawler:
                     "difficulty": analysis["difficulty"],
                     "post_type": analysis["post_type"],
                     "discover_keyword": keyword,
+                    "post_time": pub_time,
                 })
                 
                 logger.debug(f"牛客 [{idx}/{len(records)}] 列表页发现: {title[:30]}... | {post_url}")
@@ -901,6 +902,7 @@ class NowcoderCrawler:
                     "difficulty": analysis["difficulty"],
                     "post_type": analysis["post_type"],
                     "discover_keyword": keyword,
+                    "post_time": "",
                 })
                 logger.info(
                     f"牛客 [{idx}/{total}] 列表页发现: {title[:30]}... | {post_url[:60]}"

@@ -5,21 +5,26 @@
   - 调用远程大模型辅助生成标注结果
   - 保存人工确认的最终标注数据
   - 导出 labeled_data.jsonl 用于微调训练
+  - FAQ 上传：解析问题+答案文件，保存到题库并写入微调样本
 """
 from backend.utils.time_utils import now_beijing, now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
+import csv
+import io
 import json
 import logging
+import re
 import sqlite3
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 
 from backend.config.config import settings
 
 logger = logging.getLogger(__name__)
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]  # backend/services/finetune -> 项目根
 _FINETUNE_DIR = _PROJECT_ROOT / "微调"
 _LABELED_PATH = _FINETUNE_DIR / "labeled_data.jsonl"
 
@@ -110,6 +115,7 @@ def _get_db_conn() -> sqlite3.Connection:
 def import_from_log_file(log_path: str, skip_existing: bool = True) -> Dict[str, int]:
     """
     从指定 JSONL 日志文件导入样本到 finetune_samples 表。
+    支持 Miner 两阶段格式（stage1_output/stage2_output）和旧版 llm_logs 格式。
     返回 {"imported": N, "skipped": N}
     """
     p = Path(log_path)
@@ -117,8 +123,9 @@ def import_from_log_file(log_path: str, skip_existing: bool = True) -> Dict[str,
         return {"imported": 0, "skipped": 0, "failed": 0, "error": "文件不存在"}
 
     imported = skipped = failed = 0
-    failed_samples = []  # 收集失败的样本用于最后统一输出
-    
+    failed_samples = []
+    now_ts = now_beijing().isoformat(timespec="seconds")
+
     with _get_db_conn() as conn:
         for line_num, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
             line = line.strip()
@@ -126,33 +133,57 @@ def import_from_log_file(log_path: str, skip_existing: bool = True) -> Dict[str,
                 continue
             try:
                 rec = json.loads(line)
-                content = (rec.get("user_content", "") or rec.get("content", "")).strip()
-                title = rec.get("title", "")
-                source_url = rec.get("source_url", "")
-                llm_raw = rec.get("llm_response", "") or rec.get("llm_raw", "")
-                ts = rec.get("ts", now_beijing_str())
-                if not content:
-                    continue
-                if skip_existing:
-                    exists = conn.execute(
-                        "SELECT 1 FROM finetune_samples WHERE content=? AND created_at=?",
-                        (content, ts)
-                    ).fetchone()
-                    if exists:
-                        skipped += 1
+                # Miner 两阶段格式
+                if "stage1_output" in rec or "stage2_output" in rec:
+                    content = (rec.get("content_preview", "") or rec.get("content", "")).strip()
+                    stage1 = rec.get("stage1_output", "")
+                    stage2 = rec.get("stage2_output", "")
+                    stage1_model = rec.get("stage1_model", "")
+                    stage2_model = rec.get("stage2_model", "")
+                    ts = rec.get("ts", now_ts)
+                    if not content and not stage1 and not stage2:
                         continue
-                conn.execute(
-                    "INSERT INTO finetune_samples (content, title, source_url, llm_raw, status, created_at) VALUES (?,?,?,?,?,?)",
-                    (content, title, source_url, llm_raw, "pending", ts)
-                )
+                    if skip_existing:
+                        exists = conn.execute(
+                            "SELECT 1 FROM finetune_samples WHERE content=? AND stage1_output=? AND created_at=?",
+                            (content[:500], stage1[:500] if stage1 else "", ts)
+                        ).fetchone()
+                        if exists:
+                            skipped += 1
+                            continue
+                    conn.execute(
+                        """INSERT INTO finetune_samples
+                           (content, stage1_output, stage2_output, stage1_model, stage2_model, status, source, created_at)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (content or "(无原文)", stage1, stage2, stage1_model, stage2_model, "pending", "miner_two_stage", ts)
+                    )
+                else:
+                    # 旧版 llm_logs 格式（兼容）
+                    content = (rec.get("user_content", "") or rec.get("content", "")).strip()
+                    title = rec.get("title", "")
+                    source_url = rec.get("source_url", "")
+                    stage2 = rec.get("llm_response", "") or rec.get("llm_raw", "")
+                    ts = rec.get("ts", now_ts)
+                    if not content:
+                        continue
+                    if skip_existing:
+                        exists = conn.execute(
+                            "SELECT 1 FROM finetune_samples WHERE content=? AND created_at=?",
+                            (content[:500], ts)
+                        ).fetchone()
+                        if exists:
+                            skipped += 1
+                            continue
+                    conn.execute(
+                        """INSERT INTO finetune_samples
+                           (content, stage1_output, stage2_output, title, source_url, status, source, created_at)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (content, "", stage2, title, source_url, "pending", "llm_logs", ts)
+                    )
                 imported += 1
             except Exception as e:
                 failed += 1
-                failed_samples.append({
-                    "line": line_num,
-                    "error": str(e),
-                    "preview": line[:80]
-                })
+                failed_samples.append({"line": line_num, "error": str(e), "preview": line[:80]})
         conn.commit()
     
     # 统一输出结果
@@ -204,16 +235,19 @@ def import_all_logs() -> Dict[str, int]:
 
 
 def list_log_files() -> List[Dict]:
-    """列出 微调/llm_logs/ 下所有 JSONL 文件，返回文件信息列表"""
+    """列出 微调/llm_logs/ 下所有 JSONL 文件，Miner 两阶段日志排最前"""
     log_root = _FINETUNE_DIR / "llm_logs"
     result = []
     if not log_root.exists():
-        return result
+        log_root.mkdir(parents=True, exist_ok=True)
     for f in sorted(log_root.rglob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True):
         rel = f.relative_to(_FINETUNE_DIR)
-        parts = rel.parts  # (llm_logs, model_name, source_date.jsonl)
-        model = parts[1] if len(parts) > 2 else "unknown"
-        line_count = sum(1 for line in f.read_text(encoding="utf-8").splitlines() if line.strip())
+        parts = rel.parts
+        model = "Miner两阶段" if "miner_two_stage" in f.name else (parts[1] if len(parts) > 2 else "unknown")
+        try:
+            line_count = sum(1 for line in f.read_text(encoding="utf-8").splitlines() if line.strip())
+        except Exception:
+            line_count = 0
         result.append({
             "path": str(f),
             "rel_path": str(rel),
@@ -222,6 +256,11 @@ def list_log_files() -> List[Dict]:
             "line_count": line_count,
             "mtime": datetime.fromtimestamp(f.stat().st_mtime).isoformat(timespec="seconds"),
         })
+    # Miner 两阶段日志排最前，其余按修改时间倒序
+    miners = [r for r in result if "miner_two_stage" in r.get("filename", "")]
+    others = [r for r in result if "miner_two_stage" not in r.get("filename", "")]
+    others.sort(key=lambda r: r.get("mtime", ""), reverse=True)
+    return miners + others
     return result
 
 
@@ -235,8 +274,6 @@ def list_samples(status: str = None, page: int = 1, page_size: int = 20, order: 
     where = "WHERE status=?" if status else ""
     params_count = (status,) if status else ()
     params_list = (status, page_size, offset) if status else (page_size, offset)
-    
-    # 排序：asc=正序（ID从小到大），desc=倒序（ID从大到小）
     order_by = "ORDER BY id ASC" if order == "asc" else "ORDER BY id DESC"
 
     with _get_db_conn() as conn:
@@ -245,7 +282,7 @@ def list_samples(status: str = None, page: int = 1, page_size: int = 20, order: 
         ).fetchone()[0]
         rows = conn.execute(
             f"""SELECT id, content as content_preview,
-                       status, is_modified, created_at, labeled_at
+                       status, is_modified, created_at, modified_at, labeled_at, source
                 FROM finetune_samples {where}
                 {order_by} LIMIT ? OFFSET ?""",
             params_list
@@ -313,14 +350,14 @@ def assist_generate(content: str, title: str = "", model: str = None, api_key: s
 # ===========================================================
 
 def save_label(sample_id: int, final_output: str, is_modified: bool = False) -> Dict:
-    """保存人工确认的最终标注结果"""
+    """保存人工确认的最终标注结果，同时更新 modified_at"""
     now = now_beijing().isoformat(timespec="seconds")
     with _get_db_conn() as conn:
         conn.execute(
             """UPDATE finetune_samples
-               SET final_output=?, is_modified=?, status='labeled', labeled_at=?
+               SET final_output=?, is_modified=?, status='labeled', labeled_at=?, modified_at=?
                WHERE id=?""",
-            (final_output, 1 if is_modified else 0, now, sample_id)
+            (final_output, 1 if is_modified else 0, now, now, sample_id)
         )
         conn.commit()
     return {"status": "ok", "labeled_at": now}
@@ -384,16 +421,14 @@ def get_stats() -> Dict:
 
 def preview_log_file(log_path: str, limit: int = 10) -> Dict:
     """
-    预览日志文件前N条记录
+    预览日志文件前N条记录，支持 Miner 两阶段格式和旧版 llm_logs 格式
     返回 {"samples": [...], "total": N}
     """
     p = Path(log_path)
     if not p.exists():
         return {"error": "文件不存在", "samples": [], "total": 0}
-    
     samples = []
     total = 0
-    
     try:
         for line in p.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -403,27 +438,271 @@ def preview_log_file(log_path: str, limit: int = 10) -> Dict:
             if len(samples) < limit:
                 try:
                     rec = json.loads(line)
-                    # 解析 llm_raw 为对象
-                    llm_raw_obj = None
-                    if rec.get("llm_raw"):
-                        try:
-                            llm_raw_obj = json.loads(rec["llm_raw"])
-                        except:
-                            llm_raw_obj = {"error": "无效JSON", "raw": rec["llm_raw"]}
-                    
-                    samples.append({
-                        "content": rec.get("content", ""),
-                        "title": rec.get("title", ""),
-                        "source_url": rec.get("source_url", ""),
-                        "llm_raw": rec.get("llm_raw", ""),
-                        "llm_raw_obj": llm_raw_obj,
-                        "ts": rec.get("ts", ""),
-                    })
+                    # Miner 两阶段格式
+                    if "stage1_output" in rec or "stage2_output" in rec:
+                        def _parse_json(s):
+                            if not s:
+                                return None
+                            try:
+                                return json.loads(s)
+                            except Exception:
+                                return {"error": "无效JSON", "raw": str(s)[:200]}
+                        stage1_obj = _parse_json(rec.get("stage1_output"))
+                        stage2_obj = _parse_json(rec.get("stage2_output"))
+                        samples.append({
+                            "content": rec.get("content_preview", "") or rec.get("content", ""),
+                            "title": "",
+                            "source_url": "",
+                            "llm_raw": rec.get("stage1_output", ""),
+                            "llm_raw_obj": stage1_obj,
+                            "stage2_output": rec.get("stage2_output", ""),
+                            "stage2_obj": stage2_obj,
+                            "stage1_model": rec.get("stage1_model", ""),
+                            "stage2_model": rec.get("stage2_model", ""),
+                            "ts": rec.get("ts", ""),
+                        })
+                    else:
+                        llm_raw_obj = None
+                        if rec.get("llm_raw") or rec.get("llm_response"):
+                            raw = rec.get("llm_raw") or rec.get("llm_response", "")
+                            try:
+                                llm_raw_obj = json.loads(raw)
+                            except Exception:
+                                llm_raw_obj = {"error": "无效JSON", "raw": raw[:200]}
+                        samples.append({
+                            "content": rec.get("content", "") or rec.get("user_content", ""),
+                            "title": rec.get("title", ""),
+                            "source_url": rec.get("source_url", ""),
+                            "llm_raw": rec.get("llm_raw", "") or rec.get("llm_response", ""),
+                            "llm_raw_obj": llm_raw_obj,
+                            "ts": rec.get("ts", ""),
+                        })
                 except Exception as e:
                     logger.warning("解析日志行失败: %s", e)
                     continue
     except Exception as e:
         logger.error("读取日志文件失败: %s", e)
         return {"error": str(e), "samples": [], "total": 0}
-    
     return {"samples": samples, "total": total, "showing": len(samples)}
+
+
+# ===========================================================
+# FAQ 上传：解析问题+答案文件，保存题库 + 微调样本
+# ===========================================================
+
+def _parse_faq_csv(content: str) -> List[Dict[str, str]]:
+    """解析 CSV：支持 question/answer、question_text/answer_text、问题/答案 等列名"""
+    rows = []
+    reader = csv.DictReader(io.StringIO(content))
+    for row in reader:
+        q = (row.get("question") or row.get("question_text") or row.get("问题") or "").strip()
+        a = (row.get("answer") or row.get("answer_text") or row.get("答案") or "").strip()
+        if q:
+            rows.append({"question": q, "answer": a})
+    return rows
+
+
+def _parse_faq_json(content: str) -> List[Dict[str, str]]:
+    """解析 JSON：支持 [{"question":"...","answer":"..."}] 或 [{"question_text":"...","answer_text":"..."}]"""
+    data = json.loads(content)
+    if not isinstance(data, list):
+        data = [data]
+    rows = []
+    for item in data:
+        if isinstance(item, dict):
+            q = (item.get("question") or item.get("question_text") or "").strip()
+            a = (item.get("answer") or item.get("answer_text") or "").strip()
+            if q:
+                rows.append({"question": q, "answer": a})
+    return rows
+
+
+def _parse_faq_jsonl(content: str) -> List[Dict[str, str]]:
+    """解析 JSONL：每行一个 JSON 对象"""
+    rows = []
+    for line in content.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+            if isinstance(item, dict):
+                q = (item.get("question") or item.get("question_text") or "").strip()
+                a = (item.get("answer") or item.get("answer_text") or "").strip()
+                if q:
+                    rows.append({"question": q, "answer": a})
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def _parse_faq_txt(content: str) -> List[Dict[str, str]]:
+    """解析 TXT：Q: 问题 / A: 答案 或 问题\n答案（空行分隔）格式"""
+    rows = []
+    for block in re.split(r"\n\s*\n+", content):
+        block = block.strip()
+        if not block:
+            continue
+        # 格式1: Q: xxx  A: xxx 或 Q: xxx\nA: xxx
+        m = re.search(r"Q[：:]\s*(.+?)(?:\s*A[：:]\s*(.+))?$", block, re.DOTALL)
+        if m:
+            q, a = m.group(1).strip(), (m.group(2) or "").strip()
+            if q:
+                rows.append({"question": q, "answer": a})
+            continue
+        # 格式2: 第一行问题，其余为答案
+        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        if lines:
+            rows.append({"question": lines[0], "answer": "\n".join(lines[1:]) if len(lines) > 1 else ""})
+    return rows
+
+
+def parse_faq_file(content: str, filename: str = "") -> Tuple[List[Dict[str, str]], Optional[str]]:
+    """
+    根据文件内容解析 FAQ（问题+答案）列表。
+    支持：.csv, .json, .jsonl, .txt
+    返回 (rows, error)，error 非空表示解析失败。
+    """
+    content = content.strip()
+    if not content:
+        return [], "文件内容为空"
+
+    ext = (Path(filename).suffix or "").lower() if filename else ""
+    if ext == ".csv" or (not ext and "," in (content.split("\n")[0] or "") and ("question" in content.lower() or "问题" in content)):
+        try:
+            rows = _parse_faq_csv(content)
+            return rows, None
+        except Exception as e:
+            return [], f"CSV 解析失败: {e}"
+
+    if ext == ".jsonl":
+        try:
+            rows = _parse_faq_jsonl(content)
+            return rows, None
+        except Exception as e:
+            return [], f"JSONL 解析失败: {e}"
+
+    if ext == ".json":
+        try:
+            rows = _parse_faq_json(content)
+            return rows, None
+        except json.JSONDecodeError as e:
+            return [], f"JSON 解析失败: {e}"
+
+    if ext == ".txt" or not ext:
+        try:
+            rows = _parse_faq_txt(content)
+            if rows:
+                return rows, None
+        except Exception as e:
+            return [], f"TXT 解析失败: {e}"
+        # 兜底尝试 JSON
+        try:
+            rows = _parse_faq_json(content)
+            if rows:
+                return rows, None
+        except Exception:
+            pass
+        return [], "无法识别文件格式，请使用 CSV/JSON/JSONL/TXT"
+
+    return [], f"不支持的文件格式: {ext}"
+
+
+def import_faq(
+    content: str,
+    filename: str = "",
+    save_to_bank: bool = True,
+    save_to_finetune: bool = True,
+    source_platform: str = "faq_upload",
+) -> Dict[str, Any]:
+    """
+    解析 FAQ 文件并：
+    1. save_to_bank=True：保存到 questions 题库（SQLite + 可选 Neo4j）
+    2. save_to_finetune=True：写入 finetune_samples，status=labeled，用于模型微调
+
+    返回 {"parsed": N, "bank_saved": N, "finetune_saved": N, "errors": [...]}
+    """
+    from backend.services.storage.sqlite_service import sqlite_service
+    from backend.tools.knowledge_manager_tools import generate_embedding
+
+    rows, err = parse_faq_file(content, filename)
+    if err:
+        return {"parsed": 0, "bank_saved": 0, "finetune_saved": 0, "errors": [err]}
+
+    bank_saved = 0
+    finetune_saved = 0
+    errors = []
+    now = now_beijing_str()
+
+    try:
+        neo4j = __import__("backend.services.storage.neo4j_service", fromlist=["neo4j_service"]).neo4j_service
+    except Exception:
+        neo4j = None
+
+    for i, item in enumerate(rows):
+        q = item.get("question", "").strip()
+        a = item.get("answer", "").strip()
+        if not q:
+            continue
+
+        q_id = f"FAQ-{uuid.uuid4().hex[:12]}"
+
+        # 1. 保存到题库
+        if save_to_bank:
+            try:
+                tags = ["FAQ"]
+                sqlite_service.upsert_question(
+                    question_text=q,
+                    answer_text=a,
+                    difficulty="medium",
+                    question_type="技术题",
+                    source_platform=source_platform,
+                    source_url="",
+                    company="",
+                    position="",
+                    topic_tags=tags,
+                    q_id=q_id,
+                )
+                bank_saved += 1
+
+                # 可选：写入 Neo4j（用于语义检索）
+                if neo4j and neo4j.available:
+                    emb = generate_embedding(q)
+                    if emb:
+                        neo4j.add_question(
+                            q_id=q_id,
+                            text=q,
+                            answer=a,
+                            tags=tags,
+                            embedding=emb,
+                            metadata={"source": "faq_upload"},
+                        )
+            except Exception as e:
+                errors.append(f"第{i+1}条入库失败: {e}")
+
+        # 2. 写入微调样本（用于模型 SFT）
+        if save_to_finetune:
+            try:
+                final_output = json.dumps(
+                    [{"question_text": q, "answer_text": a}],
+                    ensure_ascii=False,
+                )
+                with _get_db_conn() as conn:
+                    conn.execute(
+                        """INSERT INTO finetune_samples
+                           (content, title, final_output, is_modified, status, source, created_at, labeled_at, modified_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (q, f"FAQ#{i+1}", final_output, 0, "labeled", "faq_upload", now, now, now),
+                    )
+                    conn.commit()
+                finetune_saved += 1
+            except Exception as e:
+                errors.append(f"第{i+1}条微调样本写入失败: {e}")
+
+    logger.info("FAQ 导入完成: parsed=%d bank_saved=%d finetune_saved=%d", len(rows), bank_saved, finetune_saved)
+    return {
+        "parsed": len(rows),
+        "bank_saved": bank_saved,
+        "finetune_saved": finetune_saved,
+        "errors": errors[:10],
+    }

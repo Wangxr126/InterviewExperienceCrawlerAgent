@@ -31,15 +31,18 @@ class OcrImagesTool(Tool):
         )
         self._image_paths = image_paths or []
         self._task_id = task_id
+        self._call_count = 0  # 添加调用计数器
 
     def get_parameters(self) -> List[ToolParameter]:
         return []  # 图片路径由 Agent 初始化时注入，无需 LLM 传参
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
         """执行 OCR，返回 ToolResponse 对象。"""
+        self._call_count += 1  # 记录调用
+        
         if not self._image_paths:
             logger.info("[OcrTool] 无图片可识别")
-            return ToolResponse.success(text="", data={"image_count": 0})
+            return ToolResponse.success(text="", data={"image_count": 0, "ocr_called": True})
 
         logger.info(f"[OcrTool] 开始 OCR，共 {len(self._image_paths)} 张图片")
         try:
@@ -49,11 +52,11 @@ class OcrImagesTool(Tool):
                 logger.info(f"[OcrTool] OCR 成功，识别字符数: {len(result)}")
                 return ToolResponse.success(
                     text=result,
-                    data={"image_count": len(self._image_paths), "char_count": len(result)}
+                    data={"image_count": len(self._image_paths), "char_count": len(result), "ocr_called": True}
                 )
             else:
                 logger.warning("[OcrTool] OCR 未识别到文字")
-                return ToolResponse.success(text="", data={"image_count": len(self._image_paths), "char_count": 0})
+                return ToolResponse.success(text="", data={"image_count": len(self._image_paths), "char_count": 0, "ocr_called": True})
         except Exception as e:
             logger.error(f"[OcrTool] OCR 失败: {e}")
             return ToolResponse.error(code="OCR_FAILED", message=f"OCR 执行失败: {str(e)}")
@@ -104,7 +107,7 @@ class FinishTool(Tool):
             description=(
                 "【终止操作】提取到面试题后调用此工具返回结果。"
                 "调用时机：正文或 OCR 中找到了有效面试题。"
-                "answer 参数必须是 JSON 数组字符串，每项必须包含以下字段（字段名必须完全一致）："
+                "answer 参数必须是**单行** JSON 数组字符串（禁止在字符串内换行），每项必须包含以下字段（字段名必须完全一致）："
                 "question_text（问题文本）、answer_text（答案文本）、difficulty（难度）、"
                 "question_type（题目类型）、topic_tags（标签数组）、company（公司）、position（岗位）。"
                 "示例：[{\"question_text\":\"Redis持久化方式有哪些？\",\"answer_text\":\"RDB和AOF\","

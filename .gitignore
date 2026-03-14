@@ -26,6 +26,8 @@ backend/*.db
 # 根目录遗留数据目录（已迁移至 backend/data，若存在可删除）
 memory/
 memory_data/
+tool-output/
+sqlite/
 neo4j_data/
 xhs_user_data/
 qdrant_storage/

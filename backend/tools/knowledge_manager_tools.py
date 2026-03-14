@@ -397,7 +397,9 @@ class BaseManager(Tool):
             # 3. 查重 + 写入 Neo4j + 维护知识图谱（变体边）
             similar = None
             if embedding and neo4j_service.available:
-                similar = neo4j_service.check_duplicate(embedding, threshold=0.85)
+                similar = neo4j_service.check_duplicate(
+                    embedding, threshold=settings.retrieval_check_duplicate_threshold
+                )
             neo4j_service.add_question(
                 q_id=q_id, text=question, answer=answer,
                 tags=tags, embedding=embedding,

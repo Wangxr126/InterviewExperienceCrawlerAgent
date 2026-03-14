@@ -177,7 +177,7 @@ const questionTypeClass = (t) => {
 const loadQuestions = async (page = pagination.page) => {
   loading.value = true
   try {
-    console.log(`📖 加载第 ${page} 页，每页 ${pagination.pageSize} 题`)
+    // console.log(`📖 加载第 ${page} 页，每页 ${pagination.pageSize} 题`)
     const d = await api.getQuestions({
       ...filters,
       page,
@@ -186,14 +186,14 @@ const loadQuestions = async (page = pagination.page) => {
       sort_order: sortOrder.value,
       user_id: props.userId || undefined,
     })
-    console.log(`📖 后端返回: total=${d.total}, page=${d.page}, total_pages=${d.total_pages}, questions=${d.questions?.length}`)
+    // console.log(`📖 后端返回: total=${d.total}, page=${d.page}, total_pages=${d.total_pages}, questions=${d.questions?.length}`)
     questions.value = d.questions || []
     pagination.total = d.total ?? 0
     pagination.totalPages = d.total_pages ?? 1
     pagination.page = d.page ?? page
-    console.log(`📖 前端状态: pagination.page=${pagination.page}, pagination.total=${pagination.total}, pagination.totalPages=${pagination.totalPages}`)
+    // console.log(`📖 前端状态: pagination.page=${pagination.page}, pagination.total=${pagination.total}, pagination.totalPages=${pagination.totalPages}`)
   } catch (e) {
-    console.error('❌ 加载题目失败:', e)
+    // console.error('❌ 加载题目失败:', e)
     ElMessage.error('加载题目失败，请检查后端是否已启动')
   } finally {
     loading.value = false
@@ -208,7 +208,7 @@ const onSearch = () => {
 
 // 切换页码
 const onPageChange = (newPage) => {
-  console.log(`🔄 页码变化: ${pagination.page} → ${newPage}`)
+  // console.log(`🔄 页码变化: ${pagination.page} → ${newPage}`)
   pagination.page = newPage
   loadQuestions(newPage)
 }

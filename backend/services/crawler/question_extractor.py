@@ -216,10 +216,13 @@ _shared_miner_agent = None
 
 def _get_miner_agent(image_paths: List[str] = None, task_id: str = ""):
     """获取或创建 MinerAgent 实例。
-    注意：由于改用框架托管，每次都需要创建新实例（工具状态绑定在实例上）。
+    MINER_MODE=two_stage 时使用两阶段提取（Stage1本地+Stage2豆包精加工标准答案），否则用单阶段 MinerAgent。
     """
+    from backend.config.config import settings
+    if (settings.miner_mode or "").lower() == "two_stage":
+        from backend.agents.miner_agent_v3 import create_miner_agent
+        return create_miner_agent(image_paths=image_paths or [], task_id=task_id or "", mode="two_stage")
     from backend.agents.miner_agent import MinerAgent
-    # 框架托管版本：每次创建新实例（工具注册时已绑定 image_paths）
     return MinerAgent(image_paths=image_paths or [], task_id=task_id or "")
 
 
@@ -348,6 +351,23 @@ def _dig_question_arrays(obj, depth=0, max_depth=10) -> List[List[Dict]]:
     return found
 
 
+def _get_latest_trace_session_id() -> Optional[str]:
+    """获取最近一次 Miner Agent 运行的 trace session_id（用于关联帖子与推理过程）"""
+    try:
+        from backend.config.config import settings
+        trace_dir = Path(settings.backend_data_dir) / "memory" / "traces"
+        if not trace_dir.exists():
+            return None
+        files = sorted(trace_dir.glob("trace-s-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not files:
+            return None
+        stem = files[0].stem  # trace-s-20260314-142242-0644
+        return stem.replace("trace-", "", 1) if stem.startswith("trace-") else stem
+    except Exception as e:
+        logger.debug(f"获取 trace session_id 失败: {e}")
+        return None
+
+
 def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[List[Dict], str]:
     """从 LLM 输出中提取 JSON 数组，兼容多种返回格式。返回 (items, status)，status 为 ok/unrelated/empty/parse_error"""
     if not text:
@@ -391,7 +411,36 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
         logger.info("LLM 明确返回 NO_RELATED_CONTENT，帖子与面经无关")
         return [], "unrelated"
 
-    # 0b. 检测「帖子与面经无关」或空对象，或 LLM 把原文包裹进对象返回
+    # 0b. 检测工具调用格式（模型输出了 ocr_images/mark_unrelated 但框架未执行）
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            tool_name = data.get("name") or data.get("tool") or data.get("function")
+            if tool_name == "ocr_images":
+                logger.warning("LLM 返回 ocr_images 工具调用格式但未被执行，将触发手动 OCR 降级")
+                return [], "ocr_tool_call_format"
+            if tool_name == "mark_unrelated":
+                return [], "unrelated"
+            if tool_name == "Finish":
+                # 尝试从 arguments.answer 提取答案
+                args = data.get("arguments") or {}
+                if isinstance(args, dict) and args.get("answer"):
+                    text = args["answer"]
+                elif isinstance(args, str):
+                    text = args
+                else:
+                    text = ""
+                if text.strip().startswith("["):
+                    try:
+                        arr = json.loads(text)
+                        if isinstance(arr, list) and arr and isinstance(arr[0], dict) and "question_text" in arr[0]:
+                            return arr, "ok"
+                    except json.JSONDecodeError:
+                        pass
+    except json.JSONDecodeError:
+        pass
+
+    # 0c. 检测「帖子与面经无关」或空对象，或 LLM 把原文包裹进对象返回
     try:
         data = json.loads(text)
         if isinstance(data, dict):
@@ -545,13 +594,15 @@ def extract_questions_from_post(
     extraction_source: str = "content",
     image_paths: List[str] = None,
     task_id: str = "",
-) -> Tuple[List[Dict], str, bool]:
+) -> Tuple[List[Dict], str, bool, bool, Optional[str]]:
     """
     从面经原文中用 LLM 提取结构化题目列表。
 
     content 过长时自动截断（6000 字符，约 3000 token）。
-    返回 (questions, status, agent_used_tool)，status 为 ok/unrelated/empty/parse_error。
+    返回 (questions, status, agent_used_tool, agent_succeeded, trace_session_id)。
+    status: ok/unrelated/empty/parse_error。
     agent_used_tool: MinerAgent 是否调用了 ocr_images 工具（True=是，False=否）。
+    agent_succeeded: Miner 成功提取则 True；降级为直接 LLM 成功则 False（此时不写入 Graph）。
 
     若正文无题目且有图片，MinerAgent 会自主调用 ocr_images 工具获取图片内容后再提取。
     """
@@ -560,7 +611,7 @@ def extract_questions_from_post(
     # 只检查是否完全为空（不检查长度）
     if not content and not image_paths:
         logger.warning(f"内容和图片均为空，跳过提取: {source_url}")
-        return [], "empty", False
+        return [], "empty", False, True, None
 
     # 截断过长内容
     truncated = content[:MAX_CONTENT_CHARS] if content else ""
@@ -575,6 +626,7 @@ def extract_questions_from_post(
 
     from backend.config.config import settings
     max_retries = settings.miner_max_retries
+    refusal_retries = settings.miner_refusal_retries
 
     # 正文提取（带重试）
     # 统一走 MinerAgent（框架托管版）：LLM 自主判断是否调用 ocr_images 工具
@@ -582,19 +634,46 @@ def extract_questions_from_post(
     # - 正文无题目但有图片 → LLM 自主调用 ocr_images → 再调用 Finish 返回 JSON
     items, status = [], "empty"
     agent_used_tool: bool = False
+    agent_succeeded: bool = True  # Miner 成功为 True，降级成功为 False
+    refusal_count = 0  # Miner 拒绝次数，用尽 refusal_retries 后再降级
+    trace_session_id: Optional[str] = None
     from backend.agents.miner_agent import UNRELATED_SIGNAL
     for attempt in range(1, max_retries + 1):
         t0 = time.perf_counter()
-        # 重试时在 user_prompt 末尾追加纠错指令，强制 JSON-only 输出
+        # 重试时在 user_prompt 末尾追加纠错指令
         attempt_prompt = user_prompt
         if attempt > 1:
-            attempt_prompt = user_prompt + (
-                f"\n\n【第{attempt}次重试 - 重要纠错】"
-                "上一次你的回复不是合法的 JSON 数组，解析失败。"
-                "这次必须只输出 JSON 数组本身，直接以 [ 开头、以 ] 结尾，"
-                "不要有任何前缀、说明、Markdown 格式或代码块。"
-                "即使面经是叙述性格式，也必须从中归纳题目并输出 JSON 数组。"
-            )
+            # 情况A：上次 Miner 拒绝，重试时强调必须输出 JSON
+            if status == "model_refused":
+                attempt_prompt = user_prompt + (
+                    f"\n\n【第{attempt}次重试 - Miner 拒绝后重试】"
+                    "上次返回了拒绝类回复。这次必须按要求提取面经题目并输出 JSON 数组，"
+                    "直接以 [ 开头、以 ] 结尾，不要有任何拒绝或说明。"
+                )
+            # 情况B：上次解析失败（空/格式错误）
+            elif not items or status != "ok":
+                attempt_prompt = user_prompt + (
+                    f"\n\n【第{attempt}次重试 - 重要纠错】"
+                    "上一次你的回复不是合法的 JSON 数组，解析失败。"
+                    "这次必须只输出 JSON 数组本身，直接以 [ 开头、以 ] 结尾，"
+                    "不要有任何前缀、说明、Markdown 格式或代码块。"
+                    "即使面经是叙述性格式，也必须从中归纳题目并输出 JSON 数组。"
+                )
+            # 情况C：上次提取 < 3 道且有图片但未调用 OCR → 强制提示先 OCR
+            elif len(items) < 3 and image_paths and not agent_used_tool:
+                attempt_prompt = user_prompt + (
+                    f"\n\n【第{attempt}次重试 - 必须调用 OCR】"
+                    f"上次只提取到 {len(items)} 道题，正文可能不完整。"
+                    "元信息显示有图片，题目可能在图片中。"
+                    "**你必须先调用 ocr_images 工具识别图片内容**，再根据正文+OCR 结果提取题目，最后调用 Finish 返回 JSON 数组。"
+                )
+            # 情况D：其他重试
+            else:
+                attempt_prompt = user_prompt + (
+                    f"\n\n【第{attempt}次重试 - 重要纠错】"
+                    "上一次提取的题目数量不足或格式有误。"
+                    "这次必须只输出 JSON 数组本身，直接以 [ 开头、以 ] 结尾，确保提取所有题目。"
+                )
         raw, ocr_called, is_unrelated = _call_llm_with_agent(
             content=full_content,
             has_image=bool(image_paths),
@@ -604,6 +683,7 @@ def extract_questions_from_post(
             task_id=task_id,
             retry_hint=attempt_prompt if attempt > 1 else None,
         )
+        trace_session_id = _get_latest_trace_session_id()
         llm_response_time_sec = time.perf_counter() - t0
         if ocr_called:
             agent_used_tool = True
@@ -613,7 +693,7 @@ def extract_questions_from_post(
             logger.info(f"LLM 主动标记帖子无关（mark_unrelated）: {source_url}")
             _append_llm_log_to_csv(user_prompt, "[mark_unrelated]", llm_response_time_sec,
                                    source=platform, title=post_title, source_url=source_url)
-            return [], "unrelated", agent_used_tool
+            return [], "unrelated", agent_used_tool, True, trace_session_id
 
         items, status = _parse_json_from_llm(raw, user_prompt_for_debug=user_prompt)
 
@@ -622,32 +702,73 @@ def extract_questions_from_post(
 
         if status == "unrelated":
             logger.info(f"LLM 判定帖子与面经无关: {source_url}")
-            return [], "unrelated", agent_used_tool
+            return [], "unrelated", agent_used_tool, True, trace_session_id
 
-        # 模型拒绝响应（内容安全/能力限制）：Agent 模式可能触发安全过滤，降级为直接 LLM 调用重试
+        # 模型拒绝响应：先重试 Miner refusal_retries 次，用尽后再降级为直接 LLM 调用
         if status == "model_refused":
-            logger.warning(f"LLM 拒绝响应，尝试直接 LLM 调用降级: {source_url}")
+            refusal_count += 1
+            if refusal_count < refusal_retries:
+                logger.warning(f"Miner 拒绝响应，第 {refusal_count}/{refusal_retries} 次，继续重试 Miner: {source_url}")
+                if attempt < max_retries:
+                    time.sleep(1)
+                continue
+            # 用尽 Miner 重试，降级为直接 LLM 调用
+            logger.warning(f"Miner 已重试 {refusal_retries} 次仍拒绝，降级为直接 LLM 调用: {source_url}")
             try:
                 _direct_raw = _call_llm_direct(user_prompt)
                 if _direct_raw:
                     items, status = _parse_json_from_llm(_direct_raw, user_prompt_for_debug=user_prompt)
                     if status == "ok" and items:
-                        logger.info(f"直接 LLM 调用降级成功: {len(items)} 道题目")
+                        logger.info(f"直接 LLM 调用降级成功: {len(items)} 道题目（不写入 Graph）")
+                        agent_succeeded = False
                         break
                     elif status == "model_refused":
                         logger.warning(f"直接 LLM 调用仍拒绝响应，放弃: {source_url}")
-                        return [], "model_refused", agent_used_tool
+                        return [], "model_refused", agent_used_tool, True, trace_session_id
             except Exception as _de:
                 logger.warning(f"直接 LLM 调用降级失败: {_de}")
-            return [], "model_refused", agent_used_tool
+            return [], "model_refused", agent_used_tool, True, trace_session_id
 
+        # 模型输出了 ocr_images 工具调用格式但框架未执行 → 手动 OCR + 直接 LLM 降级
+        if status == "ocr_tool_call_format" and image_paths and not agent_used_tool:
+            logger.warning(f"模型尝试调用 ocr_images 但未被执行，手动 OCR 后降级为直接 LLM: {source_url}")
+            try:
+                from backend.services.crawler.ocr_service_mcp import ocr_images_to_text
+                ocr_text = ocr_images_to_text(image_paths, task_id) or ""
+                if ocr_text:
+                    _prompt_with_ocr = user_prompt + f"\n\n## 图片OCR识别内容\n{ocr_text}"
+                    _direct_raw = _call_llm_direct(_prompt_with_ocr)
+                else:
+                    _direct_raw = _call_llm_direct(user_prompt)
+                if _direct_raw:
+                    items, status = _parse_json_from_llm(_direct_raw, user_prompt_for_debug=user_prompt)
+                    if status == "ok" and items:
+                        logger.info(f"手动 OCR + 直接 LLM 降级成功: {len(items)} 道题目（不写入 Graph）")
+                        agent_succeeded = False
+                        break
+            except Exception as _de:
+                logger.warning(f"手动 OCR 降级失败: {_de}")
+            # 降级失败则继续重试
+            if attempt < max_retries:
+                time.sleep(1)
+            continue
+
+        need_ocr_retry = (
+            status == "ok" and items and len(items) < 3
+            and image_paths and not agent_used_tool and attempt < max_retries
+        )
         if status == "ok" and items:
-            if attempt > 1:
-                logger.info(f"重试成功（第 {attempt} 次）: 提取到 {len(items)} 道题目")
-            break
+            # 提取 < 3 道且有图片但未调用 OCR → 继续重试，强制模型先 OCR
+            if need_ocr_retry:
+                logger.warning(f"提取到 {len(items)} 道题（< 3），有图片但未调用 OCR，第 {attempt + 1} 次重试（强制 OCR）")
+            else:
+                if attempt > 1:
+                    logger.info(f"重试成功（第 {attempt} 次）: 提取到 {len(items)} 道题目")
+                break
 
-        if attempt < max_retries:
+        if attempt < max_retries and not need_ocr_retry:
             logger.warning(f"提取失败（第 {attempt} 次，状态: {status}），{max_retries - attempt} 次重试机会剩余")
+        if attempt < max_retries:
             time.sleep(1)
         else:
             logger.warning(f"提取失败，已达最大重试次数 {max_retries}: {source_url}")
@@ -656,7 +777,7 @@ def extract_questions_from_post(
 
     if not items:
         logger.warning(f"LLM 未提取到题目: {source_url}")
-        return [], status, agent_used_tool
+        return [], status, agent_used_tool, True, trace_session_id
 
     questions: List[Dict] = []
     for item in items:
@@ -693,11 +814,13 @@ def extract_questions_from_post(
         q_id = str(uuid.uuid4())
         
         # 兼容多种字段名：answer_text/answer, question_type/type/role
+        # two_stage 模式：answer_text=豆包答案（展示用），raw_answer=原答案（Stage1）
         q_type = str(item.get("question_type") or item.get("type") or item.get("role", "技术题")).strip() or "技术题"
         questions.append({
-            "q_id": q_id,  # 添加 q_id 字段
+            "q_id": q_id,
             "question_text": q_text,
             "answer_text": str(item.get("answer_text") or item.get("answer", "")).strip(),
+            "raw_answer": str(item.get("raw_answer", "")).strip(),
             "difficulty": difficulty_val,
             "question_type": q_type,
             "topic_tags": json.dumps(tags_raw, ensure_ascii=False),
@@ -712,7 +835,7 @@ def extract_questions_from_post(
     # 只在成功提取到题目时输出日志
     if questions:
         logger.info(f"✅ 提取成功: {len(questions)} 道题目 | {post_title[:30] or source_url}")
-    return questions, "ok", agent_used_tool
+    return questions, "ok", agent_used_tool, agent_succeeded, trace_session_id
 
 
 

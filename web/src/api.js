@@ -158,6 +158,12 @@ export const api = {
     return r.json()
   },
 
+  /** 获取当前提取任务的最新推理过程（Miner Agent 的 Thought/工具调用） */
+  async getExtractionTrace() {
+    const r = await fetch(`${BASE}/api/crawler/extraction-trace`)
+    return r.json()
+  },
+
   async getCrawlerKeywords() {
     const r = await fetch(`${BASE}/api/crawler/keywords`)
     return r.json()
@@ -168,6 +174,7 @@ export const api = {
     if (params.status) p.set('status', params.status)
     if (params.platform) p.set('platform', params.platform)
     if (params.keyword) p.set('keyword', params.keyword)
+    if (params.title) p.set('title', params.title)
     p.set('limit', params.limit ?? '20')
     if (params.offset != null) p.set('offset', String(params.offset))
     if (params.sort_by) p.set('sort_by', params.sort_by)
@@ -199,6 +206,24 @@ export const api = {
   async refetchXhsBody(taskId) {
     const r = await fetch(`${BASE}/api/crawler/refetch-xhs-body?task_id=${encodeURIComponent(taskId)}`, {
       method: 'POST',
+    })
+    return r.json()
+  },
+
+  /** 对单个帖子重新执行 LLM 提取（OCR + MinerAgent），需正文≥50字 */
+  async reExtractSingle(taskId) {
+    const r = await fetch(`${BASE}/api/crawler/tasks/${taskId}/re-extract`, {
+      method: 'POST',
+    })
+    return r.json()
+  },
+
+  /** 对选中的多个帖子批量重新提取，后台异步执行 */
+  async reExtractBatch(taskIds) {
+    const r = await fetch(`${BASE}/api/crawler/tasks/re-extract-batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task_ids: taskIds }),
     })
     return r.json()
   },

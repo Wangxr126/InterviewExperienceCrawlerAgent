@@ -27,8 +27,10 @@ class SqliteService:
         self._init_tables()
 
     def _get_conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=15)
         conn.row_factory = sqlite3.Row
+        # WAL 模式：允许读写并发，提取任务与提交作答互不阻塞
+        conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
     # ===========================================================
@@ -91,6 +93,7 @@ class SqliteService:
                 user_id          TEXT NOT NULL,
                 question_id      TEXT NOT NULL,
                 session_id       TEXT,
+                message_id       TEXT,
                 score            INTEGER DEFAULT 0,
                 user_answer      TEXT,
                 ai_feedback      TEXT,
@@ -186,19 +189,24 @@ class SqliteService:
                 created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """,
-            # ── 微调样本表 ──
+            # ── 微调样本表（Miner 两阶段：Stage1 本地 Qwen3 + Stage2 豆包 API）──
             """
             CREATE TABLE IF NOT EXISTS finetune_samples (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 content         TEXT NOT NULL,
+                stage1_output   TEXT,
+                stage2_output   TEXT,
+                stage1_model    TEXT,
+                stage2_model    TEXT,
                 title           TEXT,
                 source_url      TEXT,
-                llm_raw         TEXT,
                 assist_output   TEXT,
                 final_output    TEXT,
                 is_modified     INTEGER DEFAULT 0,
                 status          TEXT DEFAULT 'pending',
-                created_at      TEXT NOT NULL,
+                source          TEXT DEFAULT 'miner_two_stage',
+                created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+                modified_at     DATETIME,
                 labeled_at      TEXT
             )
             """,
@@ -232,6 +240,34 @@ class SqliteService:
         with self._get_conn() as conn:
             for ddl in ddl_statements:
                 conn.execute(ddl)
+            # 迁移：微调样本表重构（Miner 两阶段），删除旧表重建
+            try:
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(finetune_samples)").fetchall()]
+                if cols and "stage1_output" not in cols:
+                    conn.execute("DROP TABLE finetune_samples")
+                    conn.execute("""
+                        CREATE TABLE finetune_samples (
+                            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                            content         TEXT NOT NULL,
+                            stage1_output   TEXT,
+                            stage2_output   TEXT,
+                            stage1_model    TEXT,
+                            stage2_model    TEXT,
+                            title           TEXT,
+                            source_url      TEXT,
+                            assist_output   TEXT,
+                            final_output    TEXT,
+                            is_modified     INTEGER DEFAULT 0,
+                            status          TEXT DEFAULT 'pending',
+                            source          TEXT DEFAULT 'miner_two_stage',
+                            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            modified_at     DATETIME,
+                            labeled_at      TEXT
+                        )
+                    """)
+                    logger.info("finetune_samples 表已重构为 Miner 两阶段格式")
+            except Exception as e:
+                logger.debug("finetune_samples 迁移检查: %s", e)
             # 迁移：为已有 crawl_tasks 表添加 image_paths 列
             cols = [r[1] for r in conn.execute("PRAGMA table_info(crawl_tasks)").fetchall()]
             if "image_paths" not in cols:
@@ -250,16 +286,31 @@ class SqliteService:
             # 迁移：为 questions 表添加 crawl_task_id，关联 crawl_tasks.id，便于根据帖子 id 查原帖
             if "crawl_task_id" not in qcols:
                 conn.execute("ALTER TABLE questions ADD COLUMN crawl_task_id INTEGER")
+            # 迁移：为 questions 表添加 raw_answer（原答案，two_stage 时 Stage1 输出；answer_text 为豆包答案）
+            if "raw_answer" not in qcols:
+                conn.execute("ALTER TABLE questions ADD COLUMN raw_answer TEXT")
             # 迁移：为 crawl_tasks 添加 agent_used_tool 列（MinerAgent 是否进行了工具调用）
             if "agent_used_tool" not in cols:
                 conn.execute("ALTER TABLE crawl_tasks ADD COLUMN agent_used_tool INTEGER DEFAULT 0")
             # 迁移：为 crawl_tasks 添加 extract_duration_min 列（LLM 提取耗时，分钟）
             if "extract_duration_min" not in cols:
                 conn.execute("ALTER TABLE crawl_tasks ADD COLUMN extract_duration_min REAL")
+            # 迁移：为 crawl_tasks 添加 trace_session_id（Miner Agent 推理 trace 的 session_id，用于链接查看）
+            if "trace_session_id" not in cols:
+                conn.execute("ALTER TABLE crawl_tasks ADD COLUMN trace_session_id TEXT")
+            # 迁移：为 crawl_tasks 添加 post_time（帖子发表时间，替代发现时间展示）
+            if "post_time" not in cols:
+                conn.execute("ALTER TABLE crawl_tasks ADD COLUMN post_time TEXT")
             # 迁移：为 interview_sessions 添加 session_meta 列（hello_agents 会话元数据）
             isess_cols = [r[1] for r in conn.execute("PRAGMA table_info(interview_sessions)").fetchall()]
             if "session_meta" not in isess_cols:
                 conn.execute("ALTER TABLE interview_sessions ADD COLUMN session_meta TEXT DEFAULT '{}'")
+            # 迁移：为 study_records 添加 eval_details、message_id 列
+            sr_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_records)").fetchall()]
+            if "eval_details" not in sr_cols:
+                conn.execute("ALTER TABLE study_records ADD COLUMN eval_details TEXT")
+            if "message_id" not in sr_cols:
+                conn.execute("ALTER TABLE study_records ADD COLUMN message_id TEXT")
             conn.commit()
         logger.info("✅ SQLite 所有表初始化完成")
         self._seed_knowledge_resources()
@@ -297,24 +348,30 @@ class SqliteService:
                         difficulty: str = "medium", question_type: str = "技术题",
                         source_platform: str = "", source_url: str = "",
                         company: str = "", position: str = "", business_line: str = "",
-                        topic_tags: List[str] = None, extraction_source: str = "content"):
+                        topic_tags: List[str] = None, extraction_source: str = "content",
+                        q_id: str = None):
+        """
+        插入题目到 questions 表。
+        q_id: 可选，不传则自动生成 UUID。传入时用于与 Neo4j 等保持一致性。
+        """
         # 清洗题目文本，去除标号
         question_text = self._clean_question_text(question_text)
         
+        if not q_id:
+            q_id = f"FAQ-{uuid.uuid4().hex[:12]}"
+        
         tags_json = json.dumps(topic_tags or [], ensure_ascii=False)
         with self._get_conn() as conn:
-            cursor = conn.execute("""
-                INSERT INTO questions
-                    (question_text, answer_text, difficulty, question_type,
+            conn.execute("""
+                INSERT OR IGNORE INTO questions
+                    (q_id, question_text, answer_text, difficulty, question_type,
                      source_platform, source_url, company, position, business_line,
-                     topic_tags, extraction_source, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                
-            """, (question_text, answer_text, difficulty, question_type,
+                     topic_tags, extraction_source, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (q_id, question_text, answer_text, difficulty, question_type,
                   source_platform, source_url, company, position, business_line, tags_json, extraction_source))
             conn.commit()
-            # 返回自动生成的 q_id
-            return cursor.lastrowid
+        return q_id
 
     def _build_question_conditions(self, company=None, position=None, difficulty=None,
                                       question_type=None, tags=None, source_platform=None,
@@ -396,6 +453,13 @@ class SqliteService:
                 params
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_question_by_id(self, q_id: str) -> Optional[Dict]:
+        """按 q_id 查询单题，用于获取标准答案等"""
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM questions WHERE q_id = ?", (q_id,)).fetchone()
+            return dict(row) if row else None
 
     def get_questions_by_source_url(self, source_url: str) -> List[Dict]:
         """按帖子 source_url 查询已提取的题目列表"""
@@ -568,7 +632,8 @@ class SqliteService:
 
     def add_study_record(self, user_id: str, question_id: str, score: int,
                          user_answer: str = "", ai_feedback: str = "",
-                         session_id: str = "") -> Dict:
+                         session_id: str = "", message_id: str = None,
+                         eval_details: Optional[Dict] = None) -> Dict:
         """
         记录一次做题，自动计算 SM-2 参数，更新标签掌握度。
         Returns: SM-2 更新结果
@@ -588,14 +653,15 @@ class SqliteService:
 
         new_ef, new_reps, new_interval, next_review = self.compute_sm2(score, ef, reps, interval)
 
+        eval_json = json.dumps(eval_details, ensure_ascii=False) if eval_details else None
         with self._get_conn() as conn:
             conn.execute("""
                 INSERT INTO study_records
-                    (user_id, question_id, session_id, score, user_answer, ai_feedback,
-                     easiness_factor, repetitions, interval_days, next_review_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (user_id, question_id, session_id, score, user_answer, ai_feedback,
-                  new_ef, new_reps, new_interval, next_review.strftime("%Y-%m-%d %H:%M:%S")))
+                    (user_id, question_id, session_id, message_id, score, user_answer, ai_feedback,
+                     easiness_factor, repetitions, interval_days, next_review_at, eval_details)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (user_id, question_id, session_id, message_id, score, user_answer, ai_feedback,
+                  new_ef, new_reps, new_interval, next_review.strftime("%Y-%m-%d %H:%M:%S"), eval_json))
             conn.commit()
 
         # 查找该题的 tags 并更新掌握度
@@ -629,6 +695,17 @@ class SqliteService:
             """, (user_id, now, limit))
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_user_weakness_notes(self, user_id: str, limit: int = 20) -> List[Dict]:
+        """获取用户自述的混淆点和遗漏点（record_weakness 工具记录）"""
+        with self._get_conn() as conn:
+            cursor = conn.execute("""
+                SELECT content, event_type, created_at
+                FROM episodic_log
+                WHERE user_id = ? AND event_type IN ('user_confusion', 'user_missed')
+                ORDER BY created_at DESC LIMIT ?
+            """, (user_id, limit))
+            return [dict(row) for row in cursor.fetchall()]
+
     def add_episodic_log(self, user_id: str, content: str,
                          importance: float = 0.75,
                          event_type: str = "study_event",
@@ -645,7 +722,7 @@ class SqliteService:
             conn.commit()
 
     def get_study_history(self, user_id: str, limit: int = 20) -> List[Dict]:
-        """获取用户做题历史"""
+        """获取用户做题历史，含 eval_details（LLM 评估建议）"""
         with self._get_conn() as conn:
             cursor = conn.execute("""
                 SELECT sr.*, q.question_text, q.topic_tags
@@ -654,17 +731,25 @@ class SqliteService:
                 WHERE sr.user_id = ?
                 ORDER BY sr.studied_at DESC LIMIT ?
             """, (user_id, limit))
-            return [dict(row) for row in cursor.fetchall()]
+            rows = [dict(row) for row in cursor.fetchall()]
+        for r in rows:
+            ed = r.get("eval_details")
+            if ed and isinstance(ed, str):
+                try:
+                    r["eval_details"] = json.loads(ed)
+                except Exception:
+                    r["eval_details"] = None
+        return rows
 
     def get_latest_scores_for_questions(self, user_id: str, question_ids: List[str]) -> Dict[str, Dict]:
-        """获取指定题目列表下，用户最近一次作答的得分。返回 {q_id: {score, studied_at}}"""
+        """获取指定题目列表下，用户最近一次作答的得分和复习时间。返回 {q_id: {score, studied_at, next_review_at}}"""
         if not question_ids or not user_id:
             return {}
         placeholders = ",".join("?" * len(question_ids))
         params = [user_id] + list(question_ids) + [user_id] + list(question_ids)
         with self._get_conn() as conn:
             cursor = conn.execute(f"""
-                SELECT sr.question_id, sr.score, sr.studied_at
+                SELECT sr.question_id, sr.score, sr.studied_at, sr.next_review_at
                 FROM study_records sr
                 INNER JOIN (
                     SELECT question_id, MAX(studied_at) as max_at
@@ -674,7 +759,13 @@ class SqliteService:
                 ) latest ON sr.question_id = latest.question_id AND sr.studied_at = latest.max_at
                 WHERE sr.user_id = ? AND sr.question_id IN ({placeholders})
             """, params)
-            return {row["question_id"]: {"score": row["score"], "studied_at": row["studied_at"]} for row in cursor.fetchall()}
+            return {
+                row["question_id"]: {
+                    "score": row["score"],
+                    "studied_at": row["studied_at"],
+                    "next_review_at": row["next_review_at"]
+                } for row in cursor.fetchall()
+            }
 
     # ===========================================================
     # interview_sessions 表操作
@@ -692,7 +783,8 @@ class SqliteService:
         return session_id
 
     def update_session_history(self, session_id: str, role: str, content: str,
-                               reasoning: str = None, max_turns: int = 50):
+                               reasoning: str = None, message_id: str = None, 
+                               metadata: dict = None, max_turns: int = 50):
         """追加对话记录（含可选 reasoning，用于 LLM 思考过程）"""
         with self._get_conn() as conn:
             row = conn.execute(
@@ -703,9 +795,16 @@ class SqliteService:
                 return
 
             history = json.loads(row["conversation_history"] or "[]")
-            msg = {"role": role, "content": content, "ts": now_beijing().isoformat()}
+            msg = {
+                "role": role, 
+                "content": content, 
+                "ts": now_beijing().isoformat(),
+                "message_id": message_id or f"msg_{int(__import__('time').time()*1000)}"
+            }
             if reasoning:
                 msg["reasoning"] = reasoning
+            if metadata:
+                msg["metadata"] = metadata
             history.append(msg)
             if len(history) > max_turns:
                 history = history[-max_turns:]
@@ -715,6 +814,7 @@ class SqliteService:
                 (json.dumps(history, ensure_ascii=False), session_id)
             )
             conn.commit()
+            return msg["message_id"]
 
     def ensure_session_exists(self, session_id: str, user_id: str) -> bool:
         """确保 session 存在，不存在则创建。返回是否为新创建"""
@@ -1122,16 +1222,26 @@ class SqliteService:
         return resource_id
 
     def get_weak_study_records(self, user_id: str, tags: List[str],
-                                limit: int = 5) -> List[Dict]:
+                                limit: int = 5,
+                                date_from: str = None, date_to: str = None) -> List[Dict]:
         """
         获取用户在指定标签上的近期错题记录（score < 3）。
         包含题目文本和 AI 反馈，用于展示遗漏/记错的点。
+        date_from/date_to: 按 studied_at 筛选，格式 YYYY-MM-DD。
         """
         if not tags:
             return []
-        # 先找出这些 tag 下的 question_id
         tag_conditions = " OR ".join(["topic_tags LIKE ?" for _ in tags])
         tag_params = [f'%"{t}"%' for t in tags]
+        extra_conditions = []
+        extra_params = []
+        if date_from:
+            extra_conditions.append("DATE(sr.studied_at) >= ?")
+            extra_params.append(date_from)
+        if date_to:
+            extra_conditions.append("DATE(sr.studied_at) <= ?")
+            extra_params.append(date_to)
+        where_extra = (" AND " + " AND ".join(extra_conditions)) if extra_conditions else ""
 
         with self._get_conn() as conn:
             cursor = conn.execute(
@@ -1142,11 +1252,11 @@ class SqliteService:
                 LEFT JOIN questions q ON sr.question_id = q.q_id
                 WHERE sr.user_id = ?
                   AND sr.score < 3
-                  AND ({tag_conditions})
+                  AND ({tag_conditions}){where_extra}
                 ORDER BY sr.studied_at DESC
                 LIMIT ?
                 """,
-                [user_id] + tag_params + [limit]
+                [user_id] + tag_params + extra_params + [limit]
             )
             return [dict(r) for r in cursor.fetchall()]
 
@@ -1158,18 +1268,18 @@ class SqliteService:
     def add_crawl_task(self, source_url: str, source_platform: str,
                        post_title: str = "", company: str = "", position: str = "",
                        business_line: str = "", difficulty: str = "", post_type: str = "",
-                       discover_keyword: str = "") -> Optional[str]:
-        """添加爬虫任务（URL已存在则忽略，返回 task_id；重复时返回 None）"""
+                       discover_keyword: str = "", post_time: str = "") -> Optional[str]:
+        """添加爬虫任务（URL已存在则忽略，返回 task_id；重复时返回 None）。post_time 为帖子发表时间"""
         task_id = f"TASK-{uuid.uuid4().hex[:10].upper()}"
         try:
             with self._get_conn() as conn:
                 conn.execute("""
                     INSERT INTO crawl_tasks
                         (task_id, source_url, source_platform, post_title,
-                         company, position, business_line, difficulty, post_type, discover_keyword)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         company, position, business_line, difficulty, post_type, discover_keyword, post_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (task_id, source_url, source_platform, post_title,
-                      company, position, business_line, difficulty, post_type, discover_keyword or ""))
+                      company, position, business_line, difficulty, post_type, discover_keyword or "", post_time or ""))
                 conn.commit()
             return task_id
         except Exception:
@@ -1207,14 +1317,19 @@ class SqliteService:
                            questions_count: int = 0, error_msg: str = "",
                            raw_content: Optional[str] = None, image_paths: Optional[List[str]] = None,
                            extraction_source: str = "", agent_used_tool: Optional[bool] = None,
-                           extract_duration_min: Optional[float] = None):
+                           extract_duration_min: Optional[float] = None,
+                           trace_session_id: Optional[str] = None):
         """更新任务状态。raw_content/image_paths 为 None 时不更新该列（保留原文），避免误覆盖。
         extraction_source: content=正文提取, image=图片OCR提取（帖子维度）
         agent_used_tool: MinerAgent 是否进行了工具调用（True/False/None=不更新）
-        extract_duration_min: LLM 提取耗时（分钟），None=不更新"""
+        extract_duration_min: LLM 提取耗时（分钟），None=不更新
+        trace_session_id: Miner Agent 推理 trace 的 session_id，用于链接查看 HTML"""
         import json as _json
         sets = ["status=?", "questions_count=?", "error_msg=?", "extraction_source=?", "processed_at=CURRENT_TIMESTAMP"]
         params: list = [status, questions_count, error_msg, extraction_source or None]
+        if trace_session_id is not None:
+            sets.append("trace_session_id=?")
+            params.append(trace_session_id or None)
         if raw_content is not None:
             sets.append("raw_content=?")
             params.append(raw_content or "")

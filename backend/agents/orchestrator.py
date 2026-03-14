@@ -77,37 +77,50 @@ def _get_memory_tool(user_id: str):
 # ===========================================================
 
 def _evaluate_answer_structured(question_text: str,
-                                 user_answer: str) -> Dict[str, Any]:
+                                 user_answer: str,
+                                 reference_answer: Optional[str] = None) -> Dict[str, Any]:
     """
     对用户答案做结构化评估，返回 JSON。
     直接调用 LLM（JSON mode），不经过 Agent ReAct 循环。
-    这是代码层面确定性调用的"最小 LLM 单元"。
 
     Returns:
         {
-          "score": int,            # 0-5
-          "feedback": str,         # 综合评价
-          "missed_points": [str],  # 遗漏/记错的具体知识点
-          "strong_points": [str],  # 答对的要点
-          "tags": [str]            # 涉及的技术标签
+          "score": int,
+          "feedback": str,
+          "shortcomings": [str],     # 不足（score<5 时必填）
+          "error_points": [{"wrong":"用户说的错误","correct":"正确说法"}],
+          "missed_points": [str],
+          "strong_points": [str],
+          "tags": [str]
         }
     """
+    ref_block = ""
+    if reference_answer and reference_answer.strip():
+        ref_block = f"\n【参考答案/标准答案】（来自题库，用于对比）\n{reference_answer.strip()}\n"
+
     system = (
         "你是一位技术面试评委。用户将提交面试题目和他们的回答。"
         "你需要评估回答质量，严格按以下 JSON 格式返回，不得添加任何额外字段或注释：\n"
-        '{"score":3,"feedback":"总体评价","missed_points":["具体遗漏点1"],'
-        '"strong_points":["答对的点"],"tags":["Redis","持久化"]}'
-        "\n评分标准：0=完全不会，1=基本不会，2=大部分不会，3=勉强会有遗漏，4=基本掌握，5=完全掌握有延伸"
-        "\nfeedback 要求：分条列点，用 1. 2. 3. 或 一、二、三、 格式，每条单独一行，便于用户阅读"
+        '{"score":3,"feedback":"总体评价","shortcomings":["不足1"],"error_points":[{"wrong":"错误表述","correct":"正确表述"}],'
+        '"missed_points":["遗漏点"],"strong_points":["答对的点"],"tags":["标签"]}'
+        "\n\n【必须遵守的规则】"
+        "\n1. 评分标准：0=完全不会，1=基本不会，2=大部分不会，3=勉强会有遗漏，4=基本掌握，5=完全掌握有延伸"
+        "\n2. 当 score<5 时，shortcomings 必须列出具体不足（如：未区分重载与重写、缺少代码示例等）"
+        "\n3. error_points：用户回答中的错误点，每项含 wrong（用户说的错误）和 correct（正确说法），用于纠正"
+        "\n4. missed_points：用户遗漏的知识点或题目要求中未回答的部分"
+        "\n5. feedback：分条列点，用 1. 2. 3. 格式，包含：亮点、不足（若 score<5）、错误纠正、遗漏补充、改进建议"
     )
     prompt = (
         f"【面试题目】\n{question_text}\n\n"
         f"【用户回答】\n{user_answer}"
+        f"{ref_block}"
     )
 
     default = {
         "score": 3,
         "feedback": "（评估服务暂时不可用，已记录原始答案）",
+        "shortcomings": [],
+        "error_points": [],
         "missed_points": [],
         "strong_points": [],
         "tags": []
@@ -155,28 +168,39 @@ def _evaluate_answer_structured(question_text: str,
 
 def _generate_explanation(question_text: str,
                            evaluation: Dict,
-                           recommendation_text: Optional[str]) -> str:
+                           recommendation_text: Optional[str],
+                           standard_answer: Optional[str] = None) -> str:
     """
     根据评估结果生成自然语言解释（对话式，面向用户）。
-    单独的 LLM 调用，专注"解释"这一件事。
+    单独 LLM 调用，专注"解释"这一件事。
     """
     score = evaluation.get("score", 3)
     missed = evaluation.get("missed_points", [])
     strong = evaluation.get("strong_points", [])
+    shortcomings = evaluation.get("shortcomings", [])
+    error_points = evaluation.get("error_points", [])
 
     parts = [
         f"题目：{question_text[:200]}",
         f"得分：{score}/5",
         f"答对的点：{', '.join(strong) if strong else '无'}",
-        f"遗漏的点：{', '.join(missed) if missed else '无'}",
-        f"综合评价：{evaluation.get('feedback', '')}",
     ]
+    if score < 5 and shortcomings:
+        parts.append(f"不足（需改进）：{', '.join(shortcomings)}")
+    if error_points:
+        err_strs = [f"「{e.get('wrong','')}」应改为「{e.get('correct','')}」" for e in error_points[:3]]
+        parts.append(f"错误纠正：{'；'.join(err_strs)}")
+    if missed:
+        parts.append(f"遗漏的点：{', '.join(missed)}")
+    parts.append(f"综合评价：{evaluation.get('feedback', '')}")
+    if standard_answer and standard_answer.strip():
+        parts.append(f"\n【标准答案】（来自题库）\n{standard_answer[:600]}")
     if recommendation_text:
         parts.append(f"\n【知识推荐】\n{recommendation_text[:500]}")
 
     prompt = "\n".join(parts) + (
         "\n\n请基于以上评估结果，用亲切、鼓励的语气给出解释和建议。"
-        "若有遗漏点请详细讲解正确内容。若有学习资源推荐请简明展示。中文回复，300字以内。"
+        "必须做到：1) score<5 时明确指出不足；2) 若有错误点，逐条纠正；3) 若有遗漏，补充说明；4) 若有标准答案，可引用关键部分帮助用户理解。中文回复，400字以内。"
     )
 
     try:
@@ -200,10 +224,17 @@ def _generate_explanation(question_text: str,
 
     # 降级：直接拼接
     lines = [f"✅ 你的得分：{score}/5\n"]
+    if score < 5 and shortcomings:
+        lines.append("**不足：** " + "、".join(shortcomings))
+    if error_points:
+        for e in error_points[:3]:
+            lines.append(f"**纠正：** 「{e.get('wrong','')}」→「{e.get('correct','')}」")
     if strong:
         lines.append("**答对的要点：** " + "、".join(strong))
     if missed:
-        lines.append("**需要补充的点：** " + "、".join(missed))
+        lines.append("**遗漏的点：** " + "、".join(missed))
+    if standard_answer and standard_answer.strip():
+        lines.append(f"\n**标准答案：**\n{standard_answer[:400]}")
     return "\n".join(lines)
 
 
@@ -303,8 +334,7 @@ class InterviewSystemOrchestrator:
 
     # 记忆由 hello_agents 框架提供：
     # - HistoryManager + SessionStore（对话历史）
-    # - recall_memory 工具（用户画像、薄弱点、答题记录）
-    # 不再在此构建 memory_context，Agent 通过工具按需获取
+    # - get_mastery_report / get_session_context 工具按需获取用户画像、薄弱点、答题记录
 
     # ===========================================================
     # 确定性流程 1：内容采集管道（代码驱动 ETL）
@@ -382,35 +412,63 @@ class InterviewSystemOrchestrator:
         """
         tags = question_tags or []
 
-        # ── Step A：结构化评估（最小 LLM 调用，JSON mode）──────
+        # ── Step A：从题库获取标准答案（若有）────────────────────
+        reference_answer: Optional[str] = None
+        try:
+            q_row = sqlite_service.get_question_by_id(question_id)
+            if q_row and (q_row.get("answer_text") or "").strip():
+                reference_answer = (q_row.get("answer_text") or "").strip()
+                logger.debug(f"[submit_answer] 已从题库获取标准答案，长度={len(reference_answer)}")
+        except Exception as e:
+            logger.warning(f"[submit_answer] 获取标准答案失败: {e}")
+
+        # ── Step B：结构化评估（最小 LLM 调用，JSON mode）──────
+        # 使用 run_in_executor 避免同步 LLM 调用阻塞事件循环（与提取任务互不阻塞）
         logger.info(f"📝 [submit_answer] 评估用户答案 q={question_id}")
-        evaluation = _evaluate_answer_structured(question_text, user_answer)
+        loop = asyncio.get_event_loop()
+        evaluation = await loop.run_in_executor(
+            None,
+            lambda: _evaluate_answer_structured(
+                question_text, user_answer, reference_answer=reference_answer
+            ),
+        )
         score = evaluation["score"]
 
         # 如果 LLM 返回了 tags，合并进来
         llm_tags = evaluation.get("tags", [])
         merged_tags = list(set(tags + llm_tags))
 
-        # ── Step B：SM-2 更新（确定性，总是执行）───────────────
-        ai_feedback = (
-            evaluation.get("feedback", "") +
-            ("；遗漏：" + "、".join(evaluation["missed_points"])
-             if evaluation.get("missed_points") else "")
-        )
+        # ── Step C：SM-2 更新（确定性，总是执行）───────────────
+        feedback_parts = [evaluation.get("feedback", "")]
+        if evaluation.get("shortcomings"):
+            feedback_parts.append("不足：" + "、".join(evaluation["shortcomings"]))
+        if evaluation.get("error_points"):
+            errs = [f"{e.get('wrong','')}→{e.get('correct','')}" for e in evaluation["error_points"][:3]]
+            feedback_parts.append("错误纠正：" + "；".join(errs))
+        if evaluation.get("missed_points"):
+            feedback_parts.append("遗漏：" + "、".join(evaluation["missed_points"][:5]))
+        ai_feedback = "；".join(feedback_parts)
+        eval_details = {
+            "shortcomings": evaluation.get("shortcomings", []),
+            "error_points": evaluation.get("error_points", []),
+            "missed_points": evaluation.get("missed_points", []),
+            "strong_points": evaluation.get("strong_points", []),
+        }
         sqlite_service.add_study_record(
             user_id=user_id,
             question_id=question_id,
             score=score,
             user_answer=user_answer,
             ai_feedback=ai_feedback,
-            session_id=session_id
+            session_id=session_id,
+            eval_details=eval_details,
         )
 
-        # ── Step C：标签掌握度更新（确定性）─────────────────────
+        # ── Step D：标签掌握度更新（确定性）─────────────────────
         if merged_tags:
             sqlite_service.update_tag_mastery(user_id, merged_tags, score)
 
-        # ── Step D：情景记忆（确定性，总是执行）─────────────────
+        # ── Step E：情景记忆（确定性，总是执行）─────────────────
         self._write_episodic(
             user_id=user_id,
             content=(
@@ -426,7 +484,7 @@ class InterviewSystemOrchestrator:
             session_id=session_id
         )
 
-        # ── Step E：语义记忆更新（确定性，按得分写弱/强）────────
+        # ── Step F：语义记忆更新（确定性，按得分写弱/强）────────
         if score <= 2:
             self._write_semantic(
                 user_id=user_id,
@@ -442,7 +500,7 @@ class InterviewSystemOrchestrator:
                 knowledge_type="strength"
             )
 
-        # ── Step F：连续薄弱检测 + 知识推荐（确定性计数器）──────
+        # ── Step G：连续薄弱检测 + 知识推荐（确定性计数器）──────
         recommendation_text: Optional[str] = None
 
         if score <= 2 and merged_tags:
@@ -475,8 +533,14 @@ class InterviewSystemOrchestrator:
                     knowledge_type="repeated_weakness"
                 )
 
-        # ── Step G：生成自然语言解释（LLM，专注"解释"这一件事）─
-        explanation = _generate_explanation(question_text, evaluation, recommendation_text)
+        # ── Step H：生成自然语言解释（LLM，专注"解释"这一件事）─
+        explanation = await loop.run_in_executor(
+            None,
+            lambda: _generate_explanation(
+                question_text, evaluation, recommendation_text,
+                standard_answer=reference_answer
+            ),
+        )
 
         logger.info(f"✅ [submit_answer] 完成 score={score}, tags={merged_tags}, "
                     f"recommendation={'有' if recommendation_text else '无'}")
@@ -484,10 +548,13 @@ class InterviewSystemOrchestrator:
         return {
             "score": score,
             "feedback": evaluation.get("feedback", ""),
+            "shortcomings": evaluation.get("shortcomings", []),
+            "error_points": evaluation.get("error_points", []),
             "missed_points": evaluation.get("missed_points", []),
             "strong_points": evaluation.get("strong_points", []),
             "explanation": explanation,
             "recommendation": recommendation_text,
+            "standard_answer": reference_answer or "",
             "tags": merged_tags
         }
 
@@ -542,8 +609,7 @@ class InterviewSystemOrchestrator:
         except Exception as e:
             logger.warning(f"[对话处理] load_session 失败，使用空历史: {e}")
 
-        # 记忆由框架提供：HistoryManager(load_session) + recall_memory 工具
-        # 不再在此注入 memory_context，Agent 通过 recall_memory 按需获取
+        # 记忆由框架提供：HistoryManager(load_session) + get_mastery_report/get_session_context 按需获取
         context_prefix = "\n".join(filter(None, [
             f"[系统] user_id={user_id}, session_id={session_id}",
             f"[简历]\n{resume}" if resume else "",
@@ -673,7 +739,8 @@ class InterviewSystemOrchestrator:
         set_current_user_id(user_id)
         set_current_session_id(session_id)
 
-        sqlite_service.ensure_session_exists(session_id, user_id)
+        # 将 SQLite 操作放到线程池，避免阻塞事件循环（Bug2 修复：chat 不再阻塞其他请求）
+        await asyncio.to_thread(sqlite_service.ensure_session_exists, session_id, user_id)
         self._write_working(user_id, f"用户：{message}", session_id=session_id)
         if resume:
             self._write_perceptual(user_id, f"简历内容（{len(resume)}字）",
@@ -681,7 +748,9 @@ class InterviewSystemOrchestrator:
 
         session_path = f"{user_id}:{session_id}"
         try:
-            self.interviewer.load_session(session_path, check_consistency=False)
+            await asyncio.to_thread(
+                lambda: self.interviewer.load_session(session_path, check_consistency=False)
+            )
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -699,14 +768,8 @@ class InterviewSystemOrchestrator:
         thinking_steps: List[dict] = []  # 累积推理过程，用于持久化（解决刷新后推理过程丢失）
         current_step: dict = {}
         
-        # 🔧 方案B：流式开始前先保存用户消息（确保至少用户问题被保存）
-        try:
-            from hello_agents.core.message import Message
-            self.interviewer.add_message(Message(full_input, "user"))
-            self.interviewer.save_session(session_id)
-            logger.debug(f"[chat_stream] 已保存用户消息到 session")
-        except Exception as e:
-            logger.warning(f"[chat_stream] 预保存用户消息失败: {e}")
+        # 注意：不再在此处 add_message(user)，hello_agents 的 arun_stream 在完成时会自动添加
+        # user+assistant，若在此预添加会导致用户消息重复保存两次（Bug1 修复）
         
         try:
             # 使用 arun_stream() 获得官方 SSE 事件流
@@ -731,9 +794,12 @@ class InterviewSystemOrchestrator:
                     current_time = _time.time()
                     if chunk_count % 50 == 0 or (current_time - last_save_time) >= 5:
                         try:
-                            # 临时保存当前进度
+                            # 临时保存当前进度（线程池执行，不阻塞事件循环）
                             if full_content.strip():
-                                sqlite_service.patch_last_assistant_content(session_id, full_content)
+                                await asyncio.to_thread(
+                                    sqlite_service.patch_last_assistant_content,
+                                    session_id, full_content
+                                )
                                 last_save_time = current_time
                                 logger.debug(f"[chat_stream] 中间保存点：已保存 {len(full_content)} 字符")
                         except Exception as e:
@@ -775,24 +841,26 @@ class InterviewSystemOrchestrator:
             # 持久化完整内容 + 推理过程 + 耗时（解决刷新/切换页面后推理过程丢失）
             duration_ms = int((_time.time() - start_time) * 1000)
             try:
-                self.interviewer.save_session(session_id)
+                # 线程池执行 SQLite 操作，不阻塞事件循环
+                await asyncio.to_thread(self.interviewer.save_session, session_id)
                 if full_content.strip():
-                    sqlite_service.patch_last_assistant_content(
+                    await asyncio.to_thread(
+                        sqlite_service.patch_last_assistant_content,
                         session_id, full_content,
-                        thinking=thinking_steps if thinking_steps else None,
-                        duration_ms=duration_ms,
+                        thinking_steps if thinking_steps else None,
+                        duration_ms,
                     )
                 logger.debug(f"[chat_stream] 流式完成，最终保存 {len(full_content)} 字符, {len(thinking_steps)} 步推理, 耗时 {duration_ms}ms")
             except Exception as e:
                 logger.warning(f"[chat_stream] save_session 失败: {e}")
 
             self._write_working(user_id, f"AI：{full_content[:100]}", importance=0.4, session_id=session_id)
-            self._write_episodic(
-                user_id=user_id,
-                content=f"对话：「{message[:60]}」→「{full_content[:60]}」",
-                importance=0.5,
-                event_type="dialogue",
-                session_id=session_id
+            # 情节记忆写入也放到线程池
+            await asyncio.to_thread(
+                lambda: self._write_episodic(
+                    user_id, f"对话：「{message[:60]}」→「{full_content[:60]}」",
+                    importance=0.5, event_type="dialogue", session_id=session_id
+                )
             )
 
         except asyncio.TimeoutError:

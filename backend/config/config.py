@@ -358,7 +358,8 @@ class _Settings:
     # ── 4.6 Miner Agent（题目提取器）──────────────────────────────────
     @property
     def miner_mode(self) -> str:
-        """Miner使用模式：local/remote，留空则使用全局LLM_MODE"""
+        """Miner使用模式：local/remote/two_stage，留空则使用全局LLM_MODE
+        two_stage=Stage1本地粗提取+Stage2豆包精加工（补充完整标准答案）"""
         return _get("MINER_MODE") or self.llm_mode
 
     # 本地配置
@@ -395,6 +396,10 @@ class _Settings:
     def miner_remote_timeout(self) -> int:
         return _get_int("MINER_REMOTE_TIMEOUT", 0) or self.llm_remote_timeout
 
+    @property
+    def miner_remote_api_key(self) -> str:
+        return _get("MINER_REMOTE_API_KEY") or self.llm_remote_api_key
+
     # 当前使用的配置（根据mode选择）
     @property
     def miner_provider(self) -> str:
@@ -407,7 +412,7 @@ class _Settings:
     @property
     def miner_api_key(self) -> str:
         local_key = _get("MINER_LOCAL_API_KEY") or self.llm_local_api_key
-        remote_key = _get("MINER_REMOTE_API_KEY") or self.llm_remote_api_key
+        remote_key = self.miner_remote_api_key
         return local_key if self.miner_mode == "local" else remote_key
 
     @property
@@ -432,6 +437,47 @@ class _Settings:
     def miner_max_retries(self) -> int:
         """题目提取失败时的最大重试次数（返回空或格式错误时重试）"""
         return _get_int("MINER_MAX_RETRIES", 3)
+
+    @property
+    def miner_refusal_retries(self) -> int:
+        """Miner 模型拒绝时，重试 Miner 的次数，用尽后再降级为直接 LLM 调用"""
+        return _get_int("MINER_REFUSAL_RETRIES", 3)
+
+    @property
+    def miner_max_steps(self) -> int:
+        """Miner Agent 最大步数（含 OCR、TodoWrite、Finish 等工具调用）"""
+        return _get_int("MINER_MAX_STEPS", 100)
+
+    # ── 两阶段 Miner：Stage 2 豆包配置（精加工阶段）────────────────────────
+    @property
+    def miner_stage2_model(self) -> str:
+        """Stage 2 精加工模型（豆包），留空则用 MINER_REMOTE_MODEL"""
+        return _get("MINER_STAGE2_MODEL") or self.miner_remote_model
+
+    @property
+    def miner_stage2_api_key(self) -> str:
+        return _get("MINER_STAGE2_API_KEY") or self.miner_remote_api_key or _get("FINETUNE_LLM_API_KEY")
+
+    @property
+    def miner_stage2_base_url(self) -> str:
+        return _get("MINER_STAGE2_BASE_URL") or self.miner_remote_base_url or _get("FINETUNE_LLM_BASE_URL")
+
+    @property
+    def miner_stage2_timeout(self) -> int:
+        return _get_int("MINER_STAGE2_TIMEOUT", 0) or self.miner_remote_timeout
+
+    @property
+    def miner_stage2_temperature(self) -> float:
+        return _get_float("MINER_STAGE2_TEMPERATURE", 0.3)
+
+    @property
+    def miner_stage2_max_tokens(self) -> int:
+        return _get_int("MINER_STAGE2_MAX_TOKENS", 0) or self.miner_max_tokens
+
+    @property
+    def extract_retries_on_failure(self) -> int:
+        """有图片时，提取失败（0题/parse_error）后的整体重试次数，用尽后 warning"""
+        return _get_int("EXTRACT_RETRIES_ON_FAILURE", 3)
 
     @property
     def crawler_fetch_max_retries(self) -> int:
@@ -464,6 +510,57 @@ class _Settings:
     def embed_ollama_url(self) -> str:
         """Ollama 本地服务地址（EMBED_MODEL_TYPE=ollama 时使用）"""
         return _get("EMBED_OLLAMA_URL", "http://localhost:11434")
+
+    # ── 5.5 检索与重排 ─────────────────────────────────────────────
+    @property
+    def rerank_enabled(self) -> bool:
+        """是否启用检索后重排（Ollama Qwen3-Reranker）"""
+        return _get_bool("RERANK_ENABLED", True)
+
+    @property
+    def rerank_model(self) -> str:
+        """重排模型，如 dengcao/Qwen3-Reranker-8B:Q4_K_M"""
+        return _get("RERANK_MODEL", "dengcao/Qwen3-Reranker-8B:Q4_K_M")
+
+    @property
+    def rerank_ollama_url(self) -> str:
+        """重排服务 Ollama 地址"""
+        return _get("RERANK_OLLAMA_URL", "http://localhost:11434")
+
+    @property
+    def rerank_top_n(self) -> int:
+        """重排后返回条数"""
+        return _get_int("RERANK_TOP_N", 5)
+
+    @property
+    def rerank_max_doc_length(self) -> int:
+        """单文档最大长度（字符），超长截断"""
+        return _get_int("RERANK_MAX_DOC_LENGTH", 1024)
+
+    @property
+    def rerank_timeout(self) -> int:
+        """重排请求超时（秒）"""
+        return _get_int("RERANK_TIMEOUT", 60)
+
+    @property
+    def retrieval_search_top_k(self) -> int:
+        """向量检索初筛条数（重排前多取一些）"""
+        return _get_int("RETRIEVAL_SEARCH_TOP_K", 15)
+
+    @property
+    def retrieval_score_threshold(self) -> float:
+        """向量检索相似度阈值（0~1）"""
+        return _get_float("RETRIEVAL_SCORE_THRESHOLD", 0.5)
+
+    @property
+    def retrieval_similar_limit(self) -> int:
+        """find_similar_questions 最终返回条数"""
+        return _get_int("RETRIEVAL_SIMILAR_LIMIT", 5)
+
+    @property
+    def retrieval_check_duplicate_threshold(self) -> float:
+        """查重阈值（入库时，高于此视为重复）"""
+        return _get_float("RETRIEVAL_CHECK_DUPLICATE_THRESHOLD", 0.92)
 
     # ── 6. Neo4j ──────────────────────────────────────────────────
     @property
@@ -557,6 +654,16 @@ class _Settings:
         return _get("OCR_MODEL", "")
 
     @property
+    def ocr_timeout(self) -> int:
+        """OCR 单张图片超时秒数，图片多或模型慢时可调大"""
+        return _get_int("OCR_TIMEOUT", 120)
+
+    @property
+    def ocr_retries(self) -> int:
+        """单张图片 OCR 失败或乱码时的重试次数"""
+        return _get_int("OCR_RETRIES", 3)
+
+    @property
     def nowcoder_output_dir(self) -> Path:
         """牛客测试/调试输出目录（正文 txt + 图片，不含 HTML）"""
         return self.backend_data_dir / "nowcoder_output"
@@ -571,6 +678,14 @@ class _Settings:
         """LLM 交互日志路径（JSONL 格式，精简原始+输出），留空则不记录"""
         p = _get("LLM_PROMPT_LOG_CSV", "").strip()
         return "" if not p else _resolve_data_path(p)
+
+    @property
+    def miner_two_stage_log_path(self) -> str:
+        """两阶段提取日志路径（Stage1 本地 + Stage2 豆包 对比，用于微调）"""
+        p = _get("MINER_TWO_STAGE_LOG", "").strip()
+        if p:
+            return _resolve_data_path(p)
+        return str(_PROJECT_ROOT / "微调" / "llm_logs" / "miner_two_stage_log.jsonl")
 
     # ── 9. 爬虫 ──────────────────────────────────────────────────
     @property

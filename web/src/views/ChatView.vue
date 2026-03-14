@@ -475,7 +475,7 @@ const send = async () => {
           // 强制触发 Vue 响应式更新
           messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
           streamingMsg.value = messages.value[aiMsgIndex]
-          console.log(`[响应式更新] content长度=${aiMsg.content.length}, 最新内容="${aiMsg.content.slice(-50)}"`)
+          // console.log(`[响应式更新] content长度=${aiMsg.content.length}, 最新内容="${aiMsg.content.slice(-50)}"`)
           scrollToBottom()
         }
       } else if (evType === 'agent_finish') {

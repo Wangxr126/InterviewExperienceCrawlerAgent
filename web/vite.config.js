@@ -18,7 +18,19 @@ export default defineConfig({
         proxyTimeout: 0,
         configure: (proxy) => {
           proxy.on('proxyRes', (proxyRes, req, res) => {
-            // 禁用代理/中间件缓冲，确保 SSE 实时推送
+            proxyRes.headers['cache-control'] = 'no-cache, no-transform'
+            proxyRes.headers['x-accel-buffering'] = 'no'
+            proxyRes.headers['connection'] = 'keep-alive'
+          })
+        },
+      },
+      '/api/crawler/extraction-trace-stream': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+        timeout: 0,
+        proxyTimeout: 0,
+        configure: (proxy) => {
+          proxy.on('proxyRes', (proxyRes, req, res) => {
             proxyRes.headers['cache-control'] = 'no-cache, no-transform'
             proxyRes.headers['x-accel-buffering'] = 'no'
             proxyRes.headers['connection'] = 'keep-alive'
