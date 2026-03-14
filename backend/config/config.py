@@ -469,7 +469,8 @@ class _Settings:
 
     @property
     def miner_stage2_timeout(self) -> int:
-        return _get_int("MINER_STAGE2_TIMEOUT", 0) or self.miner_remote_timeout
+        """Stage 2 精加工 API 超时（秒），默认 180（3 分钟）"""
+        return _get_int("MINER_STAGE2_TIMEOUT", 0) or 180
 
     @property
     def miner_stage2_temperature(self) -> float:
@@ -477,7 +478,8 @@ class _Settings:
 
     @property
     def miner_stage2_max_tokens(self) -> int:
-        return _get_int("MINER_STAGE2_MAX_TOKENS", 0) or self.miner_max_tokens
+        """Stage 2 精加工最大输出 token，默认 65536 避免长答案被截断导致 JSON 解析失败"""
+        return _get_int("MINER_STAGE2_MAX_TOKENS", 0) or 65536
 
     @property
     def extract_retries_on_failure(self) -> int:

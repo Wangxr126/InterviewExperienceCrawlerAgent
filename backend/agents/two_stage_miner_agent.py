@@ -97,6 +97,7 @@ class TwoStageExtractor:
                 base_url=settings.miner_stage2_base_url,
                 temperature=settings.miner_stage2_temperature,
                 timeout=settings.miner_stage2_timeout,
+                max_tokens=settings.miner_stage2_max_tokens,
             )
             self.enrich_agent = SimpleAgent(
                 name="Enrich Extractor",
@@ -174,6 +175,15 @@ class TwoStageExtractor:
                     return "", self._ocr_called, False
                 rough_questions = parsed
             except json.JSONDecodeError as je:
+                # 解析失败时写入调试文件，便于排查（如全角冒号、乱码等）
+                _debug_path = settings.backend_data_dir / "memory" / "json_parse_fail_debug.txt"
+                try:
+                    _debug_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(_debug_path, "w", encoding="utf-8") as f:
+                        f.write(f"# Error: {je}\n# Position: line {je.lineno} col {je.colno}\n\n")
+                        f.write(rough_result[:8000])
+                except Exception:
+                    pass
                 rough_questions = self._parse_json_fallback(rough_result)
                 if not rough_questions:
                     # 兜底：模型输出 Markdown 而非 JSON 时，尝试从 Markdown 提取题目
@@ -250,7 +260,9 @@ class TwoStageExtractor:
             return rough_result, self._ocr_called, False
 
     def _merge_stage2_with_stage1(self, enrich_result: str, rough_questions: list) -> str:
-        """合并 Stage 2 输出与 Stage 1 元数据，下游需要完整 7 字段"""
+        """合并 Stage 2 输出与 Stage 1 元数据，下游需要完整 7 字段。
+        解析失败时 re-raise，让外层触发 Stage 1 降级，避免返回无效 JSON 导致整体提取失败。
+        """
         try:
             stage2_list = json.loads(enrich_result)
             if not isinstance(stage2_list, list):
@@ -277,8 +289,10 @@ class TwoStageExtractor:
                     "position": item.get("position") or s1.get("position", ""),
                 })
             return json.dumps(merged, ensure_ascii=False)
-        except Exception:
-            return enrich_result
+        except (json.JSONDecodeError, TypeError) as e:
+            # 豆包返回截断/非法 JSON 时，必须 re-raise 以触发外层 fallback 到 Stage 1
+            logger.warning(f"[TwoStageExtractor] Stage 2 输出解析失败（可能被截断）: {e}，将降级返回 Stage 1 结果")
+            raise
 
     def _save_two_stage_log(
         self,
@@ -583,48 +597,40 @@ class TwoStageExtractor:
         return results
 
     def _normalize_question_item(self, q: dict) -> dict | None:
-        """规范化题目字段：模型可能用 question/answer/category，映射为 question_text/answer_text/question_type"""
+        """规范化题目字段，仅做最小必要映射（prompt 已规定格式，错误时靠重试+错误信息修正）"""
         if not isinstance(q, dict):
             return None
+        # 仅保留 question/answer 作为最小兼容（prompt 已禁止，但部分模型仍会误用）
         qt = q.get("question_text") or q.get("question") or ""
         if not qt or not isinstance(qt, str):
             return None
         at = q.get("answer_text") or q.get("answer") or ""
-        qtype = (
-            q.get("question_type")
-            or q.get("category")
-            or q.get("role")
-            or q.get("type")  # 兼容 LLM 输出 "type": "project"/"theory"
-            or "基础类"
-        )
-        # category/type 英文映射为中文类型
-        if qtype in ("AI", "ai"):
-            qtype = "AI类"
-        elif qtype in ("Engineering", "engineering", "project"):
-            qtype = "工程类"
-        elif qtype in ("Algorithm", "algorithm"):
-            qtype = "算法类"
-        elif qtype in ("theory", "Theory"):
+        # 仅接受标准 question_type 值，非法则置基础类（由重试+错误信息引导修正）
+        qtype = q.get("question_type") or q.get("type") or "基础类"
+        if qtype not in ("算法类", "AI类", "工程类", "基础类", "软技能"):
             qtype = "基础类"
-        elif qtype in ("soft_skill", "SoftSkill"):
-            qtype = "软技能"
-        elif qtype not in ("算法类", "AI类", "工程类", "基础类", "软技能"):
-            qtype = "基础类"
+        diff = q.get("difficulty")
+        if isinstance(diff, str):
+            diff = {"低": "easy", "中": "medium", "高": "hard"}.get(diff.strip(), diff)
+        if diff not in ("easy", "medium", "hard"):
+            diff = "medium"
+        tags = q.get("topic_tags") if isinstance(q.get("topic_tags"), list) else q.get("tags")
+        tags = tags if isinstance(tags, list) else []
         return {
             "question_text": qt.strip(),
             "answer_text": (at if isinstance(at, str) else str(at)).strip() or f"（待补充）{qt[:50]}",
-            "difficulty": q.get("difficulty") if q.get("difficulty") in ("easy", "medium", "hard") else "medium",
+            "difficulty": diff,
             "question_type": qtype,
-            "topic_tags": q.get("topic_tags") if isinstance(q.get("topic_tags"), list) else [],
+            "topic_tags": tags,
             "company": q.get("company") or "",
-            "position": q.get("position") or "",
+            "position": q.get("position") or q.get("job") or "",
         }
 
     @staticmethod
     def _repair_json(text: str) -> str:
         """修复 LLM 输出的常见 JSON 错误"""
         import re
-        s = text
+        s = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
         # 修复 "raw:answer" -> "raw_answer"（常见 LLM 笔误）
         s = re.sub(r'"raw\s*:\s*answer"', '"raw_answer"', s, flags=re.IGNORECASE)
         # 修复 "question:type" -> "question_type" 等键名中的冒号
@@ -632,24 +638,18 @@ class TwoStageExtractor:
         s = re.sub(r'"answer\s*:\s*text"', '"answer_text"', s, flags=re.IGNORECASE)
         # 移除尾随逗号（在 ] 或 } 前的逗号）
         s = re.sub(r',\s*([}\]])', r'\1', s)
-        # 修复 "question"/"question_text" 后的无效值（如 "question":㏜、乱码、缺引号）
-        s = re.sub(
-            r'("question_text"|"question")\s*:\s*([^"\[\]{}ntf0-9\-][^\n"]*)',
-            r'\1: ""',
-            s,
-        )
-        # 修复 "answer"/"answer_text" 后的无效值（同上，避免 JSON 解析失败）
-        s = re.sub(
-            r'("answer_text"|"answer")\s*:\s*([^"\[\]{}ntf0-9\-][^\n"]*)',
-            r'\1: ""',
-            s,
-        )
+        # 不再修复 question/answer 无效值：原正则会误伤合法值（如 "question_text": "有..." 中冒号后的空格被误判），
+        # 无效值由重试+错误信息引导修正
         # 修复缺失逗号："" 与下一键 "key" 之间无逗号时补上（支持无空格，如 "value""key"）
         s = re.sub(r'""\s*"', r' "", "', s)
         # 修复数组元素间缺失逗号：} 与 { 之间（如 }  { 或 }\n{）
         s = re.sub(r'}\s*{', r'},{', s)
         # 替换字符串内的中文引号/智能引号，避免解析为 JSON 边界
         s = s.replace("\u201c", '"').replace("\u201d", '"')
+        # 全角冒号 U+FF1A -> 半角，否则 json.loads 报 Expecting ':' delimiter
+        s = s.replace("\uFF1A", ":")
+        # 移除 { 与 "key" 之间的乱码（如 "назад"），仅当 { 为对象开头时（前有 [ , }）避免误伤字符串内的 {
+        s = re.sub(r'(?<=[,\[\]}])\s*{\s*[^"\s\[\]{}]+', ' {', s)
         return s
 
     @staticmethod

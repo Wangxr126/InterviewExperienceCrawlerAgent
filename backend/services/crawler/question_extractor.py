@@ -667,15 +667,7 @@ def extract_questions_from_post(
                     "即使面经是叙述性格式，也必须从中归纳题目并输出 JSON 数组。"
                     f"{_err_hint}"
                 )
-            # 情况C：上次提取 < 3 道且有图片但未调用 OCR → 强制提示先 OCR
-            elif len(items) < 3 and image_paths and not agent_used_tool:
-                attempt_prompt = user_prompt + (
-                    f"\n\n【第{attempt}次重试 - 必须调用 OCR】"
-                    f"上次只提取到 {len(items)} 道题，正文可能不完整。"
-                    "元信息显示有图片，题目可能在图片中。"
-                    "**你必须先调用 ocr_images 工具识别图片内容**，再根据正文+OCR 结果提取题目，最后调用 Finish 返回 JSON 数组。"
-                )
-            # 情况D：其他重试
+            # 情况C：其他重试
             else:
                 _err_hint = ""
                 try:
@@ -769,20 +761,12 @@ def extract_questions_from_post(
                 time.sleep(1)
             continue
 
-        need_ocr_retry = (
-            status == "ok" and items and len(items) < 3
-            and image_paths and not agent_used_tool and attempt < max_retries
-        )
         if status == "ok" and items:
-            # 提取 < 3 道且有图片但未调用 OCR → 继续重试，强制模型先 OCR
-            if need_ocr_retry:
-                logger.warning(f"提取到 {len(items)} 道题（< 3），有图片但未调用 OCR，第 {attempt + 1} 次重试（强制 OCR）")
-            else:
-                if attempt > 1:
-                    logger.info(f"重试成功（第 {attempt} 次）: 提取到 {len(items)} 道题目")
-                break
+            if attempt > 1:
+                logger.info(f"重试成功（第 {attempt} 次）: 提取到 {len(items)} 道题目")
+            break
 
-        if attempt < max_retries and not need_ocr_retry:
+        if attempt < max_retries:
             logger.warning(f"提取失败（第 {attempt} 次，状态: {status}），{max_retries - attempt} 次重试机会剩余")
         if attempt < max_retries:
             time.sleep(1)
