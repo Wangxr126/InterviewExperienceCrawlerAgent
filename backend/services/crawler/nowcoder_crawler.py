@@ -668,20 +668,25 @@ class NowcoderCrawler:
         return text
 
     def fetch_post_content_full(self, post_url: str) -> Tuple[str, List[str]]:
+        """爬取帖子详情页，返回 (正文纯文本, 图片URL列表)。兼容旧接口。"""
+        _, body, image_urls = self.fetch_post_content_full_with_title(post_url)
+        return body, image_urls
+
+    def fetch_post_content_full_with_title(self, post_url: str) -> Tuple[str, str, List[str]]:
         """
-        爬取帖子详情页，返回 (正文纯文本, 图片URL列表)。
+        爬取帖子详情页，返回 (标题, 正文纯文本, 图片URL列表)。
         以 HTML 解析（DOM）为主，不依赖正则/关键词。
         feed 链接若 DOM 无正文，会尝试解析 discuss 链接并重新抓取。
         """
         if not post_url.startswith("http"):
-            return "", []
+            return "", "", []
         try:
             time.sleep(random.uniform(1, 2))
             self._update_headers()
             resp = self.session.get(post_url, timeout=20)
             if resp.status_code != 200:
                 logger.warning(f"详情页请求失败 {resp.status_code}: {post_url}")
-                return "", []
+                return "", "", []
 
             html = resp.text
             soup = BeautifulSoup(html, "html.parser")
@@ -722,11 +727,11 @@ class NowcoderCrawler:
             else:
                 logger.warning(f"未识别到正文结构 [nowcoder]: {post_url[:80]}")
 
-            return body, image_urls
+            return title or "", body, image_urls
 
         except Exception as e:
             logger.error(f"详情页解析异常 {post_url}: {e}")
-            return "", []
+            return "", "", []
 
     # ── 列表页发现（严格按参考 parse_list_page）──────────────────────────────
 

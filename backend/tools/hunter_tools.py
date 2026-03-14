@@ -1,16 +1,14 @@
 """
 资源猎人工具箱 (Hunter Tools)
 整合了 牛客网爬虫 和 小红书爬虫，统一对外提供抓取能力。
+复用 backend.services.crawler 的完整逻辑，与 MCP content-extractor 一致。
 """
 
 import json
 import logging
 import re
 import os
-import asyncio
-import requests
 from urllib.parse import urlparse
-from bs4 import BeautifulSoup
 from typing import List, Dict, Any
 
 # ✅ 引入 Tool 和 ToolParameter
@@ -64,92 +62,59 @@ class CrawlerTool(Tool):
             return f"❌ 抓取发生异常: {str(e)}"
 
     # -------------------------------------------------------
-    # A. 牛客网爬取逻辑
+    # A. 牛客网爬取逻辑（复用 nowcoder_crawler 完整实现）
     # -------------------------------------------------------
     def _crawl_nowcoder(self, url: str) -> str:
         logger.info(f"🕸️ [牛客网] 开始抓取: {url}")
-
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-            'Referer': 'https://www.nowcoder.com',
-        }
-
         try:
-            session = requests.Session()
-            response = session.get(url, headers=headers, timeout=15)
+            from backend.services.crawler.nowcoder_crawler import NowcoderCrawler
+            from backend.config.config import settings
 
-            if response.status_code != 200:
-                return f"请求失败，状态码: {response.status_code}"
+            cookie = getattr(settings, "nowcoder_cookie", "") or os.environ.get("NOWCODER_COOKIE", "")
+            crawler = NowcoderCrawler(cookie=cookie)
+            title, content, image_urls = crawler.fetch_post_content_full_with_title(url)
 
-            soup = BeautifulSoup(response.text, 'html.parser')
-
-            # 查找正文
-            content_div = soup.find('div', class_=lambda x: x and ('nc-post-content' in x or 'post-topic-des' in x))
-            if not content_div:
-                content_div = soup.find(id="js-post-content")
-
-            # 查找标题
-            title_tag = soup.find('span', class_='post-title') or soup.find('div', class_='title')
-            title = title_tag.get_text(strip=True) if title_tag else "无标题"
-
-            if content_div:
-                for script in content_div(["script", "style"]):
-                    script.decompose()
-
-                content = content_div.get_text(separator='\n', strip=True)
-
-                return f"【来源】牛客网\n【标题】{title}\n【链接】{url}\n【正文】\n{content}"
-            else:
+            if not content:
                 return "❌ 未识别到正文结构 (可能需要更新 Cookie 或 页面结构变更)"
 
+            result = f"【来源】牛客网\n【标题】{title or '无标题'}\n【链接】{url}\n【正文】\n{content}"
+            if image_urls:
+                result += f"\n【检测到图片】共 {len(image_urls)} 张"
+                for img in image_urls:
+                    result += f"\n[IMAGE_URL]: {img}"
+            return result
         except Exception as e:
+            logger.error(f"牛客网解析异常: {e}")
             return f"牛客网解析异常: {str(e)}"
 
     # -------------------------------------------------------
-    # B. 小红书爬取逻辑
+    # B. 小红书爬取逻辑（复用 xhs_crawler，含 Playwright 兜底）
     # -------------------------------------------------------
     def _crawl_xhs(self, url: str) -> str:
         logger.info(f"📕 [小红书] 开始抓取: {url}")
-
         try:
-            from xhs_crawl import XHSSpider
-        except ImportError:
-            return "❌ 缺少依赖 `xhs-crawl`，请先 pip install xhs-crawl"
+            from backend.services.crawler.xhs_crawler import fetch_xhs_details
 
-        async def async_fetch():
-            spider = XHSSpider()
-            try:
-                post = await spider.get_post_data(url)
-                if not post:
-                    return "❌ 数据为空或帖子不存在"
+            posts = fetch_xhs_details([url])
+            if not posts:
+                return "❌ 数据为空或帖子不存在。小红书可能需要登录，请先调用 POST /api/crawler/xhs/login 完成扫码。"
 
-                title = getattr(post, "title", "无标题")
-                content = getattr(post, "content", "无内容")
+            p = posts[0]
+            title = p.get("title", "无标题")
+            content = p.get("content", "无内容")
+            image_urls = p.get("image_urls", [])
 
-                image_urls = []
-                if hasattr(post, "images") and post.images:
-                    image_urls = post.images
-
-                result_text = f"【来源】小红书\n【标题】{title}\n【链接】{url}\n【正文】\n{content}"
-
-                if image_urls:
-                    result_text += f"\n【检测到图片】共 {len(image_urls)} 张"
-                    for img in image_urls:
-                        result_text += f"\n[IMAGE_URL]: {img}"
-
-                return result_text
-
-            except Exception as e:
-                return f"❌ 小红书抓取异常: {str(e)}"
-            finally:
-                await spider.close()
-
-        try:
-            if os.name == "nt":
-                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-            return asyncio.run(async_fetch())
+            result = f"【来源】小红书\n【标题】{title}\n【链接】{url}\n【正文】\n{content}"
+            if image_urls:
+                result += f"\n【检测到图片】共 {len(image_urls)} 张"
+                for img in image_urls:
+                    result += f"\n[IMAGE_URL]: {img}"
+            return result
+        except ImportError as e:
+            return "❌ 缺少依赖 `xhs-crawl` 或 `playwright`，请先 pip install xhs-crawl playwright && playwright install chromium"
         except Exception as e:
-            return f"异步执行出错: {str(e)}"
+            logger.error(f"小红书抓取异常: {e}")
+            return f"❌ 小红书抓取异常: {str(e)}"
 
 
 # ==============================================================================

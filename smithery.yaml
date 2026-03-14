@@ -1,0 +1,4 @@
+# Smithery MCP 部署配置
+# 用于 content-extractor（牛客/小红书 URL 内容+图片提取）
+# 文档：https://smithery.ai/docs/build
+runtime: container

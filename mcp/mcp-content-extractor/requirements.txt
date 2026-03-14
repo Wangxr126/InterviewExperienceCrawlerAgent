@@ -1,0 +1,4 @@
+# MCP Content Extractor 依赖
+# 与主项目共用 backend，需在项目根目录运行
+fastmcp>=2.0.0
+python-dotenv>=1.2.0

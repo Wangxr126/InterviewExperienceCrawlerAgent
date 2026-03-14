@@ -18,6 +18,15 @@
         "E:\\Agent\\AgentProject\\wxr_agent\\mcp\\mcp-image-extractor\\dist\\index.js"
       ],
       "disabled": false
+    },
+    "content-extractor": {
+      "command": "python",
+      "args": ["mcp/mcp-content-extractor/server.py"],
+      "cwd": "E:\\Agent\\AgentProject\\wxr_agent",
+      "env": {
+        "XHS_USER_DATA_DIR": "E:\\Agent\\AgentProject\\wxr_agent\\backend\\data\\xhs_user_data"
+      },
+      "disabled": false
     }
   }
 }
