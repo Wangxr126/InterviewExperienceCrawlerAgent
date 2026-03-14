@@ -218,7 +218,7 @@
         @selection-change="onTaskSelectionChange"
         :default-sort="{ prop: 'id', order: 'descending' }"
       >
-        <el-table-column type="selection" width="50" align="center"
+        <el-table-column type="selection" width="20" align="center"
   
         >
           <template #header>操作</template>
@@ -402,10 +402,10 @@
       <div class="clear-all-body">
         <p class="clear-all-desc">此操作将永久删除以下数据，且无法恢复：</p>
         <div class="clear-all-items">
-          <div class="clear-all-item">所有帖子记录</div>
-          <div class="clear-all-item">所有已提取的面试题</div>
-          <div class="clear-all-item">相关爬取日志与本地图片</div>
-          <div class="clear-all-item">LLM 交互日志、解析失败记录、小红书链接缓存</div>
+          <div class="clear-all-item">所有帖子记录（crawl_tasks）</div>
+          <div class="clear-all-item">所有已提取的面试题（questions + Neo4j）</div>
+          <div class="clear-all-item">相关爬取日志、入库日志、本地图片</div>
+          <div class="clear-all-item">小红书链接缓存（LLM 日志保留用于微调）</div>
         </div>
         <p class="clear-all-tip">请确认您已备份重要数据后再执行。</p>
       </div>

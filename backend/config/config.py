@@ -137,6 +137,11 @@ class _Settings:
         """启动时是否预热 LLM（解决 Ollama/云端 冷启动首请求慢或无响应）"""
         return _get_bool("LLM_WARMUP_ENABLED", True)
 
+    @property
+    def warmup_embedding_rerank_ocr_enabled(self) -> bool:
+        """是否预热 Embedding/Reranker/OCR（仅题目提取可设为 false 加快启动）"""
+        return _get_bool("WARMUP_EMBEDDING_RERANK_OCR", True)
+
     # ── 3. Architect Agent ────────────────────────────────────────
     @property
     def architect_mode(self) -> str:

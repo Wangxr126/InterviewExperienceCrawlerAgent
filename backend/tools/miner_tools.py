@@ -95,6 +95,63 @@ class MarkUnrelatedTool(Tool):
         return ToolResponse.success(text="__UNRELATED__", data={"reason": reason})
 
 
+class VerifyExtractionCountTool(Tool):
+    """
+    提取数量校验工具。
+    在调用 Finish 之前必须调用此工具，校验提取数量是否与原文预期一致。
+    当元信息中有「原文约 N 道题」时，必须传入 expected_count=N；
+    数量不符时工具返回错误，模型需重新提取直至数量正确。
+    """
+
+    def __init__(self):
+        super().__init__(
+            name="verify_extraction_count",
+            description=(
+                "【必须调用】在调用 Finish 之前必须先调用此工具校验提取数量。"
+                "当元信息中有「原文约 N 道题」时，传入 extracted_count（你提取的题目数量）和 expected_count（元信息中的 N）。"
+                "数量不符时工具会返回错误，你必须重新提取直至数量正确，才能调用 Finish。"
+            ),
+        )
+
+    def get_parameters(self) -> List[ToolParameter]:
+        return [
+            ToolParameter(
+                name="extracted_count",
+                type="integer",
+                description="你当前提取到的题目数量",
+                required=True,
+            ),
+            ToolParameter(
+                name="expected_count",
+                type="integer",
+                description="元信息中的预期题目数量（如「原文约 43 道题」则填 43），无预期时填 0 表示跳过校验",
+                required=True,
+            ),
+        ]
+
+    def run(self, parameters: Dict[str, Any]) -> ToolResponse:
+        extracted = int(parameters.get("extracted_count", 0))
+        expected = int(parameters.get("expected_count", 0))
+        if expected <= 0:
+            return ToolResponse.success(
+                text="✅ 无预期数量，跳过校验。可继续调用 Finish 返回结果。",
+                data={"verified": True},
+            )
+        if extracted == expected:
+            return ToolResponse.success(
+                text=f"✅ 数量校验通过：已提取 {extracted} 道，与预期 {expected} 道一致。可调用 Finish 返回结果。",
+                data={"verified": True, "extracted_count": extracted, "expected_count": expected},
+            )
+        return ToolResponse.error(
+            code="COUNT_MISMATCH",
+            message=(
+                f"❌ 数量不符：已提取 {extracted} 道，应为 {expected} 道。"
+                "请重新逐条扫描原文，确保每道题都来自原文且数量一致，禁止遗漏或编造。"
+                "修正后再次调用 verify_extraction_count 校验，通过后再调用 Finish。"
+            ),
+        )
+
+
 class FinishTool(Tool):
     """
     完成提取工具（终止工具）。

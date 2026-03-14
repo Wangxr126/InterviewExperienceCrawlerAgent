@@ -16,7 +16,7 @@ from hello_agents.core.config import Config as HelloAgentsConfig
 from hello_agents.tools import ToolRegistry
 
 from backend.config.config import settings
-from backend.agents.prompts.miner_prompt_v2 import get_miner_prompt, format_miner_user_prompt
+from backend.agents.prompts.miner_prompt import get_miner_prompt, format_miner_user_prompt
 from backend.tools.miner_tools import OcrImagesTool, MarkUnrelatedTool
 from backend.agents.two_stage_miner_agent import TwoStageExtractor
 
@@ -116,7 +116,7 @@ class MinerAgentV3(ReActAgent):
             name="Miner Agent V3",
             llm=llm,
             tool_registry=registry,
-            system_prompt=get_miner_prompt(),  # 使用精简版 Prompt（包含 Few-shot）
+            system_prompt=get_miner_prompt(),  # 使用 miner_prompt（含 Few-shot 示例）
             max_steps=max_steps,
             config=_agent_config,
         )

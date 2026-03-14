@@ -24,6 +24,7 @@ def _get_warmup_targets():
     """
     从 config 读取各 agent 实际使用的 (base_url, model) 组合，去重。
     每个 agent 有独立的 mode/base_url/model，只预热本地（localhost/127.0.0.1）的模型。
+    two_stage 模式下 Miner Stage1 用 miner_local_model，需单独加入。
     """
     try:
         from backend.config.config import settings
@@ -35,6 +36,9 @@ def _get_warmup_targets():
             # Interviewer（面试官）
             (settings.interviewer_base_url, settings.interviewer_model),
         ]
+        # two_stage 模式下 Stage1 用 miner_local_model，需单独加入（miner_model 此时为远程）
+        if settings.miner_mode == "two_stage" and settings.miner_local_model and settings.miner_local_base_url:
+            candidates.append((settings.miner_local_base_url, settings.miner_local_model))
         seen = set()
         out = []
         for base_url, model in candidates:

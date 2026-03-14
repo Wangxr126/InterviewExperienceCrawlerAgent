@@ -479,9 +479,11 @@ async def startup_event():
     crawl_scheduler.start()
     logger.info("爬虫调度器已启动")
 
-    # 同步预热 LLM + Embedding + Reranker，确保首次请求不因冷启动超时
+    # 同步预热 LLM，确保首次请求不因冷启动超时
     if _s.llm_warmup_enabled and _s.llm_base_url:
         await asyncio.to_thread(_warmup_llm_sync)
+    # Embedding/Reranker/OCR 预热（仅题目提取可关闭以加快启动）
+    if _s.warmup_embedding_rerank_ocr_enabled:
         await asyncio.to_thread(_warmup_embedding_rerank_sync)
 
 
@@ -2267,7 +2269,7 @@ async def clear_all_crawl_data():
 
         deleted_questions += sqlite_service.delete_by_source_url(url)
 
-    # 清理可能残留的 crawl_tasks / crawl_logs（delete_by_source_url 已删，此处兜底）
+    # 清理可能残留的 crawl_tasks / crawl_logs / ingestion_logs（delete_by_source_url 已删，此处兜底）
 
     with sqlite3.connect(sqlite_service.db_path) as conn:
 
@@ -2275,9 +2277,19 @@ async def clear_all_crawl_data():
 
         conn.execute("DELETE FROM crawl_logs")
 
-        # 兜底：删除所有来源为牛客/小红书的题目（crawl_tasks 为空时上面循环不会删题）
+        # 兜底：删除 ingestion_logs 中牛客/小红书题目的关联（避免孤儿记录）
 
-        # 同步删除 Neo4j 题库中的对应题目
+        conn.execute("""
+
+            DELETE FROM ingestion_logs WHERE question_id IN (
+
+                SELECT q_id FROM questions WHERE source_platform IN ('nowcoder', 'xiaohongshu')
+
+            )
+
+        """)
+
+        # 兜底：删除所有来源为牛客/小红书的题目（crawl_tasks 为空时上面循环不会删题）
 
         try:
 

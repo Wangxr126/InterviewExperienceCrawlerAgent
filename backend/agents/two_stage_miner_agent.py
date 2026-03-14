@@ -1,7 +1,7 @@
 """
 两阶段提取 Agent
-- Stage 1：使用 miner_prompt.py 的输入和输出（与单阶段 Miner 完全一致）
-- Stage 2：豆包 API，仅将题目整理为 FAQ 格式，输出格式由 Stage2OutputSchema 定义
+- Stage 1：使用 miner_prompt.py（原始 Prompt，含内嵌 Few-shot + verify_extraction_count）
+- Stage 2：豆包 API，使用 two_stage_prompts.py 精加工
 - 保存两阶段结果用于后续本地模型微调
 """
 import json
@@ -16,7 +16,7 @@ from hello_agents.core.config import Config as HelloAgentsConfig
 from hello_agents.tools import ToolRegistry
 
 from backend.config.config import settings
-from backend.tools.miner_tools import OcrImagesTool, MarkUnrelatedTool
+from backend.tools.miner_tools import OcrImagesTool, MarkUnrelatedTool, VerifyExtractionCountTool
 from backend.agents.prompts.miner_prompt import get_miner_prompt, format_miner_user_prompt
 from backend.agents.prompts.two_stage_prompts import (
     ENRICH_SYSTEM_PROMPT,
@@ -49,6 +49,7 @@ class TwoStageExtractor:
         registry = ToolRegistry()
         registry.register_tool(OcrImagesTool(image_paths=self._image_paths, task_id=self._task_id))
         registry.register_tool(MarkUnrelatedTool())
+        registry.register_tool(VerifyExtractionCountTool())
 
         _data_dir = str(settings.backend_data_dir / "memory")
         _skills_dir = str(settings.backend_data_dir.parent.parent / ".claude" / "skills")
@@ -107,6 +108,9 @@ class TwoStageExtractor:
         """
         # ========== Stage 1：粗提取（本地） ==========
         logger.info("[TwoStageExtractor] 开始 Stage 1：粗提取（本地）")
+        logger.info(
+            "[TwoStageExtractor] 预计 2-5 分钟（OCR ~1 分钟 + 模型生成 1-3 分钟），请勿中断"
+        )
 
         user_input = format_miner_user_prompt(
             content=content,
@@ -134,9 +138,18 @@ class TwoStageExtractor:
 
             rough_result = self._repair_json(rough_result)
             try:
-                rough_questions = json.loads(rough_result)
+                parsed = json.loads(rough_result)
+                if not isinstance(parsed, list):
+                    logger.warning(
+                        "[TwoStageExtractor] Stage 1 解析结果非题目列表（可能是工具调用 JSON），已忽略"
+                    )
+                    return "", self._ocr_called, False
+                rough_questions = parsed
             except json.JSONDecodeError as je:
                 rough_questions = self._parse_json_fallback(rough_result)
+                if not rough_questions:
+                    # 兜底：模型输出 Markdown 而非 JSON 时，尝试从 Markdown 提取题目
+                    rough_questions = self._parse_markdown_to_questions(rough_result)
                 if not rough_questions:
                     raise je
             logger.info(f"[TwoStageExtractor] Stage 1 完成，提取到 {len(rough_questions)} 道题")
@@ -150,7 +163,9 @@ class TwoStageExtractor:
 
         try:
             questions_text = "\n".join(
-                f"{i+1}. {q.get('question_text', '')}" for i, q in enumerate(rough_questions)
+                f"{i+1}. {q.get('question_text', '')}"
+                for i, q in enumerate(rough_questions)
+                if isinstance(q, dict)
             )
             enrich_input = ENRICH_USER_PROMPT_TEMPLATE.format(questions_text=questions_text)
 
@@ -195,9 +210,15 @@ class TwoStageExtractor:
             stage2_list = json.loads(enrich_result)
             if not isinstance(stage2_list, list):
                 return enrich_result
-            stage1_by_qt = {q.get("question_text", ""): q for q in rough_questions}
+            stage1_by_qt = {
+                (q.get("question_text", "") if isinstance(q, dict) else ""): q
+                for q in rough_questions
+                if isinstance(q, dict)
+            }
             merged = []
             for item in stage2_list:
+                if not isinstance(item, dict):
+                    continue
                 qt = item.get("question_text", "")
                 s1 = stage1_by_qt.get(qt, {})
                 merged.append({
@@ -357,6 +378,138 @@ class TwoStageExtractor:
                     return
         except Exception as e:
             logger.debug(f"[TwoStageExtractor] 无法从工具计数追踪 OCR: {e}")
+
+    @staticmethod
+    def _parse_markdown_to_questions(text: str) -> list:
+        """兜底：模型输出 Markdown 而非调用 Finish 时，从 Markdown 中提取题目列表"""
+        import re
+
+        # 分类标题黑名单（如 1. 项目经验类、2. 高级系统设计类），避免误提
+        SECTION_HEADER_SUFFIXES = ("类", "题", "类问题", "问题")
+        SECTION_HEADER_WHITELIST = (
+            "项目经验类", "高级系统设计类", "数据库事务类", "数据库索引类",
+            "网络协议类", "手撕编程题", "结构化面试问题列表", "字节后端开发实习二面问题",
+        )
+
+        def _is_section_header(qt: str) -> bool:
+            qt = qt.strip()
+            if len(qt) < 2 or len(qt) > 25:
+                return False
+            # XXX类、XXX题 结尾
+            if qt.endswith(SECTION_HEADER_SUFFIXES) and len(qt) <= 12:
+                return True
+            if qt in SECTION_HEADER_WHITELIST:
+                return True
+            # 共N题、共22题 等
+            if re.match(r"^共\d+[题道]?$", qt):
+                return True
+            return False
+
+        def _make_item(qt: str) -> dict:
+            qt = qt.strip()
+            if len(qt) < 2 or _is_section_header(qt):
+                return None
+            return {
+                "question_text": qt,
+                "answer_text": f"（待补充）{qt[:50]}...",
+                "difficulty": "medium",
+                "question_type": "基础类",
+                "topic_tags": [],
+                "company": "",
+                "position": "",
+            }
+
+        skip_patterns = (
+            r"^#+\s",  # 标题
+            r"^来自",  # 来自华为备忘录
+            r"^NOTE\s*$",
+            r"^字节\S*$",  # 纯「字节xxx」短行（如字节二面）
+            r"^实习\S*$",
+            r"^面经\s*$",
+            r"^\*\*注\*\*",
+            r"^>",
+            r"^\*\*\d+[\.、]\s*[\u4e00-\u9fa5]+[类题]\s*\*\*",  # **1. 项目经验类** 等
+            r"^\*\*[一二三四五六七八九十\d]+[\.、]",  # **一、**二、**1. 等小节标题
+            r"^[\u4e00-\u9fa5]+[类题]\s*$",  # 纯「XXX类」「XXX题」短行
+        )
+        results = []
+        seen = set()  # 去重：question_text 规范化后
+        lines = text.split("\n")
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # ### 1. 题目 格式（豆包等模型常用，需在 skip 前处理）
+            m = re.match(r"^#+\s*(\d+)[\.、]\s*(.+)$", stripped)
+            if m:
+                qt = m.group(2).strip().rstrip("。？?")
+                if len(qt) >= 3:
+                    item = _make_item(qt)
+                    if item:
+                        key = qt[:80]
+                        if key not in seen:
+                            seen.add(key)
+                            results.append(item)
+                continue
+            if any(re.match(p, stripped, re.I) for p in skip_patterns):
+                continue
+            # 1. 题目 或 9. 题目 或 10. 题目（排除 **1. 项目经验类** 等分类标题）
+            m = re.match(r"^\s*(\d+)[\.、]\s*(.+)$", stripped)
+            if m:
+                qt = m.group(2).strip().rstrip("。？?")
+                if len(qt) >= 3:
+                    item = _make_item(qt)
+                    if item:
+                        key = qt[:80]  # 去重键
+                        if key not in seen:
+                            seen.add(key)
+                            results.append(item)
+                continue
+            # - **题目**：描述 或 * **题目**：描述
+            m = re.match(r"^\s*[-*]\s*\*\*(.+?)\*\*[：:]\s*(.+)$", stripped)
+            if m:
+                title = m.group(1).strip()
+                desc = m.group(2).strip()
+                qt = f"{title}：{desc}" if desc else title
+                if len(qt) >= 3:
+                    item = _make_item(qt)
+                    if item:
+                        key = qt[:80]
+                        if key not in seen:
+                            seen.add(key)
+                            results.append(item)
+                continue
+            # 手撕：xxx
+            m = re.match(r"^手撕[：:]\s*(.+)$", stripped)
+            if m:
+                qt = m.group(1).strip()
+                if len(qt) >= 5:
+                    item = _make_item(qt)
+                    if item:
+                        key = qt[:80]
+                        if key not in seen:
+                            seen.add(key)
+                            results.append(item)
+                continue
+            # - 纯文本题目（无 **），需像问句
+            m = re.match(r"^\s*[-*]\s+(.+)$", stripped)
+            if m:
+                qt = m.group(1).strip().rstrip("。？?")
+                if len(qt) >= 5 and any(
+                    k in qt for k in ("?", "？", "什么", "如何", "为什么", "简述", "介绍", "说明", "项目")
+                ):
+                    item = _make_item(qt)
+                    if item:
+                        key = qt[:80]
+                        if key not in seen:
+                            seen.add(key)
+                            results.append(item)
+                continue
+
+        if results:
+            logger.info(f"[TwoStageExtractor] Markdown 兜底解析成功，提取到 {len(results)} 道题")
+        return results
 
     @staticmethod
     def _parse_json_fallback(text: str) -> list:
