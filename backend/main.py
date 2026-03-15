@@ -1998,92 +1998,99 @@ async def xhs_login(wait_seconds: int = Query(120, ge=30, le=300, description="�
 
 
 
+def _validate_batch_task_ids(task_ids: list) -> list:
+    """同步校验 task_ids，供 run_in_executor 调用"""
+    import sqlite3
+    ids = [tid for tid in (task_ids or [])[:50] if tid and isinstance(tid, str)]
+    if not ids:
+        return []
+    with sqlite3.connect(sqlite_service.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        valid_ids = []
+        for tid in ids:
+            row = conn.execute(
+                "SELECT task_id, length(raw_content) as clen FROM crawl_tasks WHERE task_id=?",
+                (tid,),
+            ).fetchone()
+            if row and (row["clen"] or 0) >= 50:
+                valid_ids.append(tid)
+    return valid_ids
+
+
 @app.post("/api/crawler/tasks/re-extract-batch")
 async def re_extract_batch_tasks(body: dict):
     """
-    对选中的多个任务批量重新执行 OCR + MinerAgent 提取，后台异步执行。
+    对选中的多个任务批量重新执行 OCR + MinerAgent 提取，子进程后台执行，不阻塞其他 API。
     请求体: { "task_ids": ["uuid1", "uuid2", ...] }
     """
-    import threading
-    import sqlite3
+    import subprocess
 
     task_ids = body.get("task_ids") or []
     if not isinstance(task_ids, list) or not task_ids:
         raise HTTPException(status_code=400, detail="请提供 task_ids 数组")
 
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        valid_ids = []
-        for tid in task_ids[:50]:  # 最多 50 条
-            if not tid or not isinstance(tid, str):
-                continue
-            row = conn.execute(
-                "SELECT task_id, post_title, length(raw_content) as clen FROM crawl_tasks WHERE task_id=?",
-                (tid,),
-            ).fetchone()
-            if row and (row["clen"] or 0) >= 50:
-                valid_ids.append(tid)
+    loop = asyncio.get_event_loop()
+    valid_ids = await loop.run_in_executor(None, _validate_batch_task_ids, task_ids)
 
     if not valid_ids:
         raise HTTPException(status_code=400, detail="没有符合条件的任务（正文需≥50字）")
 
-    def _bg():
-        from backend.services.scheduling.scheduler import process_single_task
-        for tid in valid_ids:
-            try:
-                process_single_task(tid)
-            except Exception as e:
-                logger.error(f"[API] 批量提取异常 task_id={tid}: {e}")
-
-    t = threading.Thread(target=_bg, daemon=True)
-    t.start()
-    logger.info(f"[API] 批量重新提取已启动，共 {len(valid_ids)} 条")
+    # 子进程执行，与主进程完全隔离，不阻塞 loadTasks/loadStats/提交作答等
+    cmd = [sys.executable, "-m", "backend.services.scheduling.batch_extract_worker"] + valid_ids
+    _popen_kw = {"env": os.environ, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if sys.platform != "win32":
+        _popen_kw["start_new_session"] = True
+    subprocess.Popen(cmd, **_popen_kw)
+    logger.info(f"[API] 批量重新提取已启动（子进程），共 {len(valid_ids)} 条")
     return {"status": "ok", "message": f"已提交 {len(valid_ids)} 条，后台执行中", "count": len(valid_ids)}
+
+
+def _validate_single_task_id(task_id: str) -> tuple:
+    """同步校验单任务，供 run_in_executor 调用，返回 (row_dict, error_msg)"""
+    import sqlite3
+    with sqlite3.connect(sqlite_service.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT task_id, status, post_title, length(raw_content) as clen FROM crawl_tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+    if not row:
+        return None, "task_id 不存在"
+    row = dict(row)
+    if (row.get("clen") or 0) < 50:
+        return row, f"任务正文为空或过短（{row.get('clen', 0)}字），请先抓取正文"
+    return row, None
 
 
 @app.post("/api/crawler/tasks/{task_id}/re-extract")
 async def re_extract_single_task(task_id: str):
     """
-    对单个任务重新执行完整的 OCR + MinerAgent 提取流程（异步后台执行）。
+    对单个任务重新执行完整的 OCR + MinerAgent 提取流程（子进程后台执行）。
 
     适用场景：
     - 任务状态为 error/fetched/done，需重新提取
     - 帖子包含图片，想验证 OCR 效果
     - 调试单条任务的提取结果
 
-    立即返回，提取在后台线程执行，不阻塞其他 API（如提交作答、题库浏览）。
+    立即返回，提取在子进程中执行，不阻塞其他 API（如提交作答、题库浏览）。
     """
-    import threading
-    import sqlite3
+    import subprocess
 
-    # 校验 task_id 存在
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT task_id, status, post_title, length(raw_content) as clen FROM crawl_tasks WHERE task_id=?",
-            (task_id,)
-        ).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail=f"task_id 不存在: {task_id}")
+    loop = asyncio.get_event_loop()
+    row, err = await loop.run_in_executor(None, _validate_single_task_id, task_id)
+    if err:
+        if "不存在" in err:
+            raise HTTPException(status_code=404, detail=f"task_id 不存在: {task_id}")
+        raise HTTPException(status_code=400, detail=err)
 
-    post_title = row["post_title"] or "(无标题)"
-    content_len = row["clen"] or 0
-    if content_len < 50:
-        raise HTTPException(status_code=400, detail=f"任务正文为空或过短（{content_len}字），请先抓取正文")
+    post_title = (row.get("post_title") or "(无标题)")[:40]
+    logger.info(f"[API] 单任务重新提取 task_id={task_id} title={post_title}...")
 
-    logger.info(f"[API] 单任务重新提取 task_id={task_id} title={post_title[:40]}...")
-
-    def _bg():
-        from backend.services.scheduling.scheduler import process_single_task
-        try:
-            result = process_single_task(task_id)
-            logger.info(f"[API] 单任务提取完成 task_id={task_id}: {result}")
-        except Exception as e:
-            logger.error(f"[API] 单任务提取异常 task_id={task_id}: {e}")
-
-    t = threading.Thread(target=_bg, daemon=True)
-    t.start()
-    # 立即返回，不等待，避免阻塞事件循环影响提交作答等用户操作
+    cmd = [sys.executable, "-m", "backend.services.scheduling.batch_extract_worker", task_id]
+    _popen_kw = {"env": os.environ, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if sys.platform != "win32":
+        _popen_kw["start_new_session"] = True
+    subprocess.Popen(cmd, **_popen_kw)
     return {
         "status": "ok",
         "task_id": task_id,
@@ -2505,7 +2512,7 @@ async def finetune_samples(
 
     page_size: int = Query(20, ge=1, le=100),
 
-    order: str = Query("asc", regex="^(asc|desc)$"),
+    order: str = Query("asc", pattern="^(asc|desc)$"),
 
 ):
 
@@ -2642,12 +2649,49 @@ async def finetune_label(body: dict):
 
 
 @app.post("/api/finetune/export")
-
 async def finetune_export():
-
     """将所有已标注样本导出为 微调/labeled_data.jsonl"""
-
     return _ft.export_labeled()
+
+
+@app.get("/api/finetune/run-config")
+async def finetune_get_run_config():
+    """获取一键微调配置"""
+    return _ft.get_run_config()
+
+
+@app.post("/api/finetune/run-config")
+async def finetune_save_run_config(body: dict):
+    """保存一键微调配置"""
+    return _ft.save_run_config(body)
+
+
+@app.post("/api/finetune/generate-training")
+async def finetune_generate_training(body: dict = None):
+    """根据配置生成训练脚本并转换数据"""
+    config = (body or {}).get("config") if body else None
+    return _ft.generate_training_script(config)
+
+
+@app.delete("/api/finetune/samples/{sample_id}")
+async def finetune_delete_sample(sample_id: int):
+    """删除指定微调样本"""
+    res = _ft.delete_sample(sample_id)
+    if res.get("deleted", 0) == 0:
+        raise HTTPException(status_code=404, detail="样本不存在")
+    return res
+
+
+@app.post("/api/finetune/delete-log")
+async def finetune_delete_log(body: dict):
+    """删除指定日志文件（仅限 微调/llm_logs/ 下）"""
+    log_path = body.get("log_path", "")
+    if not log_path:
+        raise HTTPException(status_code=400, detail="log_path 不能为空")
+    res = _ft.delete_log_file(log_path)
+    if res.get("status") == "error":
+        raise HTTPException(status_code=400, detail=res.get("message", "删除失败"))
+    return res
 
 
 @app.post("/api/finetune/preview-log")

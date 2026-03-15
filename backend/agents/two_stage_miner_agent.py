@@ -32,18 +32,22 @@ UNRELATED_SIGNAL = "__UNRELATED__"
 _JSON_RETRY_INSTRUCTION = """
 
 ## ⚠️ 重要纠错（上次输出不符合要求）
-你上次的输出不是合法的 JSON 格式（可能是 Markdown、解释性文字或带前缀/后缀）。
+你上次的输出不是合法的 JSON 格式（可能是 Markdown 包裹、解释性文字或带前缀/后缀）。
 请严格按照以下要求重新输出：
 - **必须是纯 JSON 数组**，直接以 `[` 开头、`]` 结尾
-- **严禁** Markdown 格式（如 ###、####、-、*、** 等）
-- **严禁** ```json 代码块包裹
+- **严禁**在 JSON 整体外使用 Markdown：禁止 ###、####、```json 代码块、Markdown 列表等包裹
 - **严禁** 任何解释、说明、总结、洞察等自然语言
-- 不管有多少道题（10道、30道、50道），都必须用 JSON 数组格式输出，禁止用 Markdown 列表
+- **仅 answer_text 字段内**允许 **加粗**、1.2.3. 分条、换行等格式
 - 直接输出题目列表，不要任何前缀或后缀
 """
 
 # 上次提取失败时的错误信息，供重试时注入 prompt
 _last_extraction_error: str | None = None
+
+def _is_quota_or_rate_limit_error(err: Exception) -> bool:
+    """判断是否为额度超限或限流错误，应切换备用模型"""
+    msg = (str(err) or "").lower()
+    return any(kw in msg for kw in ("429", "quota", "ratelimitexceeded", "quotaexceeded", "额度", "限流"))
 
 
 class TwoStageExtractor:
@@ -103,27 +107,12 @@ class TwoStageExtractor:
             config=_agent_config,
         )
 
-        # Stage 2：SimpleAgent（纯对话，无工具），豆包精加工
-        if settings.miner_stage2_base_url and settings.miner_stage2_model:
-            self.enrich_llm = HelloAgentsLLM(
-                model=settings.miner_stage2_model,
-                api_key=settings.miner_stage2_api_key or "sk-dummy",
-                base_url=settings.miner_stage2_base_url,
-                temperature=settings.miner_stage2_temperature,
-                timeout=settings.miner_stage2_timeout,
-                max_tokens=settings.miner_stage2_max_tokens,
-            )
-            self.enrich_agent = SimpleAgent(
-                name="Enrich Extractor",
-                llm=self.enrich_llm,
-                system_prompt=ENRICH_SYSTEM_PROMPT,
-            )
-        else:
-            self.enrich_agent = None
-
+        # Stage 2：模型列表（主 + 备用），额度超限时按序切换
+        self._stage2_models = settings.miner_stage2_models
+        _stage2_names = [m["model"] for m in self._stage2_models] if self._stage2_models else []
         logger.info(
             "[TwoStageExtractor] 初始化完成 "
-            f"stage1=local({settings.miner_local_model}) stage2=doubao({settings.miner_stage2_model})"
+            f"stage1=local({settings.miner_local_model}) stage2={_stage2_names or '未配置'}"
         )
 
     def extract(
@@ -240,45 +229,71 @@ class TwoStageExtractor:
                     q["raw_answer"] = q.get("answer_text", "")
             return json.dumps(rough_questions, ensure_ascii=False), self._ocr_called, False
 
-        # ========== Stage 2：精加工（SimpleAgent，豆包 API） ==========
-        if not self.enrich_agent:
+        # ========== Stage 2：精加工（多模型回退，额度超限时切换） ==========
+        if not self._stage2_models:
             logger.info("[TwoStageExtractor] 未配置 Stage 2，直接返回 Stage 1 结果")
             for q in rough_questions:
                 if isinstance(q, dict):
                     q["raw_answer"] = q.get("answer_text", "")
             return json.dumps(rough_questions, ensure_ascii=False), self._ocr_called, False
 
-        logger.info("[TwoStageExtractor] 开始 Stage 2：精加工 model=%s", settings.miner_stage2_model)
-        try:
-            questions_text = "\n".join(
-                f"{i+1}. {q.get('question_text', '')}"
-                for i, q in enumerate(valid_questions)
-            )
-            enrich_input = ENRICH_USER_PROMPT_TEMPLATE.format(questions_text=questions_text)
-            enrich_result = self.enrich_agent.run(enrich_input)
-            enrich_result = (enrich_result or "").strip()
+        questions_text = "\n".join(
+            f"{i+1}. {q.get('question_text', '')}"
+            for i, q in enumerate(valid_questions)
+        )
+        enrich_input = ENRICH_USER_PROMPT_TEMPLATE.format(questions_text=questions_text)
+        last_error: Exception | None = None
 
-            if enrich_result:
-                _preview = enrich_result 
-                logger.info("[TwoStageExtractor] Stage 2 豆包原始结果:\n%s", _preview)
-                enrich_result = self._strip_think_tags(enrich_result)
-                enrich_result = self._extract_json_if_direct_reply(enrich_result)
-
-                # 合并 Stage 2 的 answer_text 与 Stage 1 的元数据（下游需要完整 7 字段）
-                enrich_result = self._merge_stage2_with_stage1(enrich_result, valid_questions)
-
-                # 保存两阶段对比数据（用于微调）
-                self._save_two_stage_log(
-                    content=content,
-                    stage1_output=rough_result,
-                    stage2_output=enrich_result,
+        for idx, cfg in enumerate(self._stage2_models):
+            model_name = cfg["model"]
+            logger.info("[TwoStageExtractor] 开始 Stage 2：精加工 model=%s (%d/%d)", model_name, idx + 1, len(self._stage2_models))
+            try:
+                enrich_llm = HelloAgentsLLM(
+                    model=cfg["model"],
+                    api_key=cfg["api_key"],
+                    base_url=cfg["base_url"],
+                    temperature=settings.miner_stage2_temperature,
+                    timeout=settings.miner_stage2_timeout,
+                    max_tokens=settings.miner_stage2_max_tokens,
                 )
+                enrich_agent = SimpleAgent(
+                    name="Enrich Extractor",
+                    llm=enrich_llm,
+                    system_prompt=ENRICH_SYSTEM_PROMPT,
+                )
+                enrich_result = enrich_agent.run(enrich_input)
+                enrich_result = (enrich_result or "").strip()
 
-                logger.info("[TwoStageExtractor] Stage 2 完成，输出长度: %d", len(enrich_result))
-                return enrich_result, self._ocr_called, False
+                if enrich_result:
+                    _preview = enrich_result
+                    logger.info("[TwoStageExtractor] Stage 2 豆包原始结果:\n%s", _preview)
+                    enrich_result = self._strip_think_tags(enrich_result)
+                    enrich_result = self._extract_json_if_direct_reply(enrich_result)
 
-        except Exception as e:
-            logger.error(f"[TwoStageExtractor] Stage 2 异常: {e}，降级返回 Stage 1 结果")
+                    # 合并 Stage 2 的 answer_text 与 Stage 1 的元数据（下游需要完整 7 字段）
+                    enrich_result = self._merge_stage2_with_stage1(enrich_result, valid_questions)
+
+                    # 保存两阶段对比数据（用于微调）
+                    self._save_two_stage_log(
+                        content=content,
+                        stage1_output=rough_result,
+                        stage2_output=enrich_result,
+                        stage2_model_used=model_name,
+                    )
+
+                    logger.info("[TwoStageExtractor] Stage 2 完成 model=%s，输出长度: %d", model_name, len(enrich_result))
+                    return enrich_result, self._ocr_called, False
+
+            except Exception as e:
+                last_error = e
+                if _is_quota_or_rate_limit_error(e) and idx + 1 < len(self._stage2_models):
+                    logger.warning("[TwoStageExtractor] Stage 2 model=%s 额度/限流: %s，切换备用模型", model_name, e)
+                else:
+                    logger.error("[TwoStageExtractor] Stage 2 model=%s 异常: %s", model_name, e)
+                    break
+
+        if last_error:
+            logger.error("[TwoStageExtractor] Stage 2 全部模型失败，降级返回 Stage 1 结果: %s", last_error)
 
         # 降级：返回 Stage 1 结果，补充 raw_answer（与 answer_text 相同）
         try:
@@ -329,6 +344,7 @@ class TwoStageExtractor:
         content: str,
         stage1_output: str,
         stage2_output: str,
+        stage2_model_used: str = "",
     ) -> None:
         """保存两阶段结果，用于后续本地模型微调（Stage1 vs Stage2 对比）"""
         log_path = settings.miner_two_stage_log_path
@@ -344,7 +360,7 @@ class TwoStageExtractor:
                 "stage1_output": stage1_output,
                 "stage2_output": stage2_output,
                 "stage1_model": settings.miner_local_model,
-                "stage2_model": settings.miner_stage2_model,
+                "stage2_model": stage2_model_used or settings.miner_stage2_model,
             }
 
             with open(log_path, "a", encoding="utf-8") as f:

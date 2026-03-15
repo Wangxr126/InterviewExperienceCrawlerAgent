@@ -3,8 +3,10 @@
 所有值均来自 .env 文件（项目根目录），不在此处硬编码。
 修改配置请直接编辑 /.env 文件。
 """
+import json
 import os
 from pathlib import Path
+from typing import List, Dict, Any
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -480,6 +482,41 @@ class _Settings:
     def miner_stage2_max_tokens(self) -> int:
         """Stage 2 精加工最大输出 token，默认 65536 避免长答案被截断导致 JSON 解析失败"""
         return _get_int("MINER_STAGE2_MAX_TOKENS", 0) or 65536
+
+    @property
+    def miner_stage2_models(self) -> List[Dict[str, Any]]:
+        """Stage 2 模型列表（含主模型 + 备用），额度超限时按序切换。
+        主模型来自 MINER_STAGE2_MODEL/API_KEY/BASE_URL；
+        备用来自 MINER_STAGE2_FALLBACK_MODELS（JSON 数组），如：
+        [{"model":"doubao-pro-32k","api_key":"xxx"},{"model":"xxx","api_key":"yyy","base_url":"https://..."}]
+        base_url 可省略，默认用主配置的 BASE_URL。
+        """
+        primary_model = self.miner_stage2_model
+        primary_key = self.miner_stage2_api_key
+        primary_base = self.miner_stage2_base_url
+        if not primary_model or not primary_base:
+            return []
+        result: List[Dict[str, Any]] = [
+            {"model": primary_model, "api_key": primary_key or "sk-dummy", "base_url": primary_base}
+        ]
+        raw = _get("MINER_STAGE2_FALLBACK_MODELS", "").strip()
+        if not raw:
+            return result
+        try:
+            fallbacks = json.loads(raw)
+            if not isinstance(fallbacks, list):
+                return result
+            for item in fallbacks:
+                if not isinstance(item, dict) or not item.get("model"):
+                    continue
+                result.append({
+                    "model": str(item["model"]),
+                    "api_key": str(item.get("api_key") or primary_key or "sk-dummy"),
+                    "base_url": str(item.get("base_url") or primary_base),
+                })
+        except json.JSONDecodeError:
+            pass
+        return result
 
     @property
     def extract_retries_on_failure(self) -> int:

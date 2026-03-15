@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]  # backend/services/finetune -> 项目根
 _FINETUNE_DIR = _PROJECT_ROOT / "微调"
 _LABELED_PATH = _FINETUNE_DIR / "labeled_data.jsonl"
+_RUN_CONFIG_PATH = _FINETUNE_DIR / "finetune_run_config.json"
 
 # 辅助大模型使用的系统提示词（与 question_extractor 一致，但更严格要求完整题目）
 _ASSIST_SYSTEM_PROMPT = """你是面经结构化专家，从面经原文中精准提取所有面试题，输出严格的 JSON 数组。
@@ -261,7 +262,28 @@ def list_log_files() -> List[Dict]:
     others = [r for r in result if "miner_two_stage" not in r.get("filename", "")]
     others.sort(key=lambda r: r.get("mtime", ""), reverse=True)
     return miners + others
-    return result
+
+
+def delete_log_file(log_path: str) -> Dict:
+    """删除指定日志文件，仅允许删除 微调/llm_logs/ 下的文件"""
+    log_root = _FINETUNE_DIR / "llm_logs"
+    p = Path(log_path).resolve()
+    try:
+        root_resolved = log_root.resolve()
+        try:
+            p.relative_to(root_resolved)
+        except ValueError:
+            return {"status": "error", "message": "只能删除微调/llm_logs/下的文件"}
+        if not p.exists():
+            return {"status": "error", "message": "文件不存在"}
+        if not p.is_file():
+            return {"status": "error", "message": "路径不是文件"}
+        p.unlink()
+        logger.info("已删除日志文件: %s", p.name)
+        return {"status": "ok", "message": f"已删除 {p.name}"}
+    except Exception as e:
+        logger.warning("删除日志文件失败: %s", e)
+        return {"status": "error", "message": str(e)}
 
 
 # ===========================================================
@@ -372,6 +394,14 @@ def save_assist_output(sample_id: int, assist_output: str) -> Dict:
         )
         conn.commit()
     return {"status": "ok"}
+
+
+def delete_sample(sample_id: int) -> Dict:
+    """删除指定微调样本"""
+    with _get_db_conn() as conn:
+        cur = conn.execute("DELETE FROM finetune_samples WHERE id=?", (sample_id,))
+        conn.commit()
+        return {"status": "ok", "deleted": cur.rowcount}
 
 
 def export_labeled(output_path: str = None) -> Dict:
@@ -705,4 +735,218 @@ def import_faq(
         "bank_saved": bank_saved,
         "finetune_saved": finetune_saved,
         "errors": errors[:10],
+    }
+
+
+# ===========================================================
+# 一键微调：配置保存 + 训练脚本生成（LoRA/QLoRA）
+# ===========================================================
+
+DEFAULT_RUN_CONFIG = {
+    "base_model": "qwen3:4b",
+    "method": "lora",
+    "output_name": "qwen3-4b-miner-lora",
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "lora_target_modules": "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+    "learning_rate": 2e-4,
+    "num_epochs": 3,
+    "per_device_train_batch_size": 2,
+    "gradient_accumulation_steps": 8,
+    "max_seq_length": 2048,
+    "warmup_ratio": 0.1,
+    "weight_decay": 0.01,
+    "use_rslora": True,
+    "precision": "bf16",
+}
+
+
+def get_run_config() -> Dict:
+    """获取当前微调运行配置"""
+    if _RUN_CONFIG_PATH.exists():
+        try:
+            data = json.loads(_RUN_CONFIG_PATH.read_text(encoding="utf-8"))
+            return {**DEFAULT_RUN_CONFIG, **data}
+        except Exception as e:
+            logger.warning("读取微调配置失败: %s", e)
+    return dict(DEFAULT_RUN_CONFIG)
+
+
+def save_run_config(config: Dict) -> Dict:
+    """保存微调运行配置"""
+    _FINETUNE_DIR.mkdir(parents=True, exist_ok=True)
+    allowed = set(DEFAULT_RUN_CONFIG.keys()) | {"lora_target_modules"}
+    merged = {**DEFAULT_RUN_CONFIG, **{k: v for k, v in config.items() if k in allowed}}
+    merged.pop("bf16", None)  # 兼容旧配置，不再保存 bf16
+    _RUN_CONFIG_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"status": "ok", "path": str(_RUN_CONFIG_PATH)}
+
+
+def _parse_lr(v) -> float:
+    """解析学习率，支持 2e-4 或 0.0002"""
+    if v is None:
+        return 2e-4
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return 2e-4
+
+
+def generate_training_script(config: Dict = None) -> Dict:
+    """
+    根据配置生成 Unsloth LoRA/QLoRA 训练脚本。
+    数据格式：将 labeled_data.jsonl (prompt/completion) 转为 instruction 格式。
+    """
+    cfg = {**DEFAULT_RUN_CONFIG, **(config or {})}
+    cfg["learning_rate"] = _parse_lr(cfg.get("learning_rate"))
+    _FINETUNE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. 转换数据格式：prompt/completion -> instruction/input/output (Alpaca)
+    converted_path = _FINETUNE_DIR / "training_data_alpaca.jsonl"
+    if not _LABELED_PATH.exists():
+        return {"status": "error", "message": "请先导出标注数据（微调/labeled_data.jsonl）"}
+    count = 0
+    with open(_LABELED_PATH, "r", encoding="utf-8") as fin:
+        with open(converted_path, "w", encoding="utf-8", newline="\n") as fout:
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    prompt = rec.get("prompt", "")
+                    completion = rec.get("completion", "")
+                    if not prompt or not completion:
+                        continue
+                    alpaca = {
+                        "instruction": "从面经原文中提取面试题，输出 JSON 数组，每项含 question_text、answer_text、difficulty、question_type、topic_tags 等字段。",
+                        "input": prompt,
+                        "output": completion,
+                    }
+                    fout.write(json.dumps(alpaca, ensure_ascii=False) + "\n")
+                    count += 1
+                except Exception:
+                    continue
+    if count == 0:
+        return {"status": "error", "message": "labeled_data.jsonl 无有效样本"}
+
+    # 2. 生成训练脚本
+    method = (cfg.get("method") or "lora").lower()
+    load_in_4bit = method == "qlora"
+    target_modules = [x.strip() for x in (cfg.get("lora_target_modules") or "").split(",") if x.strip()]
+    if not target_modules:
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    output_name = cfg.get("output_name") or "qwen3-4b-miner-lora"
+    output_dir = _FINETUNE_DIR / "lora_output" / output_name
+
+    base_model = (cfg.get("base_model") or "qwen3:4b").strip()
+    if base_model in ("qwen3:4b", "qwen3:4B"):
+        hf_model = "unsloth/Qwen3-4B"
+    else:
+        hf_model = base_model
+
+    script_content = f'''# -*- coding: utf-8 -*-
+# 一键微调脚本（Unsloth LoRA/QLoRA）
+# 生成时间: {now_beijing_str()}
+# 使用: pip install unsloth datasets trl transformers && python train_lora.py
+
+from unsloth import FastLanguageModel
+from datasets import load_dataset
+import torch
+
+# ========== 配置（来自微调界面） ==========
+# 基座模型：{base_model} -> {hf_model}
+BASE_MODEL = "{hf_model}"
+OUTPUT_DIR = "{output_dir}"
+DATA_PATH = "{converted_path}"
+LOAD_IN_4BIT = {str(load_in_4bit)}
+MAX_SEQ_LENGTH = {int(cfg.get("max_seq_length", 2048))}
+LORA_R = {int(cfg.get("lora_r", 16))}
+LORA_ALPHA = {int(cfg.get("lora_alpha", 32))}
+LORA_DROPOUT = {float(cfg.get("lora_dropout", 0.05))}
+LEARNING_RATE = {float(cfg.get("learning_rate", 2e-4))}
+NUM_EPOCHS = {int(cfg.get("num_epochs", 3))}
+BATCH_SIZE = {int(cfg.get("per_device_train_batch_size", 2))}
+GRAD_ACCUM = {int(cfg.get("gradient_accumulation_steps", 8))}
+WARMUP_RATIO = {float(cfg.get("warmup_ratio", 0.1))}
+WEIGHT_DECAY = {float(cfg.get("weight_decay", 0.01))}
+USE_RSLORA = {str(cfg.get("use_rslora", True))}
+# 训练精度: bf16/fp16/fp32，QLoRA 时 4bit 表示基座量化
+_prec = cfg.get("precision") or (cfg.get("bf16", True) if isinstance(cfg.get("bf16"), bool) else "bf16")
+BF16 = {str(_prec == "bf16" or _prec == "4bit")}
+FP16 = {str(_prec == "fp16")}
+
+def main():
+    print("加载模型...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=BASE_MODEL,
+        max_seq_length=MAX_SEQ_LENGTH,
+        load_in_4bit=LOAD_IN_4BIT,
+    )
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        target_modules={target_modules},
+        use_rslora=USE_RSLORA,
+    )
+    print("加载数据...")
+    dataset = load_dataset("json", data_files=str(DATA_PATH), split="train")
+    def format_instruction(example):
+        text = f"""<|im_start|>user
+{{example["instruction"]}}
+
+{{example["input"]}}<|im_end|>
+<|im_start|>assistant
+{{example["output"]}}<|im_end|>"""
+        return {{"text": text}}
+    dataset = dataset.map(format_instruction, remove_columns=dataset.column_names)
+    from trl import SFTTrainer
+    from transformers import TrainingArguments
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset,
+        dataset_text_field="text",
+        max_seq_length=MAX_SEQ_LENGTH,
+        dataset_num_proc=2,
+        packing=False,
+        args=TrainingArguments(
+            output_dir=str(OUTPUT_DIR),
+            per_device_train_batch_size=BATCH_SIZE,
+            gradient_accumulation_steps=GRAD_ACCUM,
+            learning_rate=LEARNING_RATE,
+            num_train_epochs=NUM_EPOCHS,
+            warmup_ratio=WARMUP_RATIO,
+            weight_decay=WEIGHT_DECAY,
+            bf16=BF16,
+            fp16=FP16,
+            logging_steps=10,
+            save_strategy="epoch",
+        ),
+    )
+    trainer.train()
+    model.save_pretrained(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
+    print(f"训练完成，模型已保存到 {{OUTPUT_DIR}}")
+
+if __name__ == "__main__":
+    main()
+'''
+
+    script_path = _FINETUNE_DIR / "train_lora.py"
+    script_path.write_text(script_content, encoding="utf-8")
+    logger.info("训练脚本已生成: %s", script_path)
+
+    return {
+        "status": "ok",
+        "script_path": str(script_path),
+        "data_path": str(converted_path),
+        "output_dir": str(output_dir),
+        "sample_count": count,
+        "message": f"已生成训练脚本，共 {count} 条样本。请执行: cd 微调 && python {script_path.name}",
     }

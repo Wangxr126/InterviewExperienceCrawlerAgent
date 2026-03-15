@@ -181,15 +181,19 @@ const handleSendToChat = () => {
                  margin-bottom: 8px; text-transform: uppercase; letter-spacing: .05em; }
 .ref-answer { font-size: 14px; line-height: 1.6; color: var(--text-sub);
               padding: 10px 12px; background: var(--bg); border-radius: 8px; }
-.ref-answer :deep(.answer-line) { margin-bottom: 8px; }
-.ref-answer :deep(.answer-line:last-child) { margin-bottom: 0; }
+.ref-answer :deep(p) { margin: 0 0 8px; }
+.ref-answer :deep(p:last-child) { margin-bottom: 0; }
+.ref-answer :deep(strong) { font-weight: 600; color: var(--text-sub); }
+.ref-answer :deep(ul), .ref-answer :deep(ol) { margin: 8px 0; padding-left: 1.5em; }
+.ref-answer :deep(li) { margin-bottom: 4px; }
 .eval-result { margin-top: 14px; padding: 14px; border-radius: 10px; }
 .eval-result.good { background: #f0fdf4; border: 1px solid #86efac; }
 .eval-result.bad  { background: #fef2f2; border: 1px solid #fca5a5; }
 .eval-score    { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
 .eval-feedback { font-size: 14px; line-height: 1.6; }
-.eval-feedback :deep(.answer-line) { margin-bottom: 6px; }
-.eval-feedback :deep(.answer-line:last-child) { margin-bottom: 0; }
+.eval-feedback :deep(p) { margin: 0 0 6px; }
+.eval-feedback :deep(p:last-child) { margin-bottom: 0; }
+.eval-feedback :deep(strong) { font-weight: 600; }
 .eval-missing  { margin-top: 8px; font-size: 13px; color: #dc2626; }
 .score-display { font-size: 18px; font-weight: 700; color: var(--primary); }
 .score-emoji   { font-size: 20px; margin-left: 4px; }
