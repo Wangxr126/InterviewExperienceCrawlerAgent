@@ -113,6 +113,21 @@ export function isStructuredQuestion(content) {
          content.includes('💡 难度：')
 }
 
+/** 评分反馈后处理：分数突出显示 + 答对/遗漏/错误图标着色 */
+function applyFeedbackStyles(html) {
+  if (!html || typeof html !== 'string') return html
+  let out = html
+  // 分数徽章：📝 评分：2/5 或 2.5/5 突出显示
+  out = out.replace(/(📝\s*评分[：:]\s*[\d.]+\/\d+)/g, '<span class="score-badge">$1</span>')
+  // 答对：绿色 ✓（兼容列表项内或段落内）
+  out = out.replace(/✓\s*答对[：:]/g, '<span class="icon-correct">✓</span> 答对：')
+  // 遗漏：橙色 ✗
+  out = out.replace(/✗\s*遗漏[：:]/g, '<span class="icon-missed">✗</span> 遗漏：')
+  // 错误：红色 ✗
+  out = out.replace(/✗\s*错误[：:]/g, '<span class="icon-error">✗</span> 错误：')
+  return out
+}
+
 /**
  * 增强的 Markdown 渲染
  * 如果是结构化题目，先提取结构再渲染
@@ -132,19 +147,21 @@ export function renderEnhancedContent(content, marked) {
     }
   }
   
+  let html
   if (isStructuredQuestion(content)) {
     const parsed = parseQuestionStructure(content)
     const cardHtml = renderQuestionCard(parsed)
     
     if (cardHtml) {
-      // 渲染卡片 + 原始 Markdown
-      const mdHtml = renderSync(content)
-      return cardHtml + '<div class="raw-content">' + mdHtml + '</div>'
+      html = cardHtml + '<div class="raw-content">' + renderSync(content) + '</div>'
+    } else {
+      html = renderSync(content)
     }
+  } else {
+    html = renderSync(content)
   }
   
-  // 普通内容，直接用 Markdown 渲染
-  return renderSync(content)
+  return applyFeedbackStyles(html)
 }
 
 /**

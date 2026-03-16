@@ -287,6 +287,11 @@ class _Settings:
         return _get_int("INTERVIEWER_MAX_TOKENS", 0) or self.llm_max_tokens
 
     @property
+    def interviewer_history_max_messages(self) -> int:
+        """注入 LLM 的对话历史最大条数，默认 20"""
+        return _get_int("INTERVIEWER_HISTORY_MAX_MESSAGES", 20)
+
+    @property
     def enable_smart_compression(self) -> bool:
         """是否启用智能摘要（需额外 LLM 调用），默认 False"""
         return _get_bool("ENABLE_SMART_COMPRESSION", False)
@@ -484,6 +489,21 @@ class _Settings:
         return _get_int("MINER_STAGE2_MAX_TOKENS", 0) or 65536
 
     @property
+    def miner_stage2_use_batch(self) -> bool:
+        """Stage 2 是否使用火山批量 API（批量推理有额外收费，默认单条）"""
+        return _get("MINER_STAGE2_USE_BATCH", "").lower() in ("1", "true", "yes")
+
+    @property
+    def miner_stage2_batch_size(self) -> int:
+        """Stage 2 队列触发批量处理的条数，达到即触发（默认 10）"""
+        return _get_int("MINER_STAGE2_BATCH_SIZE", 10)
+
+    @property
+    def miner_stage2_async_enabled(self) -> bool:
+        """是否启用 Stage1/Stage2 异步解耦（MQ 队列，达到 batch_size 触发），默认 True"""
+        return _get("MINER_STAGE2_ASYNC_ENABLED", "true").lower() in ("1", "true", "yes")
+
+    @property
     def miner_stage2_models(self) -> List[Dict[str, Any]]:
         """Stage 2 模型列表（含主模型 + 备用），额度超限时按序切换。
         主模型来自 MINER_STAGE2_MODEL/API_KEY/BASE_URL；
@@ -605,6 +625,47 @@ class _Settings:
     def retrieval_check_duplicate_threshold(self) -> float:
         """查重阈值（入库时，高于此视为重复）"""
         return _get_float("RETRIEVAL_CHECK_DUPLICATE_THRESHOLD", 0.92)
+
+    # ── 5.6 智能练习（知识点不足 + 随机，含遗忘曲线与 Reranker）────
+    @property
+    def smart_practice_knowledge_gap_count(self) -> int:
+        """智能练习：按知识点不足（薄弱点+到期复习）给出的题目数，默认 10"""
+        return _get_int("SMART_PRACTICE_KNOWLEDGE_GAP_COUNT", 10)
+
+    @property
+    def smart_practice_random_count(self) -> int:
+        """智能练习：随机补充题目数，默认 10"""
+        return _get_int("SMART_PRACTICE_RANDOM_COUNT", 10)
+
+    @property
+    def smart_practice_recall_ratio(self) -> float:
+        """智能练习：召回倍数，每路召回条数 = 最终条数 * 此值（如 3 表示要 10 条则先召回 30 条再 rerank）"""
+        return _get_float("SMART_PRACTICE_RECALL_RATIO", 3.0)
+
+    @property
+    def smart_practice_rerank_enabled(self) -> bool:
+        """智能练习：是否对知识点不足一路使用 Reranker 重排，默认 true"""
+        return _get_bool("SMART_PRACTICE_RERANK_ENABLED", True)
+
+    @property
+    def smart_practice_vector_weight(self) -> float:
+        """智能练习：薄弱点向量相似题权重（与 review 一起融合排序）"""
+        return _get_float("SMART_PRACTICE_VECTOR_WEIGHT", 0.35)
+
+    @property
+    def smart_practice_review_weight(self) -> float:
+        """智能练习：到期复习（遗忘曲线）权重"""
+        return _get_float("SMART_PRACTICE_REVIEW_WEIGHT", 0.45)
+
+    @property
+    def smart_practice_popular_weight(self) -> float:
+        """智能练习：热门/标签补充权重（可选，用于多路召回）"""
+        return _get_float("SMART_PRACTICE_POPULAR_WEIGHT", 0.2)
+
+    @property
+    def smart_practice_weak_tags_limit(self) -> int:
+        """智能练习：参与召回的薄弱标签数量上限，默认 5"""
+        return _get_int("SMART_PRACTICE_WEAK_TAGS_LIMIT", 5)
 
     # ── 6. Neo4j ──────────────────────────────────────────────────
     @property
@@ -831,9 +892,35 @@ class _Settings:
         return _get("DEFAULT_USER_ID", "Wangxr")
 
     @property
+    def default_session_id(self) -> str:
+        """默认会话 ID，前端未指定时使用（固定单会话时在 .env 配置）"""
+        return _get("DEFAULT_SESSION_ID", "sess_fixed")
+
+    @property
     def interviewer_max_steps(self) -> int:
         """Interviewer Agent 最大思考步数"""
         return _get_int("INTERVIEWER_MAX_STEPS", 8)
+
+    # ── 12. 题目推荐配置（GetRecommendedQuestionTool）──────────────
+    @property
+    def recommend_questions_count(self) -> int:
+        """一次推荐的题目数量，默认 5"""
+        return _get_int("RECOMMEND_QUESTIONS_COUNT", 5)
+
+    @property
+    def recommend_questions_json_format(self) -> bool:
+        """是否启用 JSON 格式化输出，默认 true"""
+        return _get_bool("RECOMMEND_QUESTIONS_JSON_FORMAT", True)
+
+    @property
+    def recommend_questions_show_detail(self) -> bool:
+        """是否显示题目详情（题目文本、难度、标签），默认 true"""
+        return _get_bool("RECOMMEND_QUESTIONS_SHOW_DETAIL", True)
+
+    @property
+    def recommend_questions_show_reason(self) -> bool:
+        """是否显示推荐理由，默认 true"""
+        return _get_bool("RECOMMEND_QUESTIONS_SHOW_REASON", True)
 
 
 # 全局单例（懒加载，main.py 中 load_dotenv 先于任何 import settings 执行）

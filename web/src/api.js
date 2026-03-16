@@ -42,6 +42,20 @@ export const api = {
     return r.json()
   },
 
+  /** 智能练习：知识点不足 N 条 + 随机 M 条（多路召回+Reranker+遗忘曲线），每批条数由后端 .env 配置 */
+  async getSmartPracticeQuestions(params = {}) {
+    const p = new URLSearchParams()
+    if (params.user_id) p.set('user_id', params.user_id)
+    if (params.limit != null) p.set('limit', String(params.limit))
+    if (params.company) p.set('company', params.company)
+    if (params.difficulty) p.set('difficulty', params.difficulty)
+    if (params.question_type) p.set('question_type', params.question_type)
+    if (params.tag) p.set('tag', params.tag)
+    if (params.source_platform) p.set('source_platform', params.source_platform)
+    const r = await fetch(`${BASE}/api/questions/smart-practice?${p}`)
+    return r.json()
+  },
+
   // ── 答题 ──────────────────────────────────────────────
   async submitAnswer(payload) {
     const r = await fetch(`${BASE}/api/submit_answer`, {
@@ -54,7 +68,17 @@ export const api = {
       const msg = data?.detail || (typeof data?.detail === 'string' ? data.detail : JSON.stringify(data))
       throw new Error(msg)
     }
-    return data
+    return data  // 返回 {task_id, status: "evaluating", message}
+  },
+
+  async getSubmitAnswerStatus(taskId) {
+    const r = await fetch(`${BASE}/api/submit_answer/status/${taskId}`)
+    const data = await r.json()
+    if (!r.ok) {
+      const msg = data?.detail || JSON.stringify(data)
+      throw new Error(msg)
+    }
+    return data  // 返回 {task_id, status, result/error}
   },
 
   // ── 对话（普通，用于兜底）──────────────────────────────
@@ -85,6 +109,20 @@ export const api = {
   // ── 用户掌握度 ────────────────────────────────────────
   async getMastery(userId) {
     const r = await fetch(`${BASE}/api/user/${userId}/mastery`)
+    return r.json()
+  },
+
+  async getPracticeStats(userId) {
+    const r = await fetch(`${BASE}/api/user/${userId}/practice-stats`)
+    return r.json()
+  },
+
+  /** 某用户对某题的历史作答记录（得分、回答、遗漏点/答对要点） */
+  async getQuestionStudyRecords(userId, questionId, limit = 20) {
+    const p = new URLSearchParams()
+    if (limit != null) p.set('limit', String(limit))
+    const q = p.toString()
+    const r = await fetch(`${BASE}/api/user/${userId}/questions/${questionId}/study-records${q ? '?' + q : ''}`)
     return r.json()
   },
 

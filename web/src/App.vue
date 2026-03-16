@@ -102,7 +102,8 @@ const loadConfig = async () => {
       userId.value = d.default_user_id
     }
   } catch (e) { console.warn('加载配置失败', e) }
-  if (!userId.value) userId.value = 'user_001'
+  // 与后端 default_user_id 默认值一致（如 Wangxr），避免出现 user_001
+  if (!userId.value) userId.value = 'Wangxr'
 }
 
 // 提交作答：跳转 chat，屏幕只展示题目+作答，完整信息（q_id、公司、难度、标签等）发给 AI
@@ -124,9 +125,14 @@ const onSubmitComplete = ({ question, userAnswer }) => {
 
   currentView.value = 'chat'
   nextTick(() => {
-    setTimeout(() => {
-      chatViewRef.value?.prefillAndSend({ display: displayMsg, api: apiMsg })
-    }, 200)
+    const tryPrefill = () => {
+      if (!chatViewRef.value) {
+        ElMessage.error('对话组件未就绪，请稍后再试')
+        return
+      }
+      chatViewRef.value.prefillAndSend({ display: displayMsg, api: apiMsg })
+    }
+    setTimeout(tryPrefill, 200)
   })
 }
 
@@ -197,8 +203,8 @@ body {
 .topbar {
   background: var(--card-bg);
   border-bottom: 1px solid var(--border);
-  padding: 0 28px;
-  height: 60px;
+  padding: 0 18px;
+  height: 50px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -225,17 +231,17 @@ body {
 
 /* 侧边导航 */
 .sidebar {
-  width: 160px; flex-shrink: 0;
+  width: 140px; flex-shrink: 0;
   background: var(--card-bg);
   border-right: 1px solid var(--border);
-  padding: 16px 0;
-  display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 0;
+  display: flex; flex-direction: column; gap: 2px;
 }
 .nav-item {
-  display: flex; align-items: center; gap: 10px;
-  padding: 10px 18px; cursor: pointer;
-  border-radius: 8px; margin: 0 8px;
-  font-size: 14px; color: var(--text-sub);
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; cursor: pointer;
+  border-radius: 7px; margin: 0 6px;
+  font-size: 13px; color: var(--text-sub);
   transition: all .15s;
 }
 .nav-item:hover { background: var(--primary-light); color: var(--primary); }
@@ -243,15 +249,15 @@ body {
 .nav-icon { font-size: 16px; }
 
 /* 内容区 */
-.content { flex: 1; overflow-y: auto; padding: 24px; min-height: 0; }
+.content { flex: 1; overflow-y: auto; padding: 10px 14px; min-height: 0; }
 
 /* 卡片 */
 .card {
   background: var(--card-bg);
   border-radius: var(--radius);
-  padding: 24px;
+  padding: 14px 16px;
   box-shadow: var(--shadow);
-  margin-bottom: 20px;
+  margin-bottom: 10px;
 }
-.card-title { font-size: 17px; font-weight: 600; margin-bottom: 18px; color: var(--text-main); }
+.card-title { font-size: 15px; font-weight: 600; margin-bottom: 10px; color: var(--text-main); }
 </style>

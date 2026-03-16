@@ -55,32 +55,6 @@
         </div>
       </div>
 
-      <!-- 薄弱知识点 - 简洁列表 + 关联推荐 -->
-      <div v-if="weakTagsWithRelated.length" class="section">
-        <div class="section-title">
-          <span class="title-icon">⚠️</span>
-          <span>需要加强的知识点</span>
-          <span class="title-badge">{{ weakTags.length }}</span>
-        </div>
-        <div class="weak-knowledge-list">
-          <div v-for="item in weakTagsWithRelated" :key="item.tag" class="weak-item">
-            <div class="weak-main">
-              <span class="weak-label">薄弱点：</span>
-              <el-tag type="danger" size="default" @click="$emit('quick-recommend', [item.tag])" style="cursor:pointer">
-                {{ item.tag }}
-              </el-tag>
-            </div>
-            <div v-if="item.related.length" class="weak-related">
-              <span class="related-label">关联拓展：</span>
-              <el-tag v-for="r in item.related" :key="r" type="info" size="small" 
-                      @click="$emit('quick-recommend', [r])" style="cursor:pointer;margin-right:6px">
-                {{ r }}
-              </el-tag>
-            </div>
-          </div>
-        </div>
-      </div>
-
       <!-- 最近答题记录（含 LLM 评估建议） -->
       <div v-if="data.recent_history?.length" class="section">
         <div class="section-title">📝 最近答题</div>
@@ -112,15 +86,18 @@
         </div>
       </div>
 
-      <!-- 用户自述的混淆/遗漏点（record_weakness 工具记录） -->
-      <div v-if="data.weakness_notes?.length" class="section">
+      <!-- 用户自述的混淆/遗漏点（record_weakness + submit_answer 自动记录） -->
+      <div class="section">
         <div class="section-title">📌 我记录的薄弱点</div>
-        <div class="weakness-notes-list">
+        <div v-if="data.weakness_notes?.length" class="weakness-notes-list">
           <div v-for="(n, i) in data.weakness_notes" :key="i" class="weakness-note">
             <span class="note-type">{{ n.event_type === 'user_confusion' ? '🔄 混淆' : '📋 遗漏' }}</span>
             <span class="note-content">{{ n.content }}</span>
             <span class="note-time">{{ (n.created_at || '').slice(0, 16) }}</span>
           </div>
+        </div>
+        <div v-else class="weakness-empty">
+          <span class="empty-hint">暂无记录，答题评分或说「我搞混了X和Y」时会自动记录；请确保顶部用户ID与练习时一致</span>
         </div>
       </div>
 
@@ -156,48 +133,6 @@ const avgScore = computed(() => {
   return (h.reduce((s, r) => s + (r.score || 0), 0) / h.length).toFixed(1)
 })
 
-const weakTags = computed(() => data.value?.weak_tags || [])
-
-// 为每个薄弱知识点查找关联的拓展知识点
-const weakTagsWithRelated = computed(() => {
-  const weak = weakTags.value
-  if (!weak.length) return []
-  
-  // 从知识图谱中查找关联知识点
-  const graph = data.value?.knowledge_graph || {}
-  
-  return weak.map(item => {
-    // item 可能是对象 {tag, avg_score, ...} 或字符串，提取标签名
-    const tagName = typeof item === 'string' ? item : (item?.tag ?? String(item))
-    const related = []
-    
-    // 查找该标签的关联节点
-    if (graph[tagName]) {
-      const edges = graph[tagName].edges || []
-      edges.forEach(edge => {
-        if (related.length < 3 && edge.target && edge.target !== tagName) {
-          related.push(edge.target)
-        }
-      })
-    }
-    
-    if (related.length === 0) {
-      const weakNames = weak.map(w => typeof w === 'string' ? w : w?.tag).filter(Boolean)
-      Object.keys(graph).forEach(key => {
-        if (related.length >= 3) return
-        const edges = graph[key]?.edges || []
-        edges.forEach(edge => {
-          if (edge.target === tagName && !related.includes(key) && !weakNames.includes(key)) {
-            related.push(key)
-          }
-        })
-      })
-    }
-    
-    return { tag: tagName, related: related.slice(0, 3), raw: item }
-  })
-})
-
 const masteryLevels = [
   { key: 'expert', name: '精通', icon: '🌟', type: 'success' },
   { key: 'proficient', name: '熟练', icon: '✅', type: 'success' },
@@ -231,8 +166,8 @@ const load = async () => {
   }
 }
 
-// 切换到此视图时自动加载
-watch(() => props.isActive, (v) => { if (v && !data.value) load() })
+// 切到学习报告时始终刷新，确保显示最新答题与薄弱点
+watch(() => props.isActive, (v) => { if (v) load() })
 </script>
 
 <style scoped>
@@ -297,66 +232,11 @@ watch(() => props.isActive, (v) => { if (v && !data.value) load() })
   font-style: italic;
 }
 
-/* 标题样式增强 */
+/* 标题样式 */
 .section-title {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.title-icon {
-  font-size: 18px;
-}
-
-.title-badge {
-  background: linear-gradient(135deg, #f59e0b 0%, #ef4444 100%);
-  color: white;
-  padding: 2px 8px;
-  border-radius: 12px;
-  font-size: 11px;
-  font-weight: 700;
-  margin-left: 4px;
-}
-
-/* 薄弱知识点列表 */
-.weak-knowledge-list {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.weak-item {
-  padding: 16px;
-  background: #fef2f2;
-  border-left: 4px solid #ef4444;
-  border-radius: 8px;
-}
-
-.weak-main {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.weak-label {
-  font-size: 14px;
-  font-weight: 600;
-  color: #991b1b;
-}
-
-.weak-related {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  padding-left: 8px;
-}
-
-.related-label {
-  font-size: 13px;
-  color: #6b7280;
-  white-space: nowrap;
 }
 
 .chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -381,6 +261,10 @@ watch(() => props.isActive, (v) => { if (v && !data.value) load() })
 
 /* 用户自述的薄弱点 */
 .weakness-notes-list { display: flex; flex-direction: column; gap: 8px; }
+.weakness-empty {
+  padding: 16px; background: #fffbeb; border-radius: 8px;
+  border: 1px dashed #fcd34d; font-size: 13px; color: var(--text-sub);
+}
 .weakness-note {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   padding: 10px 14px; background: #fef3c7; border-radius: 8px;

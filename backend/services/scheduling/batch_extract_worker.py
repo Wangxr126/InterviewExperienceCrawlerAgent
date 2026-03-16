@@ -6,10 +6,20 @@
 
 使用方式：
   python -m backend.services.scheduling.batch_extract_worker task_id1 task_id2 ...
+
+子进程日志写入 batch_extract.log（主进程启动时指定 stdout/stderr 重定向）
 """
 import logging
 import sys
+from datetime import datetime
 
+# 子进程独立运行，需配置基础 logging 输出到 stderr（主进程会重定向到 batch_extract.log）
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stderr,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -17,11 +27,15 @@ def run_batch_extract(task_ids: list) -> None:
     """在子进程中执行批量提取，与主进程完全隔离"""
     from backend.services.scheduling.scheduler import process_single_task
 
-    for tid in task_ids:
+    logger.info("[BatchExtractWorker] 开始批量提取，共 %d 条", len(task_ids))
+    for i, tid in enumerate(task_ids):
         try:
+            logger.info("[BatchExtractWorker] 处理 %d/%d task_id=%s", i + 1, len(task_ids), tid)
             process_single_task(tid)
+            logger.info("[BatchExtractWorker] 完成 task_id=%s", tid)
         except Exception as e:
-            logger.error(f"[BatchExtractWorker] 批量提取异常 task_id={tid}: {e}")
+            logger.error("[BatchExtractWorker] 批量提取异常 task_id=%s: %s", tid, e)
+    logger.info("[BatchExtractWorker] 全部完成")
 
 
 def main():

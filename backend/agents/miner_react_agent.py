@@ -15,7 +15,30 @@ class MinerReActAgent(ReActAgent):
     """
     扩展 ReActAgent，支持 mark_unrelated 等终止工具。
     当终止工具返回约定信号时，立即 return，避免模型重复调用。
+    兼容部分本地模型将工具调用以 {"tool":"xxx","arguments":{}} 文本格式输出到 content 的情况。
     """
+
+    def _parse_embedded_tool_call(self, content: str):
+        """
+        解析 content 中可能存在的内嵌工具调用格式。
+        格式：{"tool": "verify_extraction_count", "arguments": {"extracted_count": 13, "expected_count": 13}}
+        返回 (tool_name, arguments) 或 None。
+        """
+        import json
+        s = content.strip()
+        if not s or not s.startswith("{"):
+            return None
+        try:
+            obj = json.loads(s)
+            if not isinstance(obj, dict):
+                return None
+            tool = obj.get("tool") or obj.get("name")
+            args = obj.get("arguments") or obj.get("args") or {}
+            if tool and isinstance(args, dict):
+                return (str(tool), args)
+        except json.JSONDecodeError:
+            pass
+        return None
 
     def _run_impl(self, input_text: str, session_start_time, **kwargs) -> str:
         """与 ReActAgent 相同，但在用户工具执行后检查是否为终止工具"""
@@ -81,8 +104,76 @@ class MinerReActAgent(ReActAgent):
                 )
 
             tool_calls = response_message.tool_calls
+            content = (response_message.content or "").strip()
+
+            # 兼容：部分本地模型（如 qwen3:4b）不支持标准 tool_calls，将工具调用以 JSON 文本输出到 content
+            # 格式：{"tool": "verify_extraction_count", "arguments": {...}}
+            if not tool_calls and content:
+                embedded = self._parse_embedded_tool_call(content)
+                if embedded:
+                    tool_name, arguments = embedded
+                    tool_call_id = f"call_embedded_{current_step}"
+                    print(f"🔧 [内嵌格式] 检测到工具调用: {tool_name}({arguments})")
+
+                    messages.append({
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": [{
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": json.dumps(arguments, ensure_ascii=False)
+                            }
+                        }]
+                    })
+
+                    if self.trace_logger:
+                        self.trace_logger.log_event(
+                            "tool_call",
+                            {
+                                "tool_name": tool_name,
+                                "tool_call_id": tool_call_id,
+                                "args": arguments,
+                                "source": "embedded_content",
+                            },
+                            step=current_step
+                        )
+
+                    if tool_name in self._builtin_tools:
+                        result = self._handle_builtin_tool(tool_name, arguments)
+                        result_content = result.get("content", str(result))
+                        print(f"🔧 {tool_name}: {result_content}")
+                    else:
+                        result_content = self._execute_tool_call(tool_name, arguments)
+                        if not result_content.startswith("❌"):
+                            print(f"👀 观察: {result_content}")
+
+                    if self.trace_logger:
+                        self.trace_logger.log_event(
+                            "tool_result",
+                            {
+                                "tool_name": tool_name,
+                                "tool_call_id": tool_call_id,
+                                "result": result_content,
+                                "source": "embedded_content",
+                            },
+                            step=current_step
+                        )
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": result_content
+                    })
+
+                    if tool_name in TERMINATING_TOOLS and TERMINATING_SIGNAL in result_content:
+                        return result_content
+
+                    continue  # 继续下一轮，让模型根据工具结果输出 JSON
+
             if not tool_calls:
-                final_answer = response_message.content or "抱歉，我无法回答这个问题。"
+                final_answer = content or "抱歉，我无法回答这个问题。"
                 print(f"💬 直接回复: {final_answer}")
 
                 self.add_message(Message(input_text, "user"))

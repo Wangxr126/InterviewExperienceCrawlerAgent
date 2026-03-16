@@ -189,12 +189,22 @@ class MinerAgent(ReActAgent):
         import json, re
         # 已经是纯 JSON 数组，直接返回
         stripped = text.strip()
-        if stripped.startswith('['):
-            return stripped
+        if stripped.startswith('[') and stripped.endswith(']'):
+            try:
+                json.loads(stripped)
+                return stripped  # 验证成功，直接返回
+            except json.JSONDecodeError:
+                pass
+        
         # 去掉 markdown 代码块后尝试
         clean = re.sub(r'```(?:json)?\s*', '', stripped).strip().rstrip('`').strip()
-        if clean.startswith('['):
-            return clean
+        if clean.startswith('[') and clean.endswith(']'):
+            try:
+                json.loads(clean)
+                return clean
+            except json.JSONDecodeError:
+                pass
+        
         # 在文本中搜索第一个完整的 JSON 数组（贪婪匹配最长的 [...] 块）
         best = ''
         for m in re.finditer(r'\[', clean):

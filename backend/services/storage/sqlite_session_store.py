@@ -91,17 +91,19 @@ class SqliteSessionStore:
         session_name: Optional[str] = None,
     ) -> str:
         """保存会话到 SQLite interview_sessions 表"""
+        from backend.config.config import settings as _settings
         user_id = get_current_user_id()
         session_id = get_current_session_id() or session_name
         if not session_id:
-            session_id = session_name or f"sess_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            session_id = session_name or _settings.default_session_id
 
         self._sqlite.ensure_session_exists(session_id, user_id)
 
         # 转为 conversation_history 格式
         history_data = [_message_to_storage(m) for m in history]
 
-        # 合并已有推理过程：save_session 会覆盖整段 history，需保留旧消息的 thinking
+        # 合并已有推理过程：save_session 会覆盖整段 history，仅对「已存在的」assistant 保留 thinking
+        # 重要：只当 ki < len(old_assistant_indices) 时才复制，避免把上一轮的 thinking 复制到本轮新消息（前后不一致）
         try:
             session = self._sqlite.get_session(session_id)
             old_history = session.get("conversation_history") or []

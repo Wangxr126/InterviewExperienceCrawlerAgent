@@ -94,7 +94,7 @@ class SqliteService:
                 question_id      TEXT NOT NULL,
                 session_id       TEXT,
                 message_id       TEXT,
-                score            INTEGER DEFAULT 0,
+                score            REAL DEFAULT 0.0,
                 user_answer      TEXT,
                 ai_feedback      TEXT,
                 easiness_factor  REAL DEFAULT 2.5,
@@ -210,6 +210,21 @@ class SqliteService:
                 labeled_at      TEXT
             )
             """,
+            # ── 微调训练记录（每次生成脚本/训练单独一条）──
+            """
+            CREATE TABLE IF NOT EXISTS finetune_runs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                config_json     TEXT NOT NULL,
+                output_dir      TEXT NOT NULL,
+                script_path     TEXT NOT NULL,
+                data_path      TEXT,
+                sample_count   INTEGER DEFAULT 0,
+                status         TEXT DEFAULT 'generated',
+                created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+                started_at     DATETIME,
+                ended_at       DATETIME
+            )
+            """,
             # ── 爬虫任务队列（去重 + 状态追踪）──
             # 含：原始链接、标题、正文、图片相对路径（JSON 数组）
             # raw_content 使用 TEXT，SQLite 无长度限制（理论约 1GB），完整保存原文不截断
@@ -233,6 +248,25 @@ class SqliteService:
                 discovered_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
                 processed_at    DATETIME,
                 UNIQUE(source_url)
+            )
+            """,
+            # ── Stage2 待处理队列（MQ 替代，达到 batch_size 触发）──
+            """
+            CREATE TABLE IF NOT EXISTS stage2_pending (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id         TEXT NOT NULL UNIQUE,
+                content         TEXT,
+                stage1_output   TEXT NOT NULL,
+                rough_questions TEXT NOT NULL,
+                enrich_input    TEXT NOT NULL,
+                company         TEXT DEFAULT '',
+                position        TEXT DEFAULT '',
+                source_url      TEXT,
+                post_title      TEXT,
+                trace_session_id TEXT,
+                agent_used_tool INTEGER DEFAULT 0,
+                ocr_called      INTEGER DEFAULT 0,
+                created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """,
         ]
@@ -311,6 +345,29 @@ class SqliteService:
                 conn.execute("ALTER TABLE study_records ADD COLUMN eval_details TEXT")
             if "message_id" not in sr_cols:
                 conn.execute("ALTER TABLE study_records ADD COLUMN message_id TEXT")
+            # 迁移：创建 stage2_pending 表（两阶段异步 MQ）
+            try:
+                conn.execute("SELECT 1 FROM stage2_pending LIMIT 1")
+            except Exception:
+                conn.execute("""
+                    CREATE TABLE stage2_pending (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_id         TEXT NOT NULL UNIQUE,
+                        content         TEXT,
+                        stage1_output   TEXT NOT NULL,
+                        rough_questions TEXT NOT NULL,
+                        enrich_input    TEXT NOT NULL,
+                        company         TEXT DEFAULT '',
+                        position        TEXT DEFAULT '',
+                        source_url      TEXT,
+                        post_title      TEXT,
+                        trace_session_id TEXT,
+                        agent_used_tool INTEGER DEFAULT 0,
+                        ocr_called      INTEGER DEFAULT 0,
+                        created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                logger.info("stage2_pending 表已创建")
             conn.commit()
         logger.info("✅ SQLite 所有表初始化完成")
         self._seed_knowledge_resources()
@@ -470,6 +527,49 @@ class SqliteService:
             )
             return [dict(row) for row in cursor.fetchall()]
 
+    def filter_questions_random_exclude(
+        self,
+        user_id: str,
+        limit: int = 10,
+        exclude_ids: List[str] = None,
+        company: str = None,
+        difficulty: str = None,
+        question_type: str = None,
+        tags: List[str] = None,
+        source_platform: str = None,
+    ) -> List[Dict]:
+        """随机返回未做过的题目（排除 exclude_ids），用于智能练习补充"""
+        exclude_ids = [x for x in (exclude_ids or []) if x]
+        where_clause, params = self._build_question_conditions(
+            company=company, difficulty=difficulty, question_type=question_type,
+            tags=tags, source_platform=source_platform
+        )
+        if exclude_ids:
+            placeholders = ",".join("?" * len(exclude_ids))
+            where_clause = f"({where_clause}) AND q_id NOT IN ({placeholders})"
+            params = list(params) + exclude_ids
+        params.append(limit)
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                f"SELECT * FROM questions WHERE {where_clause} ORDER BY RANDOM() LIMIT ?",
+                params
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_practice_stats(self, user_id: str) -> Dict:
+        """获取用户练习统计：已练题目数（去重）、题库总数、是否全学完"""
+        with self._get_conn() as conn:
+            practiced = conn.execute(
+                "SELECT COUNT(DISTINCT question_id) FROM study_records WHERE user_id = ?",
+                (user_id,)
+            ).fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
+        return {
+            "practiced_count": practiced,
+            "total_count": total,
+            "all_learned": practiced >= total and total > 0,
+        }
+
     # ===========================================================
     # user_profiles 表操作
     # ===========================================================
@@ -542,7 +642,7 @@ class SqliteService:
         else:
             return "expert" if correct_count >= 5 else "proficient"
 
-    def update_tag_mastery(self, user_id: str, tags: List[str], score: int):
+    def update_tag_mastery(self, user_id: str, tags: List[str], score: float):
         """每次做题后调用，更新相关标签的掌握度"""
         with self._get_conn() as conn:
             for tag in tags:
@@ -630,12 +730,13 @@ class SqliteService:
         next_review_at = now_beijing() + timedelta(days=interval_days)
         return easiness_factor, repetitions, interval_days, next_review_at
 
-    def add_study_record(self, user_id: str, question_id: str, score: int,
+    def add_study_record(self, user_id: str, question_id: str, score: float,
                          user_answer: str = "", ai_feedback: str = "",
                          session_id: str = "", message_id: str = None,
                          eval_details: Optional[Dict] = None) -> Dict:
         """
         记录一次做题，自动计算 SM-2 参数，更新标签掌握度。
+        score: 浮点数，支持 0.5 间隔（0, 0.5, 1.0, ..., 5.0）
         Returns: SM-2 更新结果
         """
         # 读取该题的历史记录（取最新一条获取当前 SM-2 状态）
@@ -651,7 +752,9 @@ class SqliteService:
         reps = last["repetitions"] if last else 0
         interval = last["interval_days"] if last else 1
 
-        new_ef, new_reps, new_interval, next_review = self.compute_sm2(score, ef, reps, interval)
+        # SM-2 算法用整数分数（0-5）
+        score_for_sm2 = int(score)
+        new_ef, new_reps, new_interval, next_review = self.compute_sm2(score_for_sm2, ef, reps, interval)
 
         eval_json = json.dumps(eval_details, ensure_ascii=False) if eval_details else None
         with self._get_conn() as conn:
@@ -669,7 +772,7 @@ class SqliteService:
             q_row = conn.execute("SELECT topic_tags FROM questions WHERE q_id = ?", (question_id,)).fetchone()
         if q_row:
             tags = json.loads(q_row["topic_tags"] or "[]")
-            self.update_tag_mastery(user_id, tags, score)
+            self.update_tag_mastery(user_id, tags, score)  # ⚠️ 修复：用原始 score（浮点数），不是 score_for_sm2
 
         return {
             "easiness_factor": round(new_ef, 2),
@@ -695,15 +798,25 @@ class SqliteService:
             """, (user_id, now, limit))
             return [dict(row) for row in cursor.fetchall()]
 
-    def get_user_weakness_notes(self, user_id: str, limit: int = 20) -> List[Dict]:
-        """获取用户自述的混淆点和遗漏点（record_weakness 工具记录）"""
+    def get_user_weakness_notes(self, user_id: str, limit: int = 20,
+                                date_from: str = None, date_to: str = None) -> List[Dict]:
+        """获取用户自述的混淆点和遗漏点（record_weakness/submit_answer 自动记录）"""
+        conditions = ["user_id = ?", "event_type IN ('user_confusion', 'user_missed')"]
+        params = [user_id]
+        if date_from:
+            conditions.append("DATE(created_at) >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("DATE(created_at) <= ?")
+            params.append(date_to)
+        params.append(limit)
         with self._get_conn() as conn:
-            cursor = conn.execute("""
+            cursor = conn.execute(f"""
                 SELECT content, event_type, created_at
                 FROM episodic_log
-                WHERE user_id = ? AND event_type IN ('user_confusion', 'user_missed')
+                WHERE {' AND '.join(conditions)}
                 ORDER BY created_at DESC LIMIT ?
-            """, (user_id, limit))
+            """, params)
             return [dict(row) for row in cursor.fetchall()]
 
     def add_episodic_log(self, user_id: str, content: str,
@@ -739,6 +852,16 @@ class SqliteService:
                     r["eval_details"] = json.loads(ed)
                 except Exception:
                     r["eval_details"] = None
+
+            # studied_at 默认是 SQLite CURRENT_TIMESTAMP（UTC），统一转换为北京时间字符串
+            sa = r.get("studied_at")
+            if sa:
+                try:
+                    r["studied_at"] = timestamp_to_beijing(sa)
+                except Exception:
+                    # 异常时保留原始值，避免接口报错
+                    pass
+
         return rows
 
     def get_latest_scores_for_questions(self, user_id: str, question_ids: List[str]) -> Dict[str, Dict]:
@@ -766,6 +889,41 @@ class SqliteService:
                     "next_review_at": row["next_review_at"]
                 } for row in cursor.fetchall()
             }
+
+    def get_study_records_by_question(
+        self, user_id: str, question_id: str, limit: int = 20
+    ) -> List[Dict]:
+        """获取某用户对某题的历史作答记录（按时间倒序），含 eval_details。"""
+        if not user_id or not question_id:
+            return []
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                """
+                SELECT id, score, user_answer, ai_feedback, studied_at, eval_details
+                FROM study_records
+                WHERE user_id = ? AND question_id = ?
+                ORDER BY studied_at DESC
+                LIMIT ?
+                """,
+                (user_id, question_id, limit),
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+        for r in rows:
+            ed = r.get("eval_details")
+            if ed and isinstance(ed, str):
+                try:
+                    r["eval_details"] = json.loads(ed)
+                except Exception:
+                    r["eval_details"] = None
+            
+            # ⚠️ 修复：转换 studied_at 到北京时间
+            sa = r.get("studied_at")
+            if sa:
+                try:
+                    r["studied_at"] = timestamp_to_beijing(sa)
+                except Exception:
+                    pass
+        return rows
 
     # ===========================================================
     # interview_sessions 表操作
@@ -918,6 +1076,18 @@ class SqliteService:
     # ===========================================================
     # user_notes 表操作
     # ===========================================================
+    def add_note(self, user_id: str, content: str, question_id: str = None,
+                 tags: List[str] = None, note_type: str = "concept") -> str:
+        """便捷方法：创建笔记（submit_answer 自动记录遗漏/混淆点时调用）"""
+        return self.create_note(
+            user_id=user_id,
+            content=content,
+            title="",
+            question_id=question_id,
+            tags=tags,
+            note_type=note_type,
+        )
+
     def create_note(self, user_id: str, content: str, title: str = "",
                     question_id: str = None, tags: List[str] = None,
                     note_type: str = "concept") -> str:
@@ -1375,6 +1545,62 @@ class SqliteService:
                 """, (post_title or "", raw_content or "", img_val, task_id))
                 conn.commit()
 
+    # ===========================================================
+    # Stage2 待处理队列（MQ，达到 batch_size 触发）
+    # ===========================================================
+
+    def add_stage2_pending(
+        self,
+        task_id: str,
+        content: str,
+        stage1_output: str,
+        rough_questions: str,
+        enrich_input: str,
+        company: str = "",
+        position: str = "",
+        source_url: str = "",
+        post_title: str = "",
+        trace_session_id: str = "",
+        agent_used_tool: int = 0,
+        ocr_called: int = 0,
+    ) -> bool:
+        """入队 Stage2 待处理。返回 True 表示成功入队"""
+        try:
+            with self._get_conn() as conn:
+                conn.execute("""
+                    INSERT OR IGNORE INTO stage2_pending
+                    (task_id, content, stage1_output, rough_questions, enrich_input,
+                     company, position, source_url, post_title, trace_session_id, agent_used_tool, ocr_called)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (task_id, content or "", stage1_output, rough_questions, enrich_input,
+                      company, position, source_url, post_title, trace_session_id, agent_used_tool, ocr_called))
+                conn.commit()
+                return conn.total_changes > 0
+        except Exception as e:
+            logger.warning("add_stage2_pending 失败: %s", e)
+            return False
+
+    def get_stage2_pending_count(self) -> int:
+        """当前队列长度"""
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT COUNT(*) as c FROM stage2_pending").fetchone()
+            return row["c"] if row else 0
+
+    def pop_stage2_pending_batch(self, limit: int) -> List[Dict]:
+        """取出并删除一批待处理（FIFO），用于 Stage2 批量处理"""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM stage2_pending ORDER BY created_at ASC LIMIT ?",
+                (limit,)
+            ).fetchall()
+            items = [dict(r) for r in rows]
+            if items:
+                task_ids = [r["task_id"] for r in rows]
+                placeholders = ",".join("?" * len(task_ids))
+                conn.execute(f"DELETE FROM stage2_pending WHERE task_id IN ({placeholders})", task_ids)
+                conn.commit()
+            return items
+
     def is_url_crawled(self, url: str) -> bool:
         """检查 URL 是否已爬取（已入队或已处理）"""
         with self._get_conn() as conn:
@@ -1453,6 +1679,9 @@ class SqliteService:
                 GROUP BY source_platform
             """).fetchall()
             result["fetched_by_platform"] = {r["source_platform"]: r["cnt"] for r in by_platform}
+            # Stage2 待处理队列长度（两阶段异步）
+            row = conn.execute("SELECT COUNT(*) as c FROM stage2_pending").fetchone()
+            result["stage2_pending_count"] = row["c"] if row else 0
             return result
 
     def get_crawl_keywords(self) -> List[str]:
@@ -1464,6 +1693,59 @@ class SqliteService:
                 "ORDER BY discover_keyword"
             ).fetchall()
             return [r["discover_keyword"] for r in rows]
+
+    # ===========================================================
+    # finetune_runs 表操作（训练记录）
+    # ===========================================================
+    def add_finetune_run(
+        self,
+        config_json: str,
+        output_dir: str,
+        script_path: str,
+        data_path: str = None,
+        sample_count: int = 0,
+        status: str = "generated",
+    ) -> int:
+        """插入一条微调训练记录"""
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO finetune_runs
+                   (config_json, output_dir, script_path, data_path, sample_count, status)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (config_json, output_dir, script_path, data_path or "", sample_count, status),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def list_finetune_runs(self, limit: int = 50) -> List[Dict]:
+        """分页查询微调训练记录，按创建时间倒序"""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """SELECT id, config_json, output_dir, script_path, data_path, sample_count,
+                          status, created_at, started_at, ended_at
+                   FROM finetune_runs ORDER BY created_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def update_finetune_run_status(
+        self, run_id: int, status: str, started_at: str = None, ended_at: str = None
+    ) -> bool:
+        """更新训练记录状态（用户手动运行训练时可调用）"""
+        with self._get_conn() as conn:
+            updates, params = ["status = ?"], [status]
+            if started_at:
+                updates.append("started_at = ?")
+                params.append(started_at)
+            if ended_at:
+                updates.append("ended_at = ?")
+                params.append(ended_at)
+            params.append(run_id)
+            cur = conn.execute(
+                f"UPDATE finetune_runs SET {', '.join(updates)} WHERE id = ?", params
+            )
+            conn.commit()
+            return cur.rowcount > 0
 
 
 # 单例

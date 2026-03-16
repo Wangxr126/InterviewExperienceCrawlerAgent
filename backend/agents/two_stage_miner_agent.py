@@ -23,6 +23,7 @@ from backend.agents.prompts.two_stage_prompts import (
     ENRICH_SYSTEM_PROMPT,
     ENRICH_USER_PROMPT_TEMPLATE,
 )
+from backend.services.finetune.stage_merge_utils import merge_stage2_with_stage1
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,8 @@ class TwoStageExtractor:
         position: str = "",
         user_input_override: str = None,
         _retry_count: int = 0,
+        source_url: str = "",
+        post_title: str = "",
     ) -> Tuple[str, bool, bool]:
         """
         两阶段提取
@@ -229,6 +232,43 @@ class TwoStageExtractor:
                     q["raw_answer"] = q.get("answer_text", "")
             return json.dumps(rough_questions, ensure_ascii=False), self._ocr_called, False
 
+        # ========== 异步模式：入队 stage2_pending，达到 batch_size 触发 ==========
+        if settings.miner_stage2_async_enabled and self._stage2_models:
+            questions_text = "\n".join(
+                f"{i+1}. {q.get('question_text', '')}"
+                for i, q in enumerate(valid_questions)
+            )
+            enrich_input = ENRICH_USER_PROMPT_TEMPLATE.format(questions_text=questions_text)
+            from backend.services.storage import sqlite_service
+            from backend.services.stage2_processor import trigger_stage2_if_ready
+            # 需要 task_id，从 self 获取（TwoStageExtractor 由 MinerAgentV3 创建时传入）
+            task_id = getattr(self, "_task_id", "") or ""
+            trace_session_id = ""
+            try:
+                from backend.services.crawler.question_extractor import _get_latest_trace_session_id
+                trace_session_id = _get_latest_trace_session_id() or ""
+            except Exception:
+                pass
+            ok = sqlite_service.add_stage2_pending(
+                task_id=task_id,
+                content=content,
+                stage1_output=rough_result,
+                rough_questions=json.dumps(valid_questions, ensure_ascii=False),
+                enrich_input=enrich_input,
+                company=company or "",
+                position=position or "",
+                source_url=source_url or "",
+                post_title=post_title or "",
+                trace_session_id=trace_session_id,
+                agent_used_tool=1 if getattr(self, "_agent_used_tool", False) else 0,
+                ocr_called=1 if self._ocr_called else 0,
+            )
+            if ok:
+                trigger_stage2_if_ready()
+                # 返回特殊信号，让上层知道已入队，需更新 task 为 stage2_pending
+                return "__STAGE2_PENDING__", self._ocr_called, False
+            # 入队失败则降级同步执行
+
         # ========== Stage 2：精加工（多模型回退，额度超限时切换） ==========
         if not self._stage2_models:
             logger.info("[TwoStageExtractor] 未配置 Stage 2，直接返回 Stage 1 结果")
@@ -270,8 +310,8 @@ class TwoStageExtractor:
                     enrich_result = self._strip_think_tags(enrich_result)
                     enrich_result = self._extract_json_if_direct_reply(enrich_result)
 
-                    # 合并 Stage 2 的 answer_text 与 Stage 1 的元数据（下游需要完整 7 字段）
-                    enrich_result = self._merge_stage2_with_stage1(enrich_result, valid_questions)
+                    # 合并 Stage 2 的 answer_text 与 Stage 1 的元数据（下游需要完整 7 字段，支持 Stage1 旧格式 title/answer/type/tags）
+                    enrich_result = merge_stage2_with_stage1(enrich_result, json.dumps(valid_questions, ensure_ascii=False))
 
                     # 保存两阶段对比数据（用于微调）
                     self._save_two_stage_log(
@@ -303,41 +343,6 @@ class TwoStageExtractor:
             return json.dumps(rough_questions, ensure_ascii=False), self._ocr_called, False
         except Exception:
             return rough_result, self._ocr_called, False
-
-    def _merge_stage2_with_stage1(self, enrich_result: str, rough_questions: list) -> str:
-        """合并 Stage 2 输出与 Stage 1 元数据，下游需要完整 7 字段。
-        解析失败时 re-raise，让外层触发 Stage 1 降级，避免返回无效 JSON 导致整体提取失败。
-        """
-        try:
-            stage2_list = json.loads(enrich_result)
-            if not isinstance(stage2_list, list):
-                return enrich_result
-            stage1_by_qt = {
-                (q.get("question_text", "") if isinstance(q, dict) else ""): q
-                for q in rough_questions
-                if isinstance(q, dict)
-            }
-            merged = []
-            for item in stage2_list:
-                if not isinstance(item, dict):
-                    continue
-                qt = item.get("question_text", "")
-                s1 = stage1_by_qt.get(qt, {})
-                merged.append({
-                    "question_text": qt or s1.get("question_text", ""),
-                    "answer_text": item.get("answer_text") or s1.get("answer_text", ""),  # 豆包答案，用于展示
-                    "raw_answer": s1.get("answer_text", ""),  # 原答案（Stage 1），入库保存
-                    "difficulty": item.get("difficulty") or s1.get("difficulty", "medium"),
-                    "question_type": item.get("question_type") or s1.get("question_type", "基础类"),
-                    "topic_tags": item.get("topic_tags") or s1.get("topic_tags", []),
-                    "company": item.get("company") or s1.get("company", ""),
-                    "position": item.get("position") or s1.get("position", ""),
-                })
-            return json.dumps(merged, ensure_ascii=False)
-        except (json.JSONDecodeError, TypeError) as e:
-            # 豆包返回截断/非法 JSON 时，必须 re-raise 以触发外层 fallback 到 Stage 1
-            logger.warning(f"[TwoStageExtractor] Stage 2 输出解析失败（可能被截断）: {e}，将降级返回 Stage 1 结果")
-            raise
 
     def _save_two_stage_log(
         self,

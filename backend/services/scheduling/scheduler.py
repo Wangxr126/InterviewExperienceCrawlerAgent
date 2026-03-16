@@ -318,6 +318,19 @@ def _process_pending_tasks(batch_size: int = None):
                 logger.info("")
                 continue
 
+            # 两阶段异步：Stage1 完成已入队，待 Stage2 批量处理
+            if status == "stage2_pending":
+                sqlite_service.update_task_status(
+                    task_id, "stage2_pending",
+                    raw_content=raw_content,
+                    agent_used_tool=agent_used_tool,
+                    extract_duration_min=round((time.time() - _t0) / 60, 2),
+                    trace_session_id=trace_session_id,
+                )
+                logger.info(f"  📤 Stage1 完成已入队，待 Stage2 批量处理（batch_size={getattr(settings, 'miner_stage2_batch_size', 10)} 触发）")
+                logger.info("")
+                continue
+
             # LLM 解析失败 → 标记 error
             if status == "parse_error":
                 extract_error += 1

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 
 from backend.config.config import settings
+from backend.services.finetune.stage_merge_utils import merge_stage2_with_stage1, is_stage2_incomplete
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,9 @@ def import_from_log_file(log_path: str, skip_existing: bool = True) -> Dict[str,
                     content = (rec.get("content_preview", "") or rec.get("content", "")).strip()
                     stage1 = rec.get("stage1_output", "")
                     stage2 = rec.get("stage2_output", "")
+                    # 若 Stage2 不完整（为省 token 只返回 answer 等），用 Stage1 补齐
+                    if stage1 and stage2 and is_stage2_incomplete(stage2, stage1):
+                        stage2 = merge_stage2_with_stage1(stage2, stage1)
                     stage1_model = rec.get("stage1_model", "")
                     stage2_model = rec.get("stage2_model", "")
                     ts = rec.get("ts", now_ts)
@@ -199,6 +203,55 @@ def import_from_log_file(log_path: str, skip_existing: bool = True) -> Dict[str,
             logger.warning("  ... 还有 %d 条失败记录未显示", failed - 5)
     
     return {"imported": imported, "skipped": skipped, "failed": failed}
+
+
+def fix_merged_stage2_samples(source_filter: str = "miner_two_stage") -> Dict[str, int]:
+    """
+    修复已导入的标注样本：对 stage2_output 不完整的记录，用 stage1_output 补齐缺失字段。
+    可选 source_filter 仅处理指定来源（默认 miner_two_stage）。
+    返回 {"fixed": N, "skipped": N, "failed": N}
+    """
+    fixed = skipped = failed = 0
+    with _get_db_conn() as conn:
+        if source_filter:
+            rows = conn.execute(
+                """SELECT id, stage1_output, stage2_output, final_output FROM finetune_samples WHERE source=?""",
+                (source_filter,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT id, stage1_output, stage2_output, final_output FROM finetune_samples"""
+            ).fetchall()
+        for row in rows:
+            sid = row["id"]
+            stage1 = row["stage1_output"] or ""
+            stage2 = row["stage2_output"] or ""
+            final = row["final_output"] or ""
+            if not stage1 or not stage2:
+                skipped += 1
+                continue
+            if not is_stage2_incomplete(stage2, stage1):
+                skipped += 1
+                continue
+            try:
+                merged = merge_stage2_with_stage1(stage2, stage1)
+                conn.execute(
+                    "UPDATE finetune_samples SET stage2_output=? WHERE id=?",
+                    (merged, sid),
+                )
+                # 若 final_output 与 stage2_output 相同（用户点「无需修改」），一并更新
+                if final == stage2:
+                    conn.execute(
+                        "UPDATE finetune_samples SET final_output=? WHERE id=?",
+                        (merged, sid),
+                    )
+                fixed += 1
+            except Exception as e:
+                failed += 1
+                logger.warning("修复样本 id=%d 失败: %s", sid, e)
+        conn.commit()
+    logger.info("修复 Stage2 合并: fixed=%d skipped=%d failed=%d", fixed, skipped, failed)
+    return {"fixed": fixed, "skipped": skipped, "failed": failed}
 
 
 def import_all_logs() -> Dict:
@@ -404,18 +457,27 @@ def delete_sample(sample_id: int) -> Dict:
         return {"status": "ok", "deleted": cur.rowcount}
 
 
-def export_labeled(output_path: str = None) -> Dict:
+def export_labeled(output_path: str = None, sample_ids: List[int] = None) -> Dict:
     """
-    将所有 labeled 状态的样本导出为 labeled_data.jsonl（prompt/completion 格式）。
+    将 labeled 状态的样本导出为 labeled_data.jsonl（prompt/completion 格式）。
+    sample_ids: 可选，指定则只导出这些 ID；否则导出全部已标注。
     返回导出数量。
     """
     out_p = Path(output_path) if output_path else _LABELED_PATH
     out_p.parent.mkdir(parents=True, exist_ok=True)
 
     with _get_db_conn() as conn:
-        rows = conn.execute(
-            "SELECT content, final_output, is_modified, labeled_at FROM finetune_samples WHERE status='labeled' AND final_output IS NOT NULL"
-        ).fetchall()
+        if sample_ids:
+            placeholders = ",".join("?" * len(sample_ids))
+            rows = conn.execute(
+                f"""SELECT content, final_output, is_modified, labeled_at FROM finetune_samples
+                    WHERE id IN ({placeholders}) AND status='labeled' AND final_output IS NOT NULL""",
+                sample_ids,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT content, final_output, is_modified, labeled_at FROM finetune_samples WHERE status='labeled' AND final_output IS NOT NULL"
+            ).fetchall()
 
     count = 0
     with open(out_p, "w", encoding="utf-8", newline="\n") as f:
@@ -795,14 +857,19 @@ def _parse_lr(v) -> float:
         return 2e-4
 
 
-def generate_training_script(config: Dict = None) -> Dict:
+def generate_training_script(config: Dict = None, sample_ids: List[int] = None) -> Dict:
     """
     根据配置生成 Unsloth LoRA/QLoRA 训练脚本。
     数据格式：将 labeled_data.jsonl (prompt/completion) 转为 instruction 格式。
+    sample_ids: 可选，指定则先导出这些样本到 labeled_data.jsonl，再生成脚本；否则使用已有 labeled_data.jsonl。
     """
     cfg = {**DEFAULT_RUN_CONFIG, **(config or {})}
     cfg["learning_rate"] = _parse_lr(cfg.get("learning_rate"))
     _FINETUNE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 若指定了 sample_ids，先导出选中样本到 labeled_data.jsonl
+    if sample_ids:
+        export_labeled(sample_ids=sample_ids)
 
     # 1. 转换数据格式：prompt/completion -> instruction/input/output (Alpaca)
     converted_path = _FINETUNE_DIR / "training_data_alpaca.jsonl"
@@ -942,8 +1009,24 @@ if __name__ == "__main__":
     script_path.write_text(script_content, encoding="utf-8")
     logger.info("训练脚本已生成: %s", script_path)
 
+    # 保存训练记录到 SQLite
+    try:
+        from backend.services.storage.sqlite_service import sqlite_service
+        run_id = sqlite_service.add_finetune_run(
+            config_json=json.dumps(cfg, ensure_ascii=False),
+            output_dir=str(output_dir),
+            script_path=str(script_path),
+            data_path=str(converted_path),
+            sample_count=count,
+            status="generated",
+        )
+    except Exception as e:
+        logger.warning("保存训练记录失败: %s", e)
+        run_id = None
+
     return {
         "status": "ok",
+        "run_id": run_id,
         "script_path": str(script_path),
         "data_path": str(converted_path),
         "output_dir": str(output_dir),

@@ -1,9 +1,9 @@
 from __future__ import annotations
-import json, logging, re, random, requests
+import json, logging, re, random
 from typing import Any, List, Dict, Optional
 from hello_agents.tools import Tool, ToolParameter
 from hello_agents.tools.response import ToolResponse
-from backend.agents.context import get_current_user_id, get_current_session_id
+from backend.agents.context import get_current_user_id, get_current_session_id, get_current_user_message
 from backend.config.config import settings
 from backend.services.storage.sqlite_service import sqlite_service
 from backend.services.storage.neo4j_service import neo4j_service
@@ -13,46 +13,21 @@ from backend.services.multi_recall_recommender import multi_recall_recommender
 logger = logging.getLogger(__name__)
 
 
-def _call_llm(prompt: str, system: str = "", temperature: float = 0.3,
-              json_mode: bool = False, max_tokens: int = 1000) -> str:
-    try:
-        headers = {"Authorization": f"Bearer {settings.llm_api_key}",
-                   "Content-Type": "application/json"}
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        payload: Dict[str, Any] = {"model": settings.llm_model_id,
-                                    "messages": messages,
-                                    "temperature": temperature,
-                                    "max_tokens": max_tokens}
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        resp = requests.post(f"{settings.llm_base_url}/chat/completions",
-                             headers=headers, json=payload,
-                             timeout=settings.llm_timeout)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.warning("_call_llm failed: %s", e)
-        return ""
-
-
 def _get_seen_question_ids(user_id: str, limit: int = 100) -> List[str]:
     history = sqlite_service.get_study_history(user_id, limit=limit)
     return [str(r["question_id"]) for r in history if r.get("question_id")]
 
 
 class GetRecommendedQuestionTool(Tool):
+    """查库：推荐多道面试题（遗忘曲线/薄弱点/随机）。"""
     def __init__(self):
         super().__init__(
             name="get_recommended_question",
             description=(
-                "从题库推荐一道面试题。推荐策略：① 遗忘曲线到期复习题；② 薄弱标签新题；③ 按 topic/company 随机未做过题。"
-                "支持填槽：topic（知识点）、difficulty（难度）、company（公司真题，如「字节的题」）。"
-                "调用时机：① 用户主动要新题（「出一道题」「来一题」「字节的MySQL题」）；② 评分完成后用户说「下一题」。"
-                "若用户说「某公司的题」但未指定公司，需先询问「请问您想练哪家公司的题？」完成填槽。"
-                "**严禁**在「我想练习这道题：XXX」场景调用——用户已指定题目，直接按出题格式输出即可，不查库、不推荐。"
+                "【调用时机】用户说「来道题」「下一题」「字节的MySQL题」「出一道Redis题」时。"
+                "【功能】从题库推荐多道题（默认5道）：① 遗忘曲线到期 ② 薄弱标签 ③ 按 topic/company 随机。"
+                "【填槽】topic、company、difficulty。若说「某公司的题」未指定公司，先询问补全。"
+                "【严禁】用户说「我想练习这道题【q_id:xxx】」时严禁调用，直接输出题目即可。"
             ),
         )
 
@@ -73,6 +48,12 @@ class GetRecommendedQuestionTool(Tool):
         difficulty = (parameters.get("difficulty") or "").strip().lower()
         seen_ids = set(_get_seen_question_ids(user_id))
         
+        # 从 .env 读取配置
+        count = int(getattr(settings, "recommend_questions_count", 5))
+        use_json = getattr(settings, "recommend_questions_json_format", True)
+        show_detail = getattr(settings, "recommend_questions_show_detail", True)
+        show_reason = getattr(settings, "recommend_questions_show_reason", True)
+        
         try:
             # 使用多路召回推荐器
             questions = multi_recall_recommender.recommend(
@@ -81,7 +62,7 @@ class GetRecommendedQuestionTool(Tool):
                 company=company or None,
                 difficulty=difficulty or None,
                 tags=[topic] if topic else None,
-                top_n=1,  # 只返回 1 道题
+                top_n=count,  # 返回 N 道题（默认 5）
                 exclude_ids=seen_ids,
             )
             
@@ -91,10 +72,65 @@ class GetRecommendedQuestionTool(Tool):
                     message="题库暂无符合条件的题目，请先抓取面经数据或调整筛选条件。"
                 )
             
-            question = questions[0]
-            return ToolResponse.success(
-                text=json.dumps(question, ensure_ascii=False, indent=2)
-            )
+            # 格式化输出
+            if use_json:
+                # JSON 格式化输出
+                formatted_questions = []
+                for idx, q in enumerate(questions, 1):
+                    item = {
+                        "序号": idx,
+                        "题目ID": q.get("q_id", ""),
+                        "题目": q.get("question_text", "")[:150] if show_detail else q.get("question_text", ""),
+                        "难度": q.get("difficulty", "medium"),
+                        "标签": q.get("topic_tags", []) if show_detail else None,
+                        "公司": q.get("company", "") if show_detail else None,
+                    }
+                    
+                    # 添加推荐理由
+                    if show_reason:
+                        reason = _get_recommendation_reason(q, topic, company, difficulty)
+                        item["推荐理由"] = reason
+                    
+                    # 移除 None 值
+                    item = {k: v for k, v in item.items() if v is not None}
+                    formatted_questions.append(item)
+                
+                result = {
+                    "总数": len(formatted_questions),
+                    "筛选条件": {
+                        "知识点": topic or "不限",
+                        "公司": company or "不限",
+                        "难度": difficulty or "不限",
+                    },
+                    "题目列表": formatted_questions,
+                }
+                
+                return ToolResponse.success(
+                    text=json.dumps(result, ensure_ascii=False, indent=2)
+                )
+            else:
+                # 纯文本格式输出
+                lines = [f"📚 为您推荐 {len(questions)} 道题目\n"]
+                lines.append(f"筛选条件：知识点={topic or '不限'} | 公司={company or '不限'} | 难度={difficulty or '不限'}\n")
+                lines.append("=" * 80)
+                
+                for idx, q in enumerate(questions, 1):
+                    lines.append(f"\n【第 {idx} 题】")
+                    lines.append(f"题目ID: {q.get('q_id', '')}")
+                    if show_detail:
+                        lines.append(f"难度: {q.get('difficulty', 'medium')}")
+                        tags = q.get("topic_tags", [])
+                        if tags:
+                            lines.append(f"标签: {', '.join(tags)}")
+                        if q.get("company"):
+                            lines.append(f"公司: {q.get('company')}")
+                    lines.append(f"\n题目: {q.get('question_text', '')}")
+                    if show_reason:
+                        reason = _get_recommendation_reason(q, topic, company, difficulty)
+                        lines.append(f"\n推荐理由: {reason}")
+                    lines.append("\n" + "-" * 80)
+                
+                return ToolResponse.success(text="\n".join(lines))
             
         except Exception as e:
             logger.exception("get_recommended_question failed")
@@ -104,18 +140,53 @@ class GetRecommendedQuestionTool(Tool):
             )
 
 
+def _get_recommendation_reason(question: dict, topic: str, company: str, difficulty: str) -> str:
+    """生成推荐理由"""
+    reasons = []
+    
+    q_tags = question.get("topic_tags", [])
+    q_company = question.get("company", "")
+    q_difficulty = question.get("difficulty", "medium")
+    
+    # 匹配知识点
+    if topic and topic in q_tags:
+        reasons.append(f"✓ 匹配知识点「{topic}」")
+    elif topic and any(t in topic for t in q_tags):
+        reasons.append(f"✓ 相关知识点「{', '.join(q_tags[:2])}」")
+    
+    # 匹配公司
+    if company and company in q_company:
+        reasons.append(f"✓ 来自「{q_company}」真题")
+    
+    # 难度匹配
+    if difficulty and difficulty == q_difficulty:
+        reasons.append(f"✓ 符合「{difficulty}」难度")
+    
+    # 遗忘曲线
+    if question.get("is_due_review"):
+        reasons.append("⏰ 遗忘曲线到期，需复习")
+    
+    # 薄弱点
+    if question.get("is_weak_tag"):
+        reasons.append("📉 薄弱知识点，重点练习")
+    
+    # 默认理由
+    if not reasons:
+        reasons.append("🎯 精选推荐")
+    
+    return " | ".join(reasons)
+
+
 class FindSimilarQuestionsTool(Tool):
-    """② 换个问法/出几道类似题：RAG 相似题，排除自身 top n"""
+    """查库：语义相似题，排除当前题。"""
     def __init__(self):
         super().__init__(
             name="find_similar_questions",
             description=(
-                "【② 换个问法/类似题】从 RAG 向量检索与当前题目语义相似的题目，排除自身，返回 top n。"
-                "功能：基于题目文本做向量相似检索，排除 exclude_id 指定的当前题，返回最相似的 limit 道。"
-                "支持填槽：company（同公司类似题，如「字节的类似题」）、difficulty（难度过滤）。"
-                "调用时机：用户说「换个问法」「同公司的类似题」「出几道类似的」且对话中有上一题【q_id:xxx】时。"
-                "若用户说「同公司的」但未指定公司，需先询问「请问您想找哪家公司的类似题？」完成填槽。"
-                "**严禁**在「我想练习这道题：XXX」场景调用——用户已指定题目，直接格式化输出即可，不检索。"
+                "【调用时机】用户说「换个问法」「同公司的类似题」「出几道类似的」且对话中有上一题时。"
+                "【功能】向量检索相似题，排除 exclude_id，返回 limit 道。"
+                "【填槽】question_text（必填）、exclude_id、company、difficulty。若说「同公司的」未指定公司，先询问。"
+                "【严禁】用户说「我想练习这道题」时严禁调用。"
             ),
         )
 
@@ -130,7 +201,7 @@ class FindSimilarQuestionsTool(Tool):
             ToolParameter("difficulty", "string",
                           "难度填槽：easy / medium / hard，留空不限", required=False),
             ToolParameter("limit", "integer",
-                          "返回数量，默认3，最多5", required=False),
+                          f"返回数量，默认 {settings.retrieval_similar_limit}（由 RETRIEVAL_SIMILAR_LIMIT 配置）", required=False),
         ]
 
     def run(self, parameters):
@@ -138,7 +209,8 @@ class FindSimilarQuestionsTool(Tool):
         exclude_id = (parameters.get("exclude_id") or "").strip()
         company = (parameters.get("company") or "").strip()
         difficulty = (parameters.get("difficulty") or "").strip().lower()
-        limit = min(int(parameters.get("limit") or 3), 5)
+        default_limit = settings.retrieval_similar_limit
+        limit = min(int(parameters.get("limit") or default_limit), max(default_limit, 10))
         if not question_text:
             return ToolResponse.error(code="INVALID_PARAM", message="question_text 不能为空")
         try:
@@ -154,18 +226,70 @@ class FindSimilarQuestionsTool(Tool):
                         search_top_k = settings.retrieval_search_top_k
                         score_threshold = settings.retrieval_score_threshold
                         vec_results = neo4j_service.search_similar(
-                            emb, top_k=search_top_k + len(exclude_ids),
-                            score_threshold=score_threshold, exclude_ids=exclude_ids
+                            emb,
+                            top_k=search_top_k + len(exclude_ids),
+                            score_threshold=score_threshold,
+                            exclude_ids=exclude_ids,
                         )
                         if vec_results:
                             # 重排：使用 Ollama Qwen3-Reranker
                             if settings.rerank_enabled and len(vec_results) > 1:
+                                # 打印向量检索原始结果（仅打印 id 和原始 score，避免日志过长）
+                                try:
+                                    logger.info(
+                                        "[FindSimilarQuestions] 向量检索返回 %d 条，top_k=%d threshold=%.2f exclude_ids=%s",
+                                        len(vec_results),
+                                        search_top_k,
+                                        score_threshold,
+                                        exclude_ids,
+                                    )
+                                    logger.debug(
+                                        "[FindSimilarQuestions] 原始向量结果前 %d 条: %s",
+                                        min(10, len(vec_results)),
+                                        [
+                                            {
+                                                "id": str(r.get("id")),
+                                                "score": round(float(r.get("score", 0)), 4),
+                                            }
+                                            for r in vec_results[:10]
+                                        ],
+                                    )
+                                except Exception:
+                                    # 日志失败不影响主流程
+                                    pass
+
                                 reranked = rerank_candidates(
                                     query=question_text[:2048],
                                     candidates=vec_results,
                                     text_key="text",
                                     top_n=limit,
                                 )
+
+                                # 打印重排后的结果顺序及分数，便于排查「为何这道题排在前面」
+                                try:
+                                    logger.info(
+                                        "[FindSimilarQuestions] 重排后取前 %d 条，实际返回 %d 条",
+                                        limit,
+                                        len(reranked),
+                                    )
+                                    logger.debug(
+                                        "[FindSimilarQuestions] 重排结果: %s",
+                                        [
+                                            {
+                                                "id": str(r.get("id")),
+                                                "rerank_score": round(
+                                                    float(r.get("rerank_score", 0)), 4
+                                                ),
+                                                "orig_score": round(
+                                                    float(r.get("score", 0)), 4
+                                                ),
+                                            }
+                                            for r in reranked
+                                        ],
+                                    )
+                                except Exception:
+                                    pass
+
                                 for rec in reranked:
                                     results.append({
                                         "q_id": str(rec["id"]),
@@ -257,15 +381,15 @@ class FindSimilarQuestionsTool(Tool):
             return ToolResponse.error(code="EXECUTION_ERROR", message=f"find_similar_questions failed: {e}")
 
 class FilterQuestionsTool(Tool):
+    """查库：按条件筛选题目列表。"""
     def __init__(self):
         super().__init__(
             name="filter_questions",
             description=(
-                "按条件筛选题目列表（company/tags/difficulty/keyword/日期 等），返回题目列表供用户浏览选择。"
-                "支持填槽：company、tags、difficulty、question_type、keyword、date_from、date_to。"
-                "调用时机：用户说「列出字节的题」「这周收录的题」「Redis 中等难度」时。"
-                "日期格式：YYYY-MM-DD，如 2025-03-01。date_from/date_to 用于按题目收录时间筛选。"
-                "**严禁**在「我想练习这道题：XXX」场景调用——用户已指定题目，直接格式化输出即可。"
+                "【调用时机】用户说「列出字节的题」「这周收录的题」「Redis中等难度」时。"
+                "【功能】按 company/tags/difficulty/keyword/日期 筛选，返回题目列表。"
+                "【填槽】company、tags、difficulty、keyword、date_from、date_to（YYYY-MM-DD）。"
+                "【严禁】用户说「我想练习这道题」时严禁调用。"
             ),
         )
 
@@ -336,92 +460,96 @@ class FilterQuestionsTool(Tool):
             return ToolResponse.error(code="EXECUTION_ERROR", message=f"filter_questions failed: {e}")
 
 
-class RecognizeIntentTool(Tool):
-    """第一步必须调用的意图识别工具，解析用户消息并返回结构化 intent + slots。"""
-
+class GetQuestionDetailTool(Tool):
+    """查库：获取题目详情（题目文本、参考答案）。"""
     def __init__(self):
         super().__init__(
-            name="recognize_intent",
+            name="get_question_detail",
             description=(
-                "【第一步必须调用】解析用户消息，识别意图并提取槽位。"
-                "输入：用户原始消息。输出：intent（意图）、slots（槽位）。"
-                "调用时机：每轮对话开始时**必须**先调用此工具，再根据 intent 选择后续工具。"
-                "对于【已作答】格式，会提取 question_id 和 user_answer，供 submit_answer 直接使用。"
+                "【调用时机】用户想查看题目详情、参考答案时；submit_answer 流程无需调用（工具内部自动取题）。"
+                "【功能】返回 question_text、answer_text、topic_tags、difficulty。"
+                "【填槽】question_id（必填）。"
             ),
         )
 
     def get_parameters(self):
         return [
-            ToolParameter("user_message", "string",
-                          "用户原始消息（完整复制）", required=True),
+            ToolParameter("question_id", "string", "题目ID（q_id）", required=True),
         ]
 
     def run(self, parameters):
-        msg = (parameters.get("user_message") or "").strip()
-        if not msg:
-            return ToolResponse.error(code="INVALID_PARAM", message="user_message 不能为空")
+        question_id = (parameters.get("question_id") or "").strip()
+        if not question_id:
+            return ToolResponse.error(code="INVALID_PARAM", message="question_id 不能为空")
+        try:
+            with sqlite_service._get_conn() as conn:
+                row = conn.execute(
+                    "SELECT question_text, answer_text, topic_tags, difficulty FROM questions WHERE q_id = ?",
+                    (question_id,)
+                ).fetchone()
+            if not row:
+                return ToolResponse.error(code="NOT_FOUND", message=f"未找到题目 {question_id}")
+            # sqlite3.Row 无 .get，用索引
+            topic_raw = row["topic_tags"] if row["topic_tags"] else None
+            result = {
+                "question_id": question_id,
+                "question_text": row["question_text"] or "",
+                "answer_text": row["answer_text"] or "",
+                "topic_tags": json.loads(topic_raw) if topic_raw else [],
+                "difficulty": row["difficulty"] or "medium",
+            }
+            return ToolResponse.success(text=json.dumps(result, ensure_ascii=False, indent=2))
+        except Exception as e:
+            logger.exception("get_question_detail failed")
+            return ToolResponse.error(code="EXECUTION_ERROR", message=f"get_question_detail failed: {e}")
 
-        intent = "unknown"
-        slots: Dict[str, Any] = {}
 
-        # 【已作答】格式：提取 q_id、user_answer
-        if "【已作答】" in msg or "已作答" in msg:
-            q_match = re.search(r"【q_id[：:]\s*([a-f0-9\-]+)】", msg, re.I)
-            ans_match = re.search(r"【我的作答】\s*([\s\S]*?)(?=【|$)", msg)
-            if not ans_match:
-                ans_match = re.search(r"我的作答[：:]\s*([\s\S]*?)(?=【|$)", msg)
-            question_id = (q_match.group(1) or "").strip() if q_match else ""
-            user_answer = (ans_match.group(1) or "").strip() if ans_match else ""
-            if question_id and user_answer:
-                intent = "submit_answer"
-                slots = {"question_id": question_id, "user_answer": user_answer}
-            elif question_id or user_answer:
-                intent = "submit_answer"
-                slots = {"question_id": question_id, "user_answer": user_answer}
+def _VALID_INTENTS() -> set:
+    return {
+        "submit_answer", "practice_specified", "get_recommended_question",
+        "find_similar_questions", "explain", "get_mastery_report", "filter_questions",
+        "record_weakness", "manage_note", "get_session_context", "analyze_resume",
+        "get_knowledge_recommendation", "unknown",
+    }
 
-        # 出题 / 推荐
-        if intent == "unknown" and any(kw in msg for kw in ("出一道", "来一道", "来一题", "出题", "下一题", "推荐", "来道题")):
-            intent = "get_recommended_question"
-            if "字节" in msg or "bytedance" in msg.lower():
-                slots["company"] = "字节跳动"
-            if "mysql" in msg.lower() or "MySQL" in msg:
-                slots["topic"] = "MySQL"
-            if "redis" in msg.lower() or "Redis" in msg:
-                slots["topic"] = "Redis"
-            if "jvm" in msg.lower() or "JVM" in msg:
-                slots["topic"] = "JVM"
 
-        # 类似题 / 换个问法
-        if intent == "unknown" and any(kw in msg for kw in ("换个问法", "类似题", "同类型")):
-            intent = "find_similar_questions"
-            slots["exclude_id"] = ""  # 需从上下文获取
+class RecognizeIntentTool(Tool):
+    """记录 Agent 推断的意图，不做规则解析。"""
 
-        # 讲解 / 解释
-        if intent == "unknown" and any(kw in msg for kw in ("讲解", "解释", "什么是", "讲讲")):
-            intent = "explain"
+    def __init__(self):
+        super().__init__(
+            name="recognize_intent",
+            description=(
+                "【调用时机】每轮对话**第一步必须**调用，再根据 intent 选择后续工具。"
+                "【功能】记录你根据对话上下文推断的意图与槽位，不进行规则解析。"
+                "【填槽】intent（必填）、slots（可选，如 submit_answer 需 {question_id, user_answer}）。"
+            ),
+        )
 
-        # 复习 / 薄弱点
-        if intent == "unknown" and any(kw in msg for kw in ("复习", "薄弱点", "错题", "总结")):
-            intent = "get_mastery_report"
+    def get_parameters(self):
+        return [
+            ToolParameter("intent", "string",
+                          "你根据上下文推断的意图，如 submit_answer、practice_specified、get_recommended_question 等", required=True),
+            ToolParameter("slots", "object",
+                          "提取的槽位：practice_specified 填 {question_id}；submit_answer 仅填 {question_id}，勿填 user_answer（系统自动取本轮用户消息）", required=False),
+        ]
 
-        # 筛选
-        if intent == "unknown" and any(kw in msg for kw in ("列出", "筛选", "这周收录")):
-            intent = "filter_questions"
+    def run(self, parameters):
+        intent = (parameters.get("intent") or "").strip() or "unknown"
+        slots = parameters.get("slots")
+        if slots is None:
+            slots = {}
+        if isinstance(slots, str):
+            try:
+                slots = json.loads(slots) if slots.strip() else {}
+            except json.JSONDecodeError:
+                slots = {}
+        if not isinstance(slots, dict):
+            slots = {}
 
-        # 笔记
-        if intent == "unknown" and any(kw in msg for kw in ("我搞混了", "我漏了", "分不清", "记一下混淆", "记录遗漏", "我混淆了")):
-            intent = "record_weakness"
-
-        if intent == "unknown" and any(kw in msg for kw in ("记一下", "笔记", "保存笔记", "查看笔记")):
-            intent = "manage_note"
-
-        # 会话统计
-        if intent == "unknown" and any(kw in msg for kw in ("做了几道", "会话进度", "统计")):
-            intent = "get_session_context"
-
-        # 练习指定题（不调用工具）
-        if intent == "unknown" and any(kw in msg for kw in ("我想练习", "练习这道题", "练习：")):
-            intent = "practice_specified"
+        valid = _VALID_INTENTS()
+        if intent not in valid:
+            intent = "unknown"
 
         result = {"intent": intent, "slots": slots}
         return ToolResponse.success(
@@ -429,29 +557,21 @@ class RecognizeIntentTool(Tool):
 
 
 class SubmitAnswerTool(Tool):
+    """填槽评分+持久化：Agent 传入 question_id 和 user_answer，工具内部调用 LLM 自动评分，再写入 study_records / SM-2 / 会话历史。"""
     def __init__(self):
         super().__init__(
             name="submit_answer",
             description=(
-                "用户提交答案后调用：① LLM 评分（0-5分）+ 反馈；② 写入 study_records（SM-2 遗忘曲线）；③ 更新标签掌握度。"
-                "调用时机：仅当用户发送【已作答】格式（含【q_id:xxx】【我的作答】yyy）时**必须**调用。"
-                "必须传入 question_id（从【q_id:xxx】提取）和 user_answer（从【我的作答】提取）。"
-                "评分完成后，用户说「下一题」「推荐同类题」时再调用 get_recommended_question 或 find_similar_questions。"
+                "【调用时机】用户提交答案后，调用此工具完成评分和记录。"
+                "【功能】① 自动调用评估 LLM 对答案打分（无需 Agent 自行评分）② 写入 study_records、SM-2 遗忘曲线、会话历史。"
+                "【填槽】question_id 必填；user_answer 可不传（自动取本轮用户消息）。score/feedback 无需传入，工具自动评分。"
             ),
         )
 
     def get_parameters(self):
         return [
-            ToolParameter("question_id", "string",
-                          "题目ID（q_id）", required=True),
-            ToolParameter("user_answer", "string",
-                          "用户提交的答案文本", required=True),
-            ToolParameter("question_text", "string",
-                          "题目原文（提供给评分 LLM 作为上下文）", required=False),
-            ToolParameter("answer_text", "string",
-                          "参考答案（提供给评分 LLM 作为评分依据）", required=False),
-            ToolParameter("session_id", "string",
-                          "当前会话 ID，用于统计本次面试得分", required=False),
+            ToolParameter("question_id", "string", "题目ID（q_id），必填", required=True),
+            ToolParameter("user_answer", "string", "用户作答内容，可不传（系统自动取本轮用户消息）", required=False),
         ]
 
     def run(self, parameters):
@@ -459,92 +579,134 @@ class SubmitAnswerTool(Tool):
         session_id = get_current_session_id()
         question_id = (parameters.get("question_id") or "").strip()
         user_answer = (parameters.get("user_answer") or "").strip()
-        question_text = (parameters.get("question_text") or "").strip()
-        answer_text = (parameters.get("answer_text") or "").strip()
+        if not user_answer:
+            user_answer = (get_current_user_message() or "").strip()
 
         if not question_id or not user_answer:
             return ToolResponse.error(code="INVALID_PARAM", message="question_id 和 user_answer 不能为空")
 
+        # ── 填槽：自动从题库获取题目文本和标准答案 ──────────────────────
+        question_text = ""
+        reference_answer = ""
+        question_tags: List[str] = []
         try:
-            # 若未提供题目文本，从 SQLite 补全
-            if not question_text:
-                rows = sqlite_service.filter_questions(
-                    keyword=question_id, limit=1)
-                # 尝试按 q_id 精确查
-                with sqlite_service._get_conn() as conn:
-                    row = conn.execute(
-                        "SELECT question_text, answer_text, topic_tags FROM questions WHERE q_id = ?",
-                        (question_id,)
-                    ).fetchone()
-                    if row:
-                        question_text = row["question_text"] or ""
-                        answer_text = answer_text or row["answer_text"] or ""
+            with sqlite_service._get_conn() as conn:
+                row = conn.execute(
+                    "SELECT question_text, answer_text, topic_tags FROM questions WHERE q_id = ?",
+                    (question_id,)
+                ).fetchone()
+            if row:
+                question_text = row["question_text"] or ""
+                reference_answer = row["answer_text"] or ""
+                try:
+                    question_tags = json.loads(row["topic_tags"] or "[]") or []
+                except Exception:
+                    question_tags = []
+        except Exception as e:
+            logger.warning("[submit_answer] 获取题目详情失败: %s", e)
 
-            # LLM 评分
-            ref_ans = answer_text[:500] if answer_text else "（无）"
-            score_prompt = (
-                f"题目：{question_text}\n"
-                f"参考答案：{ref_ans}\n"
-                f"用户答案：{user_answer}\n\n"
-                "请对用户答案打分（0-5分整数）并给出简短反馈（3-5句话）。"
-                '仅返回 JSON 格式：{\"score\": <int>, \"feedback\": \"<str>\"}\n'
-                "评分标准：0=完全错误，1=方向对但内容严重缺失，"
-                "2=基本思路对但细节错误，3=答案正确但不完整，"
-                "4=答案完整，5=超出预期（有深度补充）。\n"
-                "feedback 要求：\n"
-                "- 3-5句话，不超过150字\n"
-                "- 直接说优点和不足，不要加亮点、优化点等标题\n"
-                "- 不要说您的答案、已为您提交等废话\n"
-                "- 格式：先说对的地方，再说需要改进的地方，最后一句建议"
+        if not question_text:
+            return ToolResponse.error(code="NOT_FOUND", message=f"未找到题目 {question_id}，请确认 question_id 正确")
+
+        # 校验：禁止将题目当答案
+        a_clean = user_answer.strip()
+        q_clean = question_text.strip()
+        if q_clean and (a_clean == q_clean or (a_clean in q_clean and len(a_clean) < 30)):
+            return ToolResponse.error(
+                code="INVALID_PARAM",
+                message="user_answer 与题目相同或为题目片段，用户尚未作答。"
             )
-            raw = _call_llm(score_prompt, json_mode=True, max_tokens=300)
-            try:
-                parsed = json.loads(raw)
-                score = max(0, min(5, int(parsed.get("score", 2))))
-                feedback = parsed.get("feedback", "")
-            except Exception:
-                score = 2
-                feedback = raw[:200] if raw else "评分解析失败"
 
-            # 生成 message_id 用于关联对话历史
+        # 评估逻辑已移除：提交作答只记录，不调用 LLM 评分
+        score_display = 0.0
+        score = 0
+        feedback = "已记录作答。"
+        missed_points: List[str] = []
+        error_points: List[dict] = []
+        merged_tags = list(question_tags)
+
+        eval_details = {
+            "shortcomings": [],
+            "error_points": error_points,
+            "missed_points": missed_points,
+            "strong_points": [],
+        }
+
+        try:
             import time
             message_id = f"eval_{question_id}_{int(time.time()*1000)}"
 
-            # 写入学习记录（SM-2 自动更新），关联 message_id
             sm2 = sqlite_service.add_study_record(
                 user_id=user_id,
                 question_id=question_id,
-                score=score,
+                score=score_display,
                 user_answer=user_answer,
                 ai_feedback=feedback,
                 session_id=session_id,
                 message_id=message_id,
+                eval_details=eval_details,
             )
+            # 同步标签掌握度
+            if merged_tags:
+                try:
+                    sqlite_service.update_tag_mastery(user_id, merged_tags, score)
+                except Exception as _te:
+                    logger.debug("update_tag_mastery 忽略: %s", _te)
+
+            # 同步 next_review_at 到 Neo4j，供多路召回+rerank(时间)推荐
+            if sm2 and sm2.get("next_review_at"):
+                try:
+                    from backend.services.storage import neo4j_service
+                    neo4j_service.upsert_user_study_record(
+                        user_id=user_id,
+                        question_id=question_id,
+                        next_review_at=sm2["next_review_at"],
+                        score=score,
+                    )
+                except Exception as ex:
+                    logger.debug("Neo4j 同步复习时间失败（不影响主流程）: %s", ex)
+
+            # ⚠️ 修复：不再自动写入 note，而是返回 missed_points/error_points
+            # 让 Agent 根据返回结果主动调用 RecordWeaknessTool 或 ManageNoteTool 来记录
+            # 这样职责清晰：submit_answer 只负责评分，note 记录由 Agent 决策
+            note_count_log = len(missed_points) + len(error_points)
+            if note_count_log:
+                logger.info(
+                    "[submit_answer] 返回 %d 条遗漏/混淆点，由 Agent 主动调用 RecordWeaknessTool 记录",
+                    note_count_log,
+                )
 
             # 同时更新对话历史，记录评分结果
             if session_id:
                 sqlite_service.update_session_history(
                     session_id=session_id,
                     role="assistant",
-                    content=f"✅ 评分完成：{score}/5\n\n{feedback}",
+                    content=f"✅ 评分完成：{score_display}/5\n\n{feedback}",
                     message_id=message_id,
                     metadata={
                         "type": "answer_evaluation",
                         "question_id": question_id,
-                        "score": score,
+                        "score": score_display,
                         "sm2": sm2
                     }
                 )
 
+            note_count = len(missed_points) + len(error_points)
             result = {
-                "score": score,
+                "score": score_display,
                 "feedback": feedback,
+                "shortcomings": [],
+                "strong_points": [],
+                "missed_points": missed_points,
+                "error_points": error_points,
+                "tags": merged_tags,
+                "standard_answer": reference_answer or "",
                 "sm2": sm2,
                 "message_id": message_id,
                 "message": (
-                    f"得分 {score}/5。"
-                    + ("下次复习：" + sm2["next_review_at"]
-                       if sm2 else "")
+                    f"评分完成：{score_display}/5。"
+                    + ("下次复习：" + sm2["next_review_at"] if sm2 else "")
+                    + (f" 检测到 {note_count} 条遗漏/混淆点，请调用 record_weakness 工具记录。" if note_count else "")
                 ),
             }
             return ToolResponse.success(
@@ -554,14 +716,14 @@ class SubmitAnswerTool(Tool):
             return ToolResponse.error(code="EXECUTION_ERROR", message=f"submit_answer failed: {e}")
 
 class RecordWeaknessTool(Tool):
-    """记录用户自述的混淆点和遗漏点，供学习报告展示"""
+    """记录：混淆点、遗漏点，供学习报告展示。"""
     def __init__(self):
         super().__init__(
             name="record_weakness",
             description=(
-                "记录用户自述的混淆点或遗漏点。"
-                "调用时机：用户说「我搞混了X和Y」「我漏了Z」「我分不清A和B」等时。"
-                "记录后会在学习报告中展示，帮助针对性复习。"
+                "【调用时机】用户说「我搞混了X和Y」「我漏了Z」「分不清A和B」时。"
+                "【功能】写入 episodic 记忆，学习报告中展示。"
+                "【填槽】confusion_points、missed_points、tags。至少提供其一。"
             ),
         )
 
@@ -613,6 +775,16 @@ class RecordWeaknessTool(Tool):
                     event_type="user_confusion",
                     session_id=session_id or "",
                 )
+                # 同步写入 user_notes，供「我记录的薄弱点」页面展示
+                try:
+                    sqlite_service.add_note(
+                        user_id=user_id,
+                        content=content,
+                        note_type="confusion",
+                        tags=["混淆点"] + [str(t) for t in tags[:3]],
+                    )
+                except Exception as _ex:
+                    logger.debug("RecordWeaknessTool add_note(混淆) 忽略: %s", _ex)
                 count += 1
         for m in missed:
             if m and str(m).strip():
@@ -626,6 +798,16 @@ class RecordWeaknessTool(Tool):
                     event_type="user_missed",
                     session_id=session_id or "",
                 )
+                # 同步写入 user_notes，供「我记录的薄弱点」页面展示
+                try:
+                    sqlite_service.add_note(
+                        user_id=user_id,
+                        content=content,
+                        note_type="weakness",
+                        tags=["遗漏点"] + [str(t) for t in tags[:3]],
+                    )
+                except Exception as _ex:
+                    logger.debug("RecordWeaknessTool add_note(遗漏) 忽略: %s", _ex)
                 count += 1
         return ToolResponse.success(
             text=json.dumps({"message": f"已记录 {count} 条薄弱点", "count": count}, ensure_ascii=False)
@@ -633,13 +815,15 @@ class RecordWeaknessTool(Tool):
 
 
 class ManageNoteTool(Tool):
+    """查库+写：笔记 CRUD。"""
     def __init__(self):
         super().__init__(
             name="manage_note",
             description=(
-                "用户笔记 CRUD。action=create/list/update/delete。"
-                "调用时机：用户说「记一下」「保存笔记」「查看我的笔记」「删除笔记」时。"
-                "**严禁**在「我想练习这道题」或出题场景调用。"
+                "【调用时机】用户说「记一下」「保存笔记」→ create；「查看笔记」→ list；「修改/删除笔记」→ update/delete。"
+                "【功能】笔记增删改查。action=create/list/update/delete。"
+                "【填槽】action 必填；create/update 需 content；update/delete 需 note_id；list 可选 keyword/tags。"
+                "【严禁】出题、练习、评分场景严禁调用。"
             ),
         )
 
@@ -740,13 +924,14 @@ class ManageNoteTool(Tool):
 
 
 class GetSessionContextTool(Tool):
+    """查库：本次会话统计。"""
     def __init__(self):
         super().__init__(
             name="get_session_context",
             description=(
-                "读取本次会话统计：已做题数、已练标签、会话进度。"
-                "调用时机：用户问「做了几道」「会话进度」「今天练了几题」时。"
-                "**严禁**在「我想练习这道题」或出题场景调用——用户已指定题目，直接格式化输出即可。"
+                "【调用时机】用户说「做了几道」「会话进度」「今天练了几题」时。"
+                "【功能】返回本次会话已做题数、平均分、已练标签。"
+                "【严禁】用户说「我想练习这道题」时严禁调用。"
             ),
         )
 
@@ -790,31 +975,50 @@ class GetSessionContextTool(Tool):
 
 
 class GetMasteryReportTool(Tool):
-    """① 复习/薄弱点场景：调取以前答题记录+漏洞"""
+    """查库：历史掌握度、薄弱点、复习建议。"""
     def __init__(self):
         super().__init__(
             name="get_mastery_report",
             description=(
-                "【① 复习/薄弱点】调取用户历史答题记录、错题、薄弱标签、推荐复习题。"
-                "支持填槽：date_from、date_to（按做题日期筛选，如「这周的错题」「3月以来的薄弱点」）。"
-                "日期格式 YYYY-MM-DD。若用户说「这周的」但未给具体日期，可推算本周一/今天完成填槽。"
-                "调用时机：用户说「复习之前做过的题」「回顾错题」「总结薄弱点」时。"
-                "**严禁**在「我想练习这道题」场景调用——用户已指定题目，直接格式化输出即可。"
+                "【调用时机】用户说「复习」「薄弱点」「错题总结」「总结薄弱点」「这周的错题」「今天的遗漏」时。"
+                "【功能】返回历史答题统计、薄弱标签、错题、note 记录的遗漏/混淆点、待复习题、建议。"
+                "【填槽】用户**未指定时间**时（如仅说「总结薄弱知识点」）**不传** date_from、date_to，表示全部；仅当用户明确说「今天」「近三天」等时才填槽。"
+                "【严禁】默认填 today；用户说「我想练习这道题」时严禁调用。"
             ),
         )
 
     def get_parameters(self):
         return [
             ToolParameter("date_from", "string",
-                          "日期填槽：起始日期 YYYY-MM-DD，如「这周的错题」填本周一", required=False),
+                          "仅当用户明确说时间时填：今天/今日、近三天、近7天、YYYY-MM-DD；未指定时不传（全部）", required=False),
             ToolParameter("date_to", "string",
-                          "日期填槽：截止日期 YYYY-MM-DD，默认今天", required=False),
+                          "仅当用户明确说时间时填：今天/今日、YYYY-MM-DD；未指定时不传（全部）", required=False),
         ]
 
     def run(self, parameters):
         user_id = get_current_user_id()
         date_from = (parameters.get("date_from") or "").strip() or None
         date_to = (parameters.get("date_to") or "").strip() or None
+
+        # 日期填槽：今天、近三天、这周 等口语化解析
+        from datetime import datetime, timedelta
+        _now = datetime.now()
+        _today = _now.strftime("%Y-%m-%d")
+        if date_from and date_from in ("今天", "今日"):
+            date_from, date_to = _today, _today
+        elif date_from and "近" in date_from and "天" in date_from:
+            try:
+                n = int("".join(c for c in date_from if c.isdigit()) or "3")
+                date_from = (_now - timedelta(days=n)).strftime("%Y-%m-%d")
+                date_to = _today
+            except (ValueError, TypeError):
+                date_from = (_now - timedelta(days=3)).strftime("%Y-%m-%d")
+                date_to = _today
+        elif date_to and date_to in ("今天", "今日"):
+            date_to = _today
+        if not date_to:
+            date_to = _today
+
         try:
             summary = sqlite_service.get_mastery_summary(user_id)
             by_level = {}
@@ -864,6 +1068,11 @@ class GetMasteryReportTool(Tool):
                 (by_level.get("novice", [])
                  + by_level.get("learning", []))
             ][:10]
+
+            # 从 note（episodic_log）获取日期范围内的薄弱点
+            weakness_notes = sqlite_service.get_user_weakness_notes(
+                user_id, limit=15, date_from=date_from, date_to=date_to
+            )
             
             report = {
                 "total_questions_practiced": summary["total_questions_practiced"],
@@ -872,6 +1081,7 @@ class GetMasteryReportTool(Tool):
                 "mastery_by_level": by_level,
                 "weak_tags": weak_tags,
                 "weak_questions": weak_questions,
+                "weakness_notes": [{"content": n["content"], "event_type": n["event_type"], "created_at": n["created_at"]} for n in weakness_notes],
                 "review_questions": review_questions,
                 "advice": (
                     f"您的正确率为 {summary['correct_rate']:.0f}%。"
@@ -888,16 +1098,15 @@ class GetMasteryReportTool(Tool):
             return ToolResponse.error(code="EXECUTION_ERROR", message=f"get_mastery_report failed: {e}")
 
 class GetKnowledgeRecommendationTool(Tool):
-    """③ 延伸知识点：GraphRAG 相关知识点 + RAG 对应题目"""
+    """查库+RAG：延伸知识点、相关题目、学习资源。"""
     def __init__(self):
         super().__init__(
             name="get_knowledge_recommendation",
             description=(
-                "【③ 延伸知识点】从 GraphRAG 搜索相关知识点 + 从 RAG 检索对应知识点的题目。"
-                "功能：① 若有 question_id，从知识图谱获取该题覆盖的 Concept，再找相关 Concept；"
-                "② 若有 topic/concept，直接搜索相关概念；③ 从题库检索覆盖这些知识点的题目（排除自身）。"
-                "调用时机：用户说「延伸一下」「拓展相关知识点」「还有哪些相关考点」「推荐学习资料」时。"
-                "**严禁**在「我想练习这道题」或出题场景调用。"
+                "【调用时机】用户说「延伸一下」「拓展考点」「还有哪些相关」「推荐学习资料」时。"
+                "【功能】GraphRAG 相关概念 + 对应题目 + 学习资源。"
+                "【填槽】topic、question_id（当前题可延伸）。"
+                "【严禁】用户说「我想练习这道题」时严禁调用。"
             ),
         )
 
@@ -1026,20 +1235,26 @@ class GetKnowledgeRecommendationTool(Tool):
 
 
 class AnalyzeResumeTool(Tool):
+    """记录：更新用户画像。Agent 解析简历，工具只持久化。"""
     def __init__(self):
         super().__init__(
             name="analyze_resume",
             description=(
-                "分析用户简历，提取技术栈、目标岗位、经验级别，更新用户画像。"
-                "调用时机：用户粘贴简历或说「分析我的简历」时。必须传入 resume_text。"
-                "**严禁**在「我想练习这道题」或出题场景调用。"
+                "【调用时机】用户粘贴简历或说「分析我的简历」时，你解析后调用此工具记录。"
+                "【功能】更新用户画像（技术栈、目标岗位、经验级别等）。"
+                "【填槽】resume_text、tech_stack、target_position、experience_level 必填；target_company、preferred_topics 可选。"
+                "【严禁】出题、练习、评分场景严禁调用。"
             ),
         )
 
     def get_parameters(self):
         return [
-            ToolParameter("resume_text", "string",
-                          "用户简历全文", required=True),
+            ToolParameter("resume_text", "string", "用户简历全文", required=True),
+            ToolParameter("tech_stack", "array", "技术栈列表，如 [\"Java\", \"Redis\"]", required=True),
+            ToolParameter("target_position", "string", "目标岗位", required=True),
+            ToolParameter("experience_level", "string", "经验级别：junior|mid|senior", required=True),
+            ToolParameter("target_company", "string", "目标公司（可空）", required=False),
+            ToolParameter("preferred_topics", "array", "偏好知识点，如 [\"JVM\", \"MySQL\"]", required=False),
         ]
 
     def run(self, parameters):
@@ -1048,30 +1263,23 @@ class AnalyzeResumeTool(Tool):
         if not resume_text:
             return ToolResponse.error(code="INVALID_PARAM", message="resume_text 不能为空")
         try:
-            prompt = (
-                f"请从以下简历中提取关键信息，仅返回 JSON：\n"
-                f"{resume_text[:3000]}\n\n"
-                "返回格式：\n"
-                "{\n"
-                '  \"tech_stack\": [\"技术1\", \"技术2\"],\n'
-                '  \"target_position\": \"岗位名\",\n'
-                '  \"target_company\": \"目标公司（可空）\",\n'
-                '  \"experience_level\": \"junior|mid|senior\",\n'
-                '  \"preferred_topics\": [\"知识点1\", \"知识点2\"]\n'
-                "}"
-            )
-            raw = _call_llm(prompt, json_mode=True, max_tokens=500,
-                            temperature=0.1)
-            try:
-                parsed = json.loads(raw)
-            except Exception:
-                parsed = {}
-
-            tech_stack = parsed.get("tech_stack") or []
-            target_position = parsed.get("target_position") or ""
-            target_company = parsed.get("target_company") or ""
-            experience_level = parsed.get("experience_level") or "junior"
-            preferred_topics = parsed.get("preferred_topics") or []
+            tech_stack = parameters.get("tech_stack") or []
+            target_position = (parameters.get("target_position") or "").strip()
+            experience_level = (parameters.get("experience_level") or "junior").strip().lower()
+            target_company = (parameters.get("target_company") or "").strip()
+            preferred_topics = parameters.get("preferred_topics") or []
+            if isinstance(tech_stack, str):
+                try:
+                    tech_stack = json.loads(tech_stack) if tech_stack.strip().startswith("[") else [tech_stack]
+                except Exception:
+                    tech_stack = [tech_stack] if tech_stack else []
+            if isinstance(preferred_topics, str):
+                try:
+                    preferred_topics = json.loads(preferred_topics) if preferred_topics.strip().startswith("[") else [preferred_topics]
+                except Exception:
+                    preferred_topics = [preferred_topics] if preferred_topics else []
+            if experience_level not in ("junior", "mid", "senior"):
+                experience_level = "junior"
 
             sqlite_service.upsert_user_profile(
                 user_id=user_id,
@@ -1168,6 +1376,7 @@ def get_interviewer_tools() -> list:
         GetRecommendedQuestionTool(),
         FindSimilarQuestionsTool(),
         FilterQuestionsTool(),
+        GetQuestionDetailTool(),
         SubmitAnswerTool(),
         RecordWeaknessTool(),
         ManageNoteTool(),

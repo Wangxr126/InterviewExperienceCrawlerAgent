@@ -132,7 +132,9 @@ class MinerAgentV3(ReActAgent):
         has_image: bool = False,
         company: str = "",
         position: str = "",
-        user_input_override: str = None
+        user_input_override: str = None,
+        source_url: str = "",
+        post_title: str = "",
     ) -> Tuple[str, bool, bool]:
         """
         运行 MinerAgentV3
@@ -155,6 +157,8 @@ class MinerAgentV3(ReActAgent):
             return self._two_stage_extractor.extract(
                 content, has_image, company, position,
                 user_input_override=user_input_override,
+                source_url=source_url,
+                post_title=post_title,
             )
         
         # 单阶段模式和结构化输出模式：使用 ReActAgent
@@ -248,11 +252,13 @@ class MinerAgentV3(ReActAgent):
             schema_prompt = f"""{user_input}
 
 ## 输出格式（结构化）
+**语言强制**：question_text、answer_text、topic_tags 必须全部为中文，严禁韩文。原文为韩文/日文等外语时必须翻译为中文。
+
 你的输出必须严格符合以下 JSON Schema：
 {QuestionListSchema.model_json_schema()}
 
 每个题目必须包含：
-- question_text（至少 5 字）
+- question_text（至少 5 字，必须中文）
 - answer_text（至少 10 字）
 - difficulty（easy/medium/hard）
 - question_type（算法类/AI类/工程类/基础类/软技能）

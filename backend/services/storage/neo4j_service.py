@@ -465,6 +465,35 @@ class Neo4jService:
         logger.info("[Graph] 搜索: get_questions_by_concept 返回 %d 条", len(rows))
         return rows
 
+    def upsert_user_study_record(self, user_id: str, question_id: str,
+                                 next_review_at: str, score: int,
+                                 studied_at: str = None) -> bool:
+        """写入用户学习记录到 Neo4j，供多路召回+rerank(时间)推荐。"""
+        if not self._check_available("upsert_user_study_record"):
+            return False
+        if not user_id or not question_id:
+            return False
+        try:
+            query = """
+            MERGE (s:UserStudyRecord {user_id: $user_id, question_id: $question_id})
+            SET s.next_review_at = $next_review_at,
+                s.score = $score,
+                s.studied_at = coalesce($studied_at, datetime())
+            RETURN 1
+            """
+            with self.driver.session(database=self.db_name) as session:
+                session.run(query,
+                           user_id=user_id,
+                           question_id=question_id,
+                           next_review_at=next_review_at or "",
+                           score=score or 0,
+                           studied_at=studied_at)
+            logger.debug("[Graph] upsert_user_study_record user=%s q=%s", user_id[:8], question_id[:8])
+            return True
+        except Exception as e:
+            logger.warning("Neo4j upsert_user_study_record 失败: %s", e)
+            return False
+
 
 # 单例
 neo4j_service = Neo4jService()

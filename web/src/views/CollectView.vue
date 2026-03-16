@@ -537,8 +537,8 @@ const STATUS_META = {
   error:      { label: '失败',   color: '#f56c6c' },
   skipped:    { label: '已跳过', color: '#c0c4cc' },
 }
-const STATUS_LABEL = { pending:'待抓取', fetched:'待提取', done:'已完成', unrelated:'无关帖', error:'失败', skipped:'已跳过' }
-const STATUS_TAG   = { pending:'warning', fetched:'', done:'success', unrelated:'info', error:'danger', skipped:'info' }
+const STATUS_LABEL = { pending:'待抓取', fetched:'待提取', stage2_pending:'待精加工', done:'已完成', unrelated:'无关帖', error:'失败', skipped:'已跳过' }
+const STATUS_TAG   = { pending:'warning', fetched:'', stage2_pending:'', done:'success', unrelated:'info', error:'danger', skipped:'info' }
 
 const fetchedCount = computed(() => {
   const v = rawStats.value['fetched']

@@ -272,7 +272,7 @@ import random
 
 import time
 
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 
 
@@ -294,9 +294,10 @@ from pydantic import BaseModel
 
 
 
-from backend.agents.orchestrator import get_orchestrator
+from backend.agents.interviewer_agent import get_orchestrator
 
 from backend.services.storage.sqlite_service import sqlite_service
+from backend.services.multi_recall_recommender import multi_recall_recommender
 
 from backend.services.scheduling.scheduler import crawl_scheduler
 from backend.services.crawler.task_executor import (
@@ -305,6 +306,7 @@ from backend.services.crawler.task_executor import (
     prepare_extract_pending,
     prepare_retry_errors,
     prepare_re_extract_all,
+    get_fetched_task_ids,
 )
 
 
@@ -530,6 +532,7 @@ def get_config():
     from backend.services.crawler.task_executor import get_source_info
     return {
         "default_user_id": _s.default_user_id,
+        "default_session_id": _s.default_session_id,
         "interviewer_max_steps": _s.interviewer_max_steps,
         "crawler_process_batch_size": _s.crawler_process_batch_size,
         "crawler_source": _s.crawler_source,
@@ -759,7 +762,55 @@ def get_random_question(
     return q
 
 
-
+@app.get("/api/questions/smart-practice")
+def get_smart_practice_questions(
+    user_id: Optional[str] = Query(None, description="用户ID，必填时启用薄弱点+复习召回"),
+    limit: int = Query(20, ge=1, le=50, description="每批题目数量上限（实际条数由 .env 知识点不足+随机数决定）"),
+    company: Optional[str] = Query(None),
+    difficulty: Optional[str] = Query(None),
+    question_type: Optional[str] = Query(None),
+    tag: Optional[str] = Query(None),
+    source_platform: Optional[str] = Query(None),
+):
+    """
+    智能练习：知识点不足 N 条（薄弱点+遗忘曲线多路召回+ Reranker）+ 随机 M 条。
+    召回条数 = N * SMART_PRACTICE_RECALL_RATIO，所有参数见 .env 中 SMART_PRACTICE_*。
+    """
+    import json as _json
+    tags = [tag] if tag else None
+    uid = user_id or "user_001"
+    questions, is_review_mode = multi_recall_recommender.recommend_smart_practice(
+        user_id=uid,
+        company=company,
+        difficulty=difficulty,
+        question_type=question_type,
+        tags=tags,
+        source_platform=source_platform,
+    )
+    if limit < len(questions):
+        questions = questions[:limit]
+    for q in questions:
+        try:
+            q["topic_tags"] = _json.loads(q.get("topic_tags") or "[]")
+        except Exception:
+            q["topic_tags"] = []
+    stats = sqlite_service.get_practice_stats(uid)
+    if uid and questions:
+        q_ids = [q.get("q_id") for q in questions if q.get("q_id")]
+        scores_map = sqlite_service.get_latest_scores_for_questions(uid, q_ids)
+        for q in questions:
+            qid = q.get("q_id")
+            if qid and qid in scores_map:
+                q["last_score"] = scores_map[qid]["score"]
+                q["last_studied_at"] = scores_map[qid]["studied_at"]
+    return {
+        "questions": questions,
+        "total_in_batch": len(questions),
+        "is_review_mode": is_review_mode,
+        "practiced_count": stats["practiced_count"],
+        "total_count": stats["total_count"],
+        "all_learned": stats["all_learned"],
+    }
 
 
 @app.get("/api/questions/meta")
@@ -929,54 +980,37 @@ def _is_retryable_error(e: Exception) -> bool:
 
 
 @app.post("/api/chat")
-
 async def api_chat(req: ChatRequest):
-
     """
-
     自由对话接口：出题、解释、换个问法、查看掌握度等。
-
     答题评估请使用 /api/submit_answer。
-
     超时 90 秒；连接/超时错误会自动重试 2 次。
-
     """
-
     import logging as _logging
-
+    from backend.config.config import settings as _settings
+    _user_id = (req.user_id or "").strip() or _settings.default_user_id
+    _session_id = (req.session_id or "").strip() or None
+    if _session_id is None:
+        _session_id = _settings.default_session_id
     _chat_logger = _logging.getLogger("chat")
-
-    _chat_logger.info(f"[Chat ←] user={req.user_id} | {req.message[:120]}")
-
-
+    _chat_logger.info(f"[Chat ←] user={_user_id} | {req.message[:120]}")
 
     last_err = None
-
     for attempt in range(3):
-
         try:
-
             reply, thinking_steps = await asyncio.wait_for(
-
                 orchestrator.chat(
-
-                    user_id=req.user_id,
-
+                    user_id=_user_id,
                     message=req.message,
-
                     resume=req.resume,
-
-                    session_id=req.session_id
-
+                    session_id=_session_id
                 ),
-
-                timeout=90.0
-
+                timeout=float(_settings.interviewer_timeout),
             )
 
             _chat_logger.info(
 
-                f"[Chat →] user={req.user_id} | reply({len(reply)}chars): "
+                f"[Chat →] user={_user_id} | reply({len(reply)}chars): "
 
                 f"{reply[:300]}{'...' if len(reply) > 300 else ''}"
 
@@ -996,9 +1030,9 @@ async def api_chat(req: ChatRequest):
 
             else:
 
-                _chat_logger.error(f"[Chat ✗] user={req.user_id} TIMEOUT 90s")
+                _chat_logger.error(f"[Chat ✗] user={_user_id} TIMEOUT {_settings.interviewer_timeout}s")
 
-                return {"reply": "⚠️ 响应超时（90s），LLM 服务可能繁忙，请稍后重试。", "error": "timeout"}
+                return {"reply": f"⚠️ 响应超时（{_settings.interviewer_timeout}s），LLM 服务可能繁忙，请稍后重试。", "error": "timeout"}
 
         except Exception as e:
 
@@ -1014,7 +1048,7 @@ async def api_chat(req: ChatRequest):
 
                 continue
 
-            _chat_logger.error(f"[Chat ✗] user={req.user_id} error: {err_msg[:300]}")
+            _chat_logger.error(f"[Chat ✗] user={_user_id} error: {err_msg[:300]}")
 
             if "429" in err_msg or "SetLimitExceeded" in err_msg or "TooManyRequests" in err_msg:
 
@@ -1037,8 +1071,14 @@ async def api_chat_stream(req: ChatRequest):
     连接/超时错误会自动重试 2 次。
     """
     import logging as _logging
+    from backend.config.config import settings as _settings
+    # 未传或空 user_id 时使用配置的默认用户（与 /api/config 的 default_user_id 一致，如 Wangxr）
+    _user_id = (req.user_id or "").strip() or _settings.default_user_id
+    _session_id = (req.session_id or "").strip() or None
+    if _session_id is None:
+        _session_id = _settings.default_session_id
     _chat_logger = _logging.getLogger("chat")
-    _chat_logger.info(f"[Stream ←] user={req.user_id} | {req.message[:120]}")
+    _chat_logger.info(f"[Stream ←] user={_user_id} | {req.message[:120]}")
 
     async def generate():
         for attempt in range(3):
@@ -1046,10 +1086,10 @@ async def api_chat_stream(req: ChatRequest):
                 _chat_logger.info(f"[Stream] 使用 arun_stream，attempt={attempt+1}")
                 # 参照官方 streaming-sse-guide：async for event in agent.arun_stream()
                 async for sse_line in orchestrator.chat_stream(
-                    user_id=req.user_id,
+                    user_id=_user_id,
                     message=req.message,
                     resume=req.resume,
-                    session_id=req.session_id,
+                    session_id=_session_id,
                 ):
                     # sse_line 是字符串，需要编码为字节
                     if isinstance(sse_line, str):
@@ -1065,7 +1105,7 @@ async def api_chat_stream(req: ChatRequest):
                     _chat_logger.warning(f"[Stream] 超时，重试 {attempt + 2}/3...")
                     await asyncio.sleep(2)
                 else:
-                    yield f"data: {json.dumps({'error': '⚠️ 响应超时（90s），LLM 服务可能繁忙，请稍后重试'}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'error': f'⚠️ 响应超时（{_settings.interviewer_timeout}s），LLM 服务可能繁忙，请稍后重试'}, ensure_ascii=False)}\n\n"
             except Exception as e:
                 err_str = str(e)
                 if attempt < 2 and _is_retryable_error(e):
@@ -1099,40 +1139,142 @@ async def api_chat_stream(req: ChatRequest):
 
 
 
+# 全局存储：评分任务状态 {task_id: {status, result, error}}
+_submit_answer_tasks: Dict[str, Dict[str, Any]] = {}
+
+
+@app.post("/api/submit_answer/stream")
+async def api_submit_answer_stream(req: SubmitAnswerRequest):
+    """
+    答题提交接口（SSE 流式，Agent 先评分）：
+    将用户答案构造成对话消息，通过 chat_stream 让 Agent 完整执行：
+      recognize_intent → get_question_detail → Agent自行评分 → submit_answer记录 → record_weakness记录薄弱点
+    前端监听 SSE 事件流，与 /api/chat/stream 完全相同的事件格式。
+    """
+    from backend.config.config import settings as _settings
+    _uid = (req.user_id or "").strip() or _settings.default_user_id
+    _session_id = (req.session_id or "").strip() or _settings.default_session_id
+    _question_id = (req.question_id or "").strip()
+    _question_text = (req.question_text or "").strip()
+    _user_answer = (req.user_answer or "").strip()
+
+    # 构造包含题目 ID 标记的消息，Agent 的 recognize_intent 会识别为 submit_answer 意图
+    # 格式：「我的答案：{user_answer}\n\n【q_id:{question_id}】」
+    # 这样 Agent 能提取 question_id，并把本轮消息作为 user_answer
+    if _question_id:
+        chat_message = f"{_user_answer}\n\n【q_id:{_question_id}】"
+    else:
+        chat_message = _user_answer
+
+    async def generate():
+        try:
+            async for sse_line in orchestrator.chat_stream(
+                user_id=_uid,
+                message=chat_message,
+                session_id=_session_id,
+            ):
+                if isinstance(sse_line, str):
+                    if not sse_line.endswith('\n\n'):
+                        sse_line += '\n\n'
+                    yield sse_line.encode('utf-8')
+                else:
+                    yield sse_line
+        except Exception as e:
+            err_str = str(e)
+            logger.error(f"[submit_answer/stream] 异常: {err_str[:200]}")
+            yield f"data: {json.dumps({'error': f'⚠️ 评分失败：{err_str[:200]}'}, ensure_ascii=False)}\n\n".encode('utf-8')
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/api/submit_answer")
-
 async def api_submit_answer(req: SubmitAnswerRequest):
-
     """
-
-    答题提交接口（确定性答题链）：
-
-    评估 → SM-2更新 → 记忆写入 → 知识推荐（score ≤ 2 时）
-
+    答题提交接口：直接记录作答，不调用 LLM 评估。
+    评估由 Agent（/api/submit_answer/stream 或 /api/chat/stream）负责。
     """
+    from backend.config.config import settings as _settings
+    from backend.services.storage.sqlite_service import sqlite_service as _sqlite
+    _uid = (req.user_id or "").strip() or _settings.default_user_id
+    _session_id = (req.session_id or "").strip() or _settings.default_session_id
+    _question_id = (req.question_id or "").strip()
+    _user_answer = (req.user_answer or "").strip()
+
+    if not _question_id or not _user_answer:
+        raise HTTPException(status_code=400, detail="question_id 和 user_answer 不能为空")
+
+    task_id = f"eval_{_question_id}_{int(time.time() * 1000)}"
 
     try:
-
-        result = await orchestrator.submit_answer(
-            user_id=req.user_id,
-            session_id=req.session_id or f"sess_{int(__import__('time').time()*1000)}",
-            question_id=req.question_id,
-            question_text=req.question_text,
-            user_answer=req.user_answer,
-            question_tags=req.question_tags or []
+        sm2 = _sqlite.add_study_record(
+            user_id=_uid,
+            question_id=_question_id,
+            score=0.0,
+            user_answer=_user_answer,
+            ai_feedback="已记录作答，待 Agent 评估。",
+            session_id=_session_id,
+            message_id=task_id,
+            eval_details={},
         )
-
+        tags = req.question_tags or []
+        if tags:
+            try:
+                _sqlite.update_tag_mastery(_uid, tags, 0)
+            except Exception:
+                pass
+        result = {
+            "task_id": task_id,
+            "status": "completed",
+            "score": 0.0,
+            "feedback": "已记录作答，请在对话中让 AI 为你评估。",
+            "sm2": sm2,
+            "message": "作答已记录。",
+        }
+        logger.info(f"[submit_answer] 任务 {task_id} 记录完成（无评估）")
         return result
-
     except Exception as e:
-
         err_msg = str(e)
+        logger.error(f"[submit_answer] 任务 {task_id} 失败: {err_msg[:200]}")
+        raise HTTPException(status_code=500, detail=err_msg[:300])
 
-        if "429" in err_msg or "SetLimitExceeded" in err_msg:
 
-            raise HTTPException(status_code=429, detail="LLM 调用超出限额，请调整火山引擎安全体验模式")
-
-        raise HTTPException(status_code=500, detail=err_msg[:500])
+@app.get("/api/submit_answer/status/{task_id}")
+async def api_submit_answer_status(task_id: str):
+    """
+    查询答题评分任务状态。
+    前端轮询此接口，直到 status 为 completed 或 failed。
+    """
+    if task_id not in _submit_answer_tasks:
+        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+    
+    task = _submit_answer_tasks[task_id]
+    
+    if task["status"] == "evaluating":
+        return {
+            "task_id": task_id,
+            "status": "evaluating",
+            "message": "正在评分中..."
+        }
+    elif task["status"] == "completed":
+        return {
+            "task_id": task_id,
+            "status": "completed",
+            "result": task["result"]
+        }
+    else:  # failed
+        return {
+            "task_id": task_id,
+            "status": "failed",
+            "error": task["error"]
+        }
 
 
 
@@ -1180,11 +1322,11 @@ def get_user_mastery(user_id: str):
 
     history = sqlite_service.get_study_history(user_id, limit=10)
 
-    weakness_notes = sqlite_service.get_user_weakness_notes(user_id, limit=10)
+    weakness_notes = sqlite_service.get_user_weakness_notes(user_id, limit=20)
 
     profile = sqlite_service.get_user_profile(user_id)
 
-    # 兼容前端 ReportView 期望的字段（total_answered, mastered_count）
+    # 兼容前端 ReportView 期望的字段（total_answered, mastered_count, mastery_by_level）
     total = (summary or {}).get("total_questions_practiced", 0)
     rate = (summary or {}).get("correct_rate", 0) or 0
     correct = int(total * rate / 100) if total else 0
@@ -1192,6 +1334,7 @@ def get_user_mastery(user_id: str):
         "user_id": user_id,
         "profile": profile,
         "mastery_summary": summary,
+        "mastery_by_level": (summary or {}).get("by_level", {}),
         "weak_tags": weak_tags,
         "recent_history": history,
         "weakness_notes": weakness_notes,
@@ -1214,7 +1357,20 @@ def get_due_reviews(user_id: str, limit: int = 10):
     return {"user_id": user_id, "due_count": len(due), "questions": due}
 
 
+@app.get("/api/user/{user_id}/practice-stats")
+def get_practice_stats(user_id: str):
+    """获取练习统计：已练题目数（去重）、题库总数、是否全学完"""
+    return sqlite_service.get_practice_stats(user_id)
 
+
+@app.get("/api/user/{user_id}/questions/{question_id}/study-records")
+def get_question_study_records(
+    user_id: str,
+    question_id: str,
+    limit: int = Query(20, ge=1, le=50, description="最多返回条数"),
+):
+    """获取某用户对某题的历史作答记录（得分、回答、要点等）"""
+    return sqlite_service.get_study_records_by_question(user_id, question_id, limit=limit)
 
 
 # ══════════════════════════════════════════════════════
@@ -1626,7 +1782,7 @@ async def process_crawler_queue(batch_size: int | None = Query(default=None, ge=
 
 @app.post("/api/crawler/extract-pending")
 async def extract_pending_posts(batch_size: int | None = Query(default=None, ge=1, le=200)):
-    """异步提取所有 fetched 状态（已爬取正文但尚未提取题目）的帖子。立即返回启动确认，LLM 提取在后台线程执行。"""
+    """异步提取所有 fetched 状态（已爬取正文但尚未提取题目）的帖子。子进程执行，不阻塞主进程（chat/提交作答等）。"""
     batch_size = batch_size if batch_size is not None else _cfg.crawler_process_batch_size
     logger.info(f"[API] 提取未处理帖子 被调用 batch_size={batch_size}")
     pending_count, initial_by_platform = prepare_extract_pending()
@@ -1638,33 +1794,39 @@ async def extract_pending_posts(batch_size: int | None = Query(default=None, ge=
             "pending": 0,
             "source_info": task_get_source_info(),
         }
-    logger.info(f"[API] 提取未处理帖子 启动后台线程，待处理 {pending_count} 条")
-    global _extraction_running, _extraction_initial_by_platform
-
-    async def _bg_async():
-        global _extraction_running, _extraction_initial_by_platform
-        try:
-            _extraction_running = True
-            _extraction_initial_by_platform = initial_by_platform
-            await asyncio.to_thread(task_execute, "process_tasks", "button", batch_size=batch_size)
-            logger.info(f"[API] 提取未处理帖子 后台完成")
-        except Exception as e:
-            logger.error(f"后台提取失败: {e}", exc_info=True)
-        finally:
-            _extraction_running = False
-            _extraction_initial_by_platform = {}
-
-    asyncio.create_task(_bg_async())
-    logger.info(f"[后台任务] ▶ 启动 LLM提取任务 | 待处理 {pending_count} 条 | batch_size={batch_size}")
+    task_ids = get_fetched_task_ids(batch_size)
+    if not task_ids:
+        return {
+            "status": "ok",
+            "message": "没有符合条件的待提取帖子",
+            "pending": 0,
+            "source_info": task_get_source_info(),
+        }
+    log_path = _BACKEND_LOGS / "batch_extract.log"
+    cmd = [sys.executable, "-m", "backend.services.scheduling.batch_extract_worker"] + task_ids
+    _spawn_batch_extract_subprocess(cmd, log_path, total_count=len(task_ids))
+    logger.info(f"[API] 提取未处理帖子 已启动子进程，共 {len(task_ids)} 条，日志: {log_path}")
     return {
         "status": "ok",
-        "message": f"已启动后台提取，共 {pending_count} 条待处理帖子，batch_size={batch_size}",
+        "message": f"已提交子进程后台提取，共 {len(task_ids)} 条，日志: {log_path}",
         "pending": pending_count,
         "source_info": task_get_source_info(),
     }
 
 
 
+
+
+@app.post("/api/crawler/stage2-process")
+async def trigger_stage2_process():
+    """手动触发 Stage2 批量处理（处理 stage2_pending 队列中剩余项，不足 batch_size 也会处理）"""
+    from backend.services.stage2_processor import run_stage2_processor_now
+    from backend.services.storage import sqlite_service
+    count = sqlite_service.get_stage2_pending_count()
+    if count == 0:
+        return {"status": "ok", "message": "Stage2 队列为空", "processed": 0}
+    await asyncio.to_thread(run_stage2_processor_now)
+    return {"status": "ok", "message": f"已触发 Stage2 处理（队列原有 {count} 条）", "queued": count}
 
 
 @app.post("/api/crawler/clean-data")
@@ -2017,14 +2179,74 @@ def _validate_batch_task_ids(task_ids: list) -> list:
     return valid_ids
 
 
+def _spawn_batch_extract_subprocess(cmd: list, log_path: Path, total_count: int) -> None:
+    """启动批量提取子进程，日志全量写文件，控制台每 60 秒打印一次进度条"""
+    import subprocess
+    import threading
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logf = open(log_path, "a", encoding="utf-8")
+    completed = 0
+    last_print_time = [0]  # 用 list 以便闭包内修改
+    lock = threading.Lock()
+
+    def _print_progress():
+        with lock:
+            pct = int(100 * completed / total_count) if total_count else 0
+            bar_len = 20
+            filled = int(bar_len * completed / total_count) if total_count else 0
+            bar = "█" * filled + "░" * (bar_len - filled)
+            sys.stdout.write(f"\r[批量提取] {bar} {completed}/{total_count} ({pct}%)\n")
+            sys.stdout.flush()
+
+    def read_and_tee(pipe):
+        nonlocal completed
+        try:
+            for line in iter(pipe.readline, b""):
+                if not line:
+                    break
+                try:
+                    text = line.decode("utf-8", errors="replace")
+                except Exception:
+                    text = str(line)
+                logf.write(text)
+                logf.flush()
+                # 解析进度：完成 task_id=xxx 或 全部完成
+                if "[BatchExtractWorker] 完成 task_id=" in text:
+                    with lock:
+                        completed += 1
+                if "[BatchExtractWorker] 全部完成" in text:
+                    with lock:
+                        completed = total_count
+                # 每 60 秒打印一次进度
+                now = time.time()
+                if now - last_print_time[0] >= 60:
+                    last_print_time[0] = now
+                    _print_progress()
+        finally:
+            pipe.close()
+            with lock:
+                _print_progress()
+            logf.close()
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        env=os.environ,
+        **({"start_new_session": True} if sys.platform != "win32" else {}),
+    )
+    t = threading.Thread(target=read_and_tee, args=(proc.stdout,), daemon=True)
+    t.start()
+
+
 @app.post("/api/crawler/tasks/re-extract-batch")
 async def re_extract_batch_tasks(body: dict):
     """
     对选中的多个任务批量重新执行 OCR + MinerAgent 提取，子进程后台执行，不阻塞其他 API。
     请求体: { "task_ids": ["uuid1", "uuid2", ...] }
     """
-    import subprocess
-
     task_ids = body.get("task_ids") or []
     if not isinstance(task_ids, list) or not task_ids:
         raise HTTPException(status_code=400, detail="请提供 task_ids 数组")
@@ -2036,12 +2258,11 @@ async def re_extract_batch_tasks(body: dict):
         raise HTTPException(status_code=400, detail="没有符合条件的任务（正文需≥50字）")
 
     # 子进程执行，与主进程完全隔离，不阻塞 loadTasks/loadStats/提交作答等
+    # 子进程日志全量写 batch_extract.log，控制台每 60 秒打印进度条
     cmd = [sys.executable, "-m", "backend.services.scheduling.batch_extract_worker"] + valid_ids
-    _popen_kw = {"env": os.environ, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-    if sys.platform != "win32":
-        _popen_kw["start_new_session"] = True
-    subprocess.Popen(cmd, **_popen_kw)
-    logger.info(f"[API] 批量重新提取已启动（子进程），共 {len(valid_ids)} 条")
+    log_path = _BACKEND_LOGS / "batch_extract.log"
+    _spawn_batch_extract_subprocess(cmd, log_path, len(valid_ids))
+    logger.info(f"[API] 批量重新提取已启动（子进程），共 {len(valid_ids)} 条，日志: {log_path}")
     return {"status": "ok", "message": f"已提交 {len(valid_ids)} 条，后台执行中", "count": len(valid_ids)}
 
 
@@ -2074,8 +2295,6 @@ async def re_extract_single_task(task_id: str):
 
     立即返回，提取在子进程中执行，不阻塞其他 API（如提交作答、题库浏览）。
     """
-    import subprocess
-
     loop = asyncio.get_event_loop()
     row, err = await loop.run_in_executor(None, _validate_single_task_id, task_id)
     if err:
@@ -2087,10 +2306,8 @@ async def re_extract_single_task(task_id: str):
     logger.info(f"[API] 单任务重新提取 task_id={task_id} title={post_title}...")
 
     cmd = [sys.executable, "-m", "backend.services.scheduling.batch_extract_worker", task_id]
-    _popen_kw = {"env": os.environ, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-    if sys.platform != "win32":
-        _popen_kw["start_new_session"] = True
-    subprocess.Popen(cmd, **_popen_kw)
+    log_path = _BACKEND_LOGS / "batch_extract.log"
+    _spawn_batch_extract_subprocess(cmd, log_path, 1)
     return {
         "status": "ok",
         "task_id": task_id,
@@ -2499,7 +2716,14 @@ async def finetune_import(body: dict):
     return _ft.import_from_log_file(log_path)
 
 
-
+@app.post("/api/finetune/fix-merged")
+async def finetune_fix_merged(body: dict = None):
+    """
+    修复已导入样本：对 stage2_output 不完整的记录，用 stage1_output 补齐缺失字段。
+    body 可选: {"source": "miner_two_stage"} 仅处理指定来源，不传则处理 miner_two_stage。
+    """
+    source = (body or {}).get("source", "miner_two_stage")
+    return _ft.fix_merged_stage2_samples(source_filter=source)
 
 
 @app.get("/api/finetune/samples")
@@ -2649,9 +2873,10 @@ async def finetune_label(body: dict):
 
 
 @app.post("/api/finetune/export")
-async def finetune_export():
-    """将所有已标注样本导出为 微调/labeled_data.jsonl"""
-    return _ft.export_labeled()
+async def finetune_export(body: dict = None):
+    """导出已标注样本为 微调/labeled_data.jsonl，body.sample_ids 可选指定要导出的样本 ID"""
+    sample_ids = (body or {}).get("sample_ids")
+    return _ft.export_labeled(sample_ids=sample_ids)
 
 
 @app.get("/api/finetune/run-config")
@@ -2666,11 +2891,19 @@ async def finetune_save_run_config(body: dict):
     return _ft.save_run_config(body)
 
 
+@app.get("/api/finetune/runs")
+async def finetune_list_runs(limit: int = 50):
+    """分页查询微调训练记录"""
+    return sqlite_service.list_finetune_runs(limit=limit)
+
+
 @app.post("/api/finetune/generate-training")
 async def finetune_generate_training(body: dict = None):
-    """根据配置生成训练脚本并转换数据"""
-    config = (body or {}).get("config") if body else None
-    return _ft.generate_training_script(config)
+    """根据配置生成训练脚本并转换数据，body.sample_ids 可选指定训练样本"""
+    body = body or {}
+    config = body.get("config")
+    sample_ids = body.get("sample_ids")
+    return _ft.generate_training_script(config=config, sample_ids=sample_ids)
 
 
 @app.delete("/api/finetune/samples/{sample_id}")

@@ -45,6 +45,9 @@
       <el-button @click="autoImportAll" :loading="autoImporting" type="primary" size="large">
         {{ autoImporting ? '同步中...' : '🔄 同步日志' }}
       </el-button>
+      <el-button @click="fixMergedSamples" :loading="fixMergedLoading" size="large" title="对 stage2 不完整的样本，用 stage1 补齐缺失字段">
+        {{ fixMergedLoading ? '修复中...' : '🔧 修复 Stage2 合并' }}
+      </el-button>
       <el-button type="success" @click="exportLabeled" :loading="exporting" size="large">
         导出标注数据
       </el-button>
@@ -62,9 +65,24 @@
               <el-radio-button value="labeled">已标注</el-radio-button>
             </el-radio-group>
             <el-button :icon="Refresh" @click="loadSamples(1)" size="large">刷新</el-button>
+            <span v-if="selectedSampleIds.length > 0" class="selected-tip">
+              已选 <strong>{{ selectedSampleIds.length }}</strong> 条用于微调
+            </span>
+            <el-button v-if="selectedSampleIds.length > 0" size="small" @click="clearSampleSelection">清空选择</el-button>
+            <el-button v-if="filterStatus === 'labeled' && samples.length > 0" size="small" type="primary" @click="selectAllLabeledOnPage">
+              全选本页
+            </el-button>
           </div>
           
-          <el-table :data="samples" class="sample-table" @row-click="onSampleClick">
+          <el-table
+            ref="sampleTableRef"
+            :data="samples"
+            class="sample-table"
+            row-key="id"
+            @row-click="onSampleClick"
+            @selection-change="onSampleSelectionChange"
+          >
+            <el-table-column type="selection" width="50" align="center" :selectable="row => row.status === 'labeled'" reserve-selection />
             <el-table-column label="ID" prop="id" width="80" align="center" />
             <el-table-column label="面经内容">
               <template #default="{ row }">
@@ -186,7 +204,7 @@
               </div>
             </div>
 
-            <!-- 中栏：Stage1 本地 Qwen3 / Stage2 豆包 对比 -->
+            <!-- 中栏：Stage1 本地 Qwen3（Stage2 内容默认填入③编辑区） -->
             <div class="editor-panel">
               <div class="panel-header">
                 <span class="panel-title">② Stage1 本地 Qwen3</span>
@@ -203,27 +221,12 @@
                   :showLine="true"
                 />
               </div>
-              <div v-if="currentSample.stage2_output" class="panel-header" style="margin-top:12px">
-                <span class="panel-title">Stage2 豆包 API</span>
-                <span class="panel-subtitle">（{{ stage2QuestionCount }} 道题）</span>
-                <el-button @click="copyStage2" size="small" style="margin-left: auto;">
-                  📋 复制到编辑区
-                </el-button>
-              </div>
-              <div v-if="currentSample.stage2_output" class="panel-content json-viewer">
-                <vue-json-pretty 
-                  :data="parseJson(currentSample.stage2_output)"
-                  :deep="99"
-                  :showLength="true"
-                  :showLine="true"
-                />
-              </div>
             </div>
 
             <!-- 右栏：标注编辑 + 大模型辅助 -->
             <div class="editor-panel">
               <div class="panel-header">
-                <span class="panel-title">③ 标注编辑</span>
+                <span class="panel-title">③ 标注编辑 <el-tag type="info" size="small">默认 Stage2 豆包生成</el-tag></span>
                 <el-button 
                   type="primary" 
                   @click="callAssist"
@@ -245,21 +248,49 @@
                 <el-button @click="formatEditOutput" size="large">格式化 JSON</el-button>
               </div>
 
-              <!-- 可编辑的JSON文本框 -->
-              <div class="panel-content">
-                <el-input 
-                  type="textarea" 
+              <!-- 查找/替换工具栏（Ctrl+F 也可打开编辑器内置搜索） -->
+              <div class="find-replace-bar">
+                <el-input
+                  v-model="findText"
+                  placeholder="查找"
+                  size="small"
+                  clearable
+                  style="width: 140px"
+                  @keyup.enter="doReplace"
+                />
+                <el-input
+                  v-model="replaceText"
+                  placeholder="替换为"
+                  size="small"
+                  clearable
+                  style="width: 140px"
+                  @keyup.enter="doReplace"
+                />
+                <el-button size="small" @click="doReplace">替换</el-button>
+                <el-button size="small" @click="doReplaceAll">全部替换</el-button>
+                <span class="find-tip">Ctrl+F 查找</span>
+              </div>
+              <!-- 可编辑的 JSON 编辑器（语法高亮 + 查找替换） -->
+              <div class="panel-content json-editor-wrap">
+                <CodeMirror
                   v-model="editOutput"
-                  :rows="28"
+                  :basic="true"
+                  :tab="true"
+                  :wrap="true"
+                  :lang="jsonLang"
+                  :extensions="[oneDark]"
                   placeholder="在此编辑JSON..."
-                  class="edit-textarea"
+                  class="json-codemirror"
                 />
               </div>
             </div>
           </div>
         </div>
         
-        <el-empty v-else description="请在「样本列表」中点击一条记录进入编辑" :image-size="200" />
+        <div v-else class="editor-empty-state">
+          <el-empty description="请在「样本列表」中点击一条记录进入编辑" :image-size="180" />
+          <el-button type="primary" @click="activeTab = 'list'" size="large">前往样本列表</el-button>
+        </div>
       </el-tab-pane>
 
       <!-- Tab 3: 日志文件 -->
@@ -385,11 +416,30 @@
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">目标模块<el-tooltip content="LoRA 注入到哪些线性层：q_proj/k_proj/v_proj 为注意力层，o_proj 为输出投影，gate_proj/up_proj/down_proj 为 FFN 层。全选可获最佳效果；减少模块可省显存但会降低质量。建议保持默认全选。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">目标模块</span>
               </template>
-              <el-select v-model="runConfig.lora_target_modules_arr" multiple collapse-tags collapse-tags-tooltip placeholder="选择要注入 LoRA 的模块" style="width:100%">
-                <el-option v-for="m in TARGET_MODULE_OPTIONS" :key="m" :label="m" :value="m" />
-              </el-select>
+              <div class="module-select-wrapper">
+                <div class="module-dropdown-explanation">
+                  q_proj/k_proj/v_proj 为注意力层，o_proj 为输出投影，gate_proj/up_proj/down_proj 为 FFN 层。全选可获最佳效果；减少模块可省显存但会降低质量。
+                </div>
+                <el-select v-model="runConfig.lora_target_modules_arr" multiple placeholder="选择要注入 LoRA 的模块" style="width:100%">
+                  <el-option v-for="m in TARGET_MODULE_OPTIONS" :key="m.value" :label="m.label" :value="m.value">
+                    <div class="module-option">
+                      <span class="module-name">{{ m.label }}</span>
+                      <span class="module-desc">{{ m.desc }}</span>
+                    </div>
+                  </el-option>
+                </el-select>
+                <div class="module-expression-footer">
+                  <el-input
+                    v-model="targetModuleExpr"
+                    size="small"
+                    placeholder="表达式: all | attention | ffn | q_proj,k_proj,..."
+                    @keyup.enter="applyTargetModuleExpr"
+                  />
+                  <el-button size="small" type="primary" @click="applyTargetModuleExpr">应用</el-button>
+                </div>
+              </div>
             </el-form-item>
             <el-form-item>
               <template #label>
@@ -455,11 +505,41 @@
             </el-form-item>
           </el-form>
 
+          <div class="oneclick-data-tip" v-if="selectedSampleIds.length > 0">
+            <el-icon><InfoFilled /></el-icon>
+            已从样本列表选择 <strong>{{ selectedSampleIds.length }}</strong> 条用于本次训练
+          </div>
+          <div class="oneclick-data-tip muted" v-else>
+            <el-icon><InfoFilled /></el-icon>
+            未选择样本时，将使用「导出标注数据」生成的全部数据。可在样本列表中勾选已标注样本以指定训练数据。
+          </div>
           <div class="oneclick-actions">
             <el-button @click="saveRunConfig">保存配置</el-button>
             <el-button type="primary" @click="generateTraining" :loading="generating">
               {{ generating ? '生成中...' : '生成训练脚本' }}
             </el-button>
+          </div>
+
+          <!-- 训练记录 -->
+          <div class="train-runs-section">
+            <div class="train-runs-header">
+              <span>训练记录</span>
+              <el-button :icon="Refresh" @click="loadTrainRuns" size="small">刷新</el-button>
+            </div>
+            <el-table :data="trainRuns" class="train-runs-table" max-height="280">
+              <el-table-column label="ID" prop="id" width="60" align="center" />
+              <el-table-column label="创建时间" prop="created_at" width="170" />
+              <el-table-column label="状态" width="90" align="center">
+                <template #default="{ row }">
+                  <el-tag :type="row.status === 'generated' ? 'info' : row.status === 'completed' ? 'success' : 'warning'" size="small">
+                    {{ row.status === 'generated' ? '已生成' : row.status === 'completed' ? '已完成' : row.status === 'running' ? '训练中' : row.status || '-' }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="样本数" prop="sample_count" width="80" align="center" />
+              <el-table-column label="输出目录" prop="output_dir" min-width="200" show-overflow-tooltip />
+              <el-table-column label="脚本路径" prop="script_path" min-width="180" show-overflow-tooltip />
+            </el-table>
           </div>
 
           <!-- 训练状态/进度 -->
@@ -571,11 +651,16 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onActivated } from 'vue'
-import { Refresh, Loading, UploadFilled, QuestionFilled, CircleCheckFilled } from '@element-plus/icons-vue'
+import { ref, computed, watch, nextTick, onMounted, onActivated } from 'vue'
+import { Refresh, Loading, UploadFilled, QuestionFilled, CircleCheckFilled, InfoFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import VueJsonPretty from 'vue-json-pretty'
 import 'vue-json-pretty/lib/styles.css'
+import CodeMirror from 'vue-codemirror6'
+import { json } from '@codemirror/lang-json'
+import { oneDark } from '@codemirror/theme-one-dark'
+
+const jsonLang = json()
 
 const BASE = '/api/finetune'
 const api = {
@@ -658,6 +743,28 @@ const autoImportAll = async () => {
   }
 }
 
+// 修复 Stage2 合并（对 stage2 不完整的样本，用 stage1 补齐）
+const fixMergedLoading = ref(false)
+const fixMergedSamples = async () => {
+  fixMergedLoading.value = true
+  try {
+    const res = await api.post(`${BASE}/fix-merged`, {})
+    if (res.fixed > 0) {
+      ElMessage.success(`已修复 ${res.fixed} 条，跳过 ${res.skipped} 条`)
+      if (currentSample.value) {
+        currentSample.value = await api.get(`${BASE}/samples/${currentSample.value.id}`)
+      }
+      await loadStats()
+    } else {
+      ElMessage.info(res.skipped > 0 ? '无需修复，所有样本已完整' : '没有可修复的样本')
+    }
+  } catch (e) {
+    ElMessage.error('修复失败：' + e.message)
+  } finally {
+    fixMergedLoading.value = false
+  }
+}
+
 // 日志文件
 const logFiles = ref([])
 const loadLogFiles = async () => { logFiles.value = await api.get(`${BASE}/log-files`) }
@@ -680,6 +787,7 @@ const deleteLogFile = async (row) => {
     const data = await res.json()
     if (!res.ok) throw new Error(data.detail || data.message || '删除失败')
     ElMessage.success(data.message || '已删除')
+    activeTab.value = 'logs'
     await loadLogFiles()
     await loadStats()
   } catch (e) {
@@ -695,8 +803,10 @@ const deleteSample = async (row) => {
     if (!res.ok) throw new Error(data.detail || '删除失败')
     ElMessage.success('已删除')
     if (currentSample.value?.id === row.id) currentSample.value = null
+    selectedSampleIds.value = selectedSampleIds.value.filter(id => id !== row.id)
     await loadStats()
     await loadSamples(currentPage.value)
+    activeTab.value = 'list'
   } catch (e) {
     ElMessage.error('删除失败：' + (e.message || e))
   }
@@ -740,6 +850,28 @@ const currentPage = ref(1)
 const pageSize = ref(20)
 const pagerTotal = ref(0)
 const activeTab = ref('list')
+const sampleTableRef = ref(null)
+const selectedSampleIds = ref([])
+
+const onSampleSelectionChange = (selection) => {
+  const idsOnPage = samples.value.map(r => r.id)
+  const selectedOnPage = selection.map(r => r.id)
+  selectedSampleIds.value = [
+    ...selectedSampleIds.value.filter(id => !idsOnPage.includes(id)),
+    ...selectedOnPage,
+  ]
+}
+
+const selectAllLabeledOnPage = () => {
+  if (!sampleTableRef.value) return
+  const labeled = samples.value.filter(r => r.status === 'labeled')
+  labeled.forEach(row => sampleTableRef.value.toggleRowSelection(row, true))
+}
+
+const clearSampleSelection = () => {
+  selectedSampleIds.value = []
+  sampleTableRef.value?.clearSelection()
+}
 
 const loadSamples = async (page = currentPage.value) => {
   currentPage.value = page
@@ -752,9 +884,14 @@ const loadSamples = async (page = currentPage.value) => {
   const res = await api.get(`${BASE}/samples?${params}`)
   samples.value = res.items || []
   pagerTotal.value = res.total || 0
+  nextTick(() => {
+    const toSelect = samples.value.filter(r => selectedSampleIds.value.includes(r.id))
+    toSelect.forEach(row => sampleTableRef.value?.toggleRowSelection(row, true))
+  })
 }
 
-const onSampleClick = async (row) => {
+const onSampleClick = async (row, column, event) => {
+  if (event?.target?.closest?.('.el-checkbox')) return
   const detail = await api.get(`${BASE}/samples/${row.id}`)
   currentSample.value = detail
   // 预填：final_output > assist_output > stage2_output（豆包结果）
@@ -790,6 +927,25 @@ const editOutput = ref('')
 const assisting = ref(false)
 const labeling = ref(false)
 const exporting = ref(false)
+const findText = ref('')
+const replaceText = ref('')
+
+const doReplace = () => {
+  if (!findText.value) { ElMessage.warning('请输入查找内容'); return }
+  const idx = editOutput.value.indexOf(findText.value)
+  if (idx === -1) { ElMessage.info('未找到匹配内容'); return }
+  editOutput.value = editOutput.value.replace(findText.value, replaceText.value)
+  ElMessage.success('已替换 1 处')
+}
+
+const doReplaceAll = () => {
+  if (!findText.value) { ElMessage.warning('请输入查找内容'); return }
+  const parts = editOutput.value.split(findText.value)
+  const count = parts.length - 1
+  if (count === 0) { ElMessage.info('未找到匹配内容'); return }
+  editOutput.value = parts.join(replaceText.value)
+  ElMessage.success(`已全部替换 ${count} 处`)
+}
 
 const isModified = computed(() => {
   const orig = currentSample.value?.final_output || currentSample.value?.assist_output || currentSample.value?.stage2_output || ''
@@ -810,16 +966,6 @@ const stage1QuestionCount = computed(() => {
     return Array.isArray(parsed) ? parsed.length : 0
   } catch { return 0 }
 })
-// Stage2 题目数量
-const stage2QuestionCount = computed(() => {
-  const raw = currentSample.value?.stage2_output
-  if (!raw) return 0
-  try {
-    const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed.length : 0
-  } catch { return 0 }
-})
-
 // 解析编辑输出：如果是list，去掉首尾括号展示为对象数组
 const parsedEditOutput = computed(() => {
   if (!editOutput.value) return []
@@ -892,13 +1038,6 @@ const copyStage1 = () => {
   if (!text) { ElMessage.warning('Stage1 无内容'); return }
   navigator.clipboard.writeText(text).then(() => ElMessage.success('已复制')).catch(() => ElMessage.error('复制失败'))
 }
-const copyStage2 = () => {
-  const text = currentSample.value?.stage2_output || ''
-  if (!text) { ElMessage.warning('Stage2 无内容'); return }
-  editOutput.value = formatJson(text)
-  ElMessage.success('已填入编辑区')
-}
-
 const confirmNoChange = async () => {
   // 使用 Stage2 豆包 或 Stage1 作为最终标注
   const llmOutput = currentSample.value?.stage2_output || currentSample.value?.stage1_output
@@ -929,19 +1068,59 @@ const confirmNoChange = async () => {
 const exportLabeled = async () => {
   exporting.value = true
   try {
-    const res = await api.post(`${BASE}/export`, {})
+    const body = selectedSampleIds.value.length > 0 ? { sample_ids: selectedSampleIds.value } : {}
+    const res = await api.post(`${BASE}/export`, body)
     ElMessage.success(`已导出 ${res.exported} 条 → ${res.path}`)
   } finally {
     exporting.value = false
   }
 }
 
-const TARGET_MODULE_OPTIONS = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
+const TARGET_MODULE_OPTIONS = [
+  { value: 'q_proj', label: 'q_proj', desc: 'Query 投影，注意力查询向量' },
+  { value: 'k_proj', label: 'k_proj', desc: 'Key 投影，注意力键向量' },
+  { value: 'v_proj', label: 'v_proj', desc: 'Value 投影，注意力值向量' },
+  { value: 'o_proj', label: 'o_proj', desc: '输出投影，注意力层输出' },
+  { value: 'gate_proj', label: 'gate_proj', desc: 'FFN 门控投影' },
+  { value: 'up_proj', label: 'up_proj', desc: 'FFN 上投影' },
+  { value: 'down_proj', label: 'down_proj', desc: 'FFN 下投影' },
+]
+
+const ALL_MODULES = TARGET_MODULE_OPTIONS.map(m => m.value)
+const ATTENTION_MODULES = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
+const FFN_MODULES = ['gate_proj', 'up_proj', 'down_proj']
+
+const targetModuleExpr = ref('')
+
+const applyTargetModuleExpr = () => {
+  const expr = (targetModuleExpr.value || '').trim().toLowerCase()
+  if (!expr) return
+  let result = []
+  if (expr === 'all' || expr === '*') {
+    result = [...ALL_MODULES]
+  } else if (expr === 'attention' || expr === 'qkv' || expr === 'attn') {
+    result = [...ATTENTION_MODULES]
+  } else if (expr === 'ffn') {
+    result = [...FFN_MODULES]
+  } else {
+    const validSet = new Set(ALL_MODULES)
+    result = expr.split(/[,，\s+]+/).map(s => s.trim()).filter(s => validSet.has(s))
+  }
+  if (result.length > 0) {
+    runConfig.value.lora_target_modules_arr = result
+    ElMessage.success(`已应用 ${result.length} 个模块`)
+  } else {
+    ElMessage.warning('表达式无效，支持: all | attention | ffn | q_proj,k_proj,...')
+  }
+}
 
 const onTabChange = (tab) => {
   if (tab === 'list') loadSamples(1)
   else if (tab === 'logs') loadLogFiles()
-  else if (tab === 'oneclick') loadRunConfig()
+  else if (tab === 'oneclick') {
+    loadRunConfig()
+    loadTrainRuns()
+  }
 }
 
 // 一键微调
@@ -967,6 +1146,17 @@ const runConfig = ref({
   precision: 'bf16',
 })
 
+const trainRuns = ref([])
+const loadTrainRuns = async () => {
+  try {
+    const list = await api.get(`${BASE}/runs`)
+    trainRuns.value = list || []
+  } catch (e) {
+    console.warn('加载训练记录失败', e)
+    trainRuns.value = []
+  }
+}
+
 // 微调方式改为 LoRA 时，若精度为 4bit 则重置为 bf16（需在 runConfig 声明之后）
 watch(() => runConfig.value.method, (method) => {
   if (method === 'lora' && runConfig.value.precision === '4bit') {
@@ -979,10 +1169,11 @@ const loadRunConfig = async () => {
     const cfg = await api.get(`${BASE}/run-config`)
     const arr = (cfg.lora_target_modules || '').split(',').map(s => s.trim()).filter(Boolean)
     const precision = cfg.precision ?? (cfg.bf16 === false ? 'fp16' : 'bf16')
+    const defaultModules = TARGET_MODULE_OPTIONS.map(m => m.value)
     runConfig.value = {
       ...runConfig.value,
       ...cfg,
-      lora_target_modules_arr: arr.length ? arr : TARGET_MODULE_OPTIONS,
+      lora_target_modules_arr: arr.length ? arr : defaultModules,
       precision,
     }
   } catch (e) {
@@ -1011,12 +1202,15 @@ const generateTraining = async () => {
   generating.value = true
   generateResult.value = null
   try {
-    const res = await api.post(`${BASE}/generate-training`, { config: getConfigForApi() })
+    const body = { config: getConfigForApi() }
+    if (selectedSampleIds.value.length > 0) body.sample_ids = selectedSampleIds.value
+    const res = await api.post(`${BASE}/generate-training`, body)
     if (res.status === 'error') {
       ElMessage.warning(res.message)
       return
     }
     generateResult.value = res
+    await loadTrainRuns()
     ElMessage.success('训练脚本已生成')
   } catch (e) {
     ElMessage.error('生成失败：' + (e.message || e))
@@ -1183,6 +1377,16 @@ onActivated(async () => {
 }
 
 /* 编辑器 */
+.editor-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 400px;
+  gap: 24px;
+  padding: 40px;
+}
+
 .editor-container {
   display: flex;
   flex-direction: column;
@@ -1222,26 +1426,35 @@ onActivated(async () => {
 
 .editor-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 20px;
-  min-height: 700px;
+  grid-template-columns: 1fr 1fr 1.2fr;
+  gap: 24px;
+  min-height: 720px;
+  align-items: stretch;
 }
 
 .editor-panel {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  background: #f9fafb;
+  gap: 14px;
+  background: #fff;
   border-radius: 12px;
-  padding: 16px;
+  padding: 20px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  border: 1px solid #e5e7eb;
+}
+
+.editor-panel:last-child {
+  background: linear-gradient(to bottom, #fafbfc 0%, #fff 60px);
 }
 
 .panel-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding-bottom: 12px;
-  border-bottom: 2px solid #e5e7eb;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #e5e7eb;
 }
 
 .post-info {
@@ -1316,48 +1529,121 @@ onActivated(async () => {
 }
 
 .panel-title {
-  font-size: 17px;
-  font-weight: 700;
-  color: #111827;
+  font-size: 16px;
+  font-weight: 600;
+  color: #1f2937;
+  letter-spacing: 0.02em;
 }
 
 .panel-subtitle {
-  font-size: 14px;
-  color: #9ca3af;
-  margin-left: 8px;
+  font-size: 13px;
+  color: #6b7280;
+  margin-left: 6px;
+  font-weight: 500;
 }
 
 .panel-content {
   flex: 1;
-  overflow: auto;
-  background: white;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: #fafafa;
   border-radius: 8px;
   padding: 16px;
+  border: 1px solid #f0f0f0;
+  min-height: 0;
 }
 
 .content-textarea :deep(textarea) {
   font-family: 'JetBrains Mono', 'Fira Code', monospace;
-  font-size: 15px;
-  line-height: 1.8;
-  color: #1f2937;
+  font-size: 14px;
+  line-height: 1.75;
+  color: #374151;
 }
 
-.edit-textarea :deep(textarea) {
-  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+.find-replace-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 14px;
+  background: #f8fafc;
+  border-radius: 8px;
+  margin-bottom: 12px;
+  border: 1px solid #e2e8f0;
+}
+
+.find-replace-bar .find-tip {
+  font-size: 12px;
+  color: #94a3b8;
+  margin-left: 4px;
+}
+
+.json-editor-wrap {
+  flex: 1;
+  min-height: 420px;
+  display: flex;
+  flex-direction: column;
+}
+
+.json-codemirror {
+  flex: 1;
   font-size: 14px;
-  line-height: 1.6;
-  color: #1f2937;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-  padding: 12px;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.json-codemirror :deep(.cm-editor) {
+  min-height: 400px;
+}
+
+.json-codemirror :deep(.cm-scroller) {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 14px;
+  line-height: 1.7;
+  overflow-x: hidden !important;
+}
+
+.json-codemirror :deep(.cm-content) {
+  overflow-wrap: break-word;
+  padding: 12px 0;
+}
+
+.json-codemirror :deep(.cm-line) {
+  padding-left: 4px;
+}
+
+/* vue-json-pretty 语法高亮 */
+.json-viewer :deep(.vjs-key) {
+  color: #059669 !important;
+  font-weight: 600;
+}
+
+.json-viewer :deep(.vjs-value__string) {
+  color: #0369a1 !important;
+}
+
+.json-viewer :deep(.vjs-value__number) {
+  color: #b91c1c !important;
+}
+
+.json-viewer :deep(.vjs-value__boolean) {
+  color: #7c3aed !important;
+}
+
+.json-viewer :deep(.vjs-tree__brackets) {
+  color: #64748b !important;
 }
 
 .json-viewer {
   font-size: 15px;
+  overflow-x: hidden;
 }
 
 .json-viewer :deep(.vjs-tree) {
   font-size: 15px;
+  overflow-wrap: break-word;
+  word-break: break-all;
 }
 
 .editor-actions {
@@ -1368,12 +1654,13 @@ onActivated(async () => {
 
 .editor-actions-top {
   display: flex;
-  gap: 12px;
-  padding: 12px 20px;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 14px 16px;
   background: #f0fdf4;
   border-radius: 8px;
   margin-bottom: 12px;
-  border: 2px solid #22c55e;
+  border: 1px solid #bbf7d0;
 }
 
 .navigation-actions {
@@ -1683,6 +1970,24 @@ onActivated(async () => {
   object-fit: contain;
   vertical-align: middle;
 }
+.module-option { display: flex; flex-direction: column; gap: 2px; }
+.module-option .module-name { font-weight: 500; }
+.module-option .module-desc { font-size: 12px; color: #6b7280; }
+.module-select-wrapper { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.module-dropdown-explanation {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.5;
+  background: #f8fafc;
+  border-radius: 6px;
+  border: 1px solid #e2e8f0;
+}
+.module-expression-footer {
+  display: flex;
+  gap: 8px;
+}
+.module-expression-footer .el-input { flex: 1; }
 .oneclick-container {
   background: white;
   border-radius: 16px;
@@ -1741,4 +2046,12 @@ onActivated(async () => {
 .train-cmd code { color: #fff; }
 .train-meta { font-size: 13px; color: #6b7280; margin-top: 12px; }
 .train-meta span { display: block; margin: 4px 0; }
+.train-runs-section { margin-top: 24px; padding-top: 20px; border-top: 1px solid #e5e7eb; }
+.train-runs-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; font-weight: 600; }
+.train-runs-table { font-size: 13px; }
+.selected-tip { margin-left: 12px; color: #16a34a; font-size: 14px; }
+.selected-tip strong { color: #15803d; }
+.oneclick-data-tip { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; padding: 12px; background: #f0fdf4; border-radius: 8px; font-size: 13px; color: #166534; }
+.oneclick-data-tip.muted { background: #f8fafc; color: #64748b; }
+.oneclick-data-tip .el-icon { font-size: 18px; flex-shrink: 0; }
 </style>

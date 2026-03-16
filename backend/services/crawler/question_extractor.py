@@ -228,7 +228,7 @@ def _get_miner_agent(image_paths: List[str] = None, task_id: str = ""):
 
 def _call_llm_with_agent(content: str, has_image: bool, company: str = "", position: str = "", 
                          image_paths: List[str] = None, task_id: str = "",
-                         retry_hint: str = None) -> Tuple[str, bool, bool]:
+                         retry_hint: str = None, source_url: str = "", post_title: str = "") -> Tuple[str, bool, bool]:
     """
     使用 MinerAgent（框架托管版）提取题目。
     LLM 自主通过工具调用决策：
@@ -257,6 +257,8 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
                 company=company,
                 position=position,
                 user_input_override=retry_hint,
+                source_url=source_url,
+                post_title=post_title,
             )
         else:
             result, ocr_called, is_unrelated = agent.run(
@@ -264,6 +266,8 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
                 has_image=has_image,
                 company=company,
                 position=position,
+                source_url=source_url,
+                post_title=post_title,
             )
         logger.info(f"[MinerAgent] 执行完成，输出长度: {len(result)}, ocr_called={ocr_called}, is_unrelated={is_unrelated}")
         # Agent 成功返回，但 result 是拒绝文本时降级为直接 LLM 调用
@@ -690,6 +694,8 @@ def extract_questions_from_post(
             image_paths=image_paths,
             task_id=task_id,
             retry_hint=attempt_prompt if attempt > 1 else None,
+            source_url=source_url,
+            post_title=post_title,
         )
         trace_session_id = _get_latest_trace_session_id()
         llm_response_time_sec = time.perf_counter() - t0
@@ -702,6 +708,11 @@ def extract_questions_from_post(
             _append_llm_log_to_csv(user_prompt, "[mark_unrelated]", llm_response_time_sec,
                                    source=platform, title=post_title, source_url=source_url)
             return [], "unrelated", agent_used_tool, True, trace_session_id
+
+        # 两阶段异步：Stage1 完成已入队，待 Stage2 批量处理
+        if raw == "__STAGE2_PENDING__":
+            logger.info(f"Stage1 完成已入队，待 Stage2 批量处理: {source_url}")
+            return [], "stage2_pending", agent_used_tool, True, trace_session_id
 
         items, status = _parse_json_from_llm(raw, user_prompt_for_debug=user_prompt)
 

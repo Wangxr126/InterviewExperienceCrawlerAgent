@@ -25,8 +25,15 @@
           <el-option label="牛客网" value="nowcoder" />
           <el-option label="小红书" value="xiaohongshu" />
         </el-select>
+      </div>
+
+      <!-- 操作行：搜索 | 智能练习 | 重置 -->
+      <div class="action-row">
         <el-button type="primary" @click="onSearch" :loading="loading">🔍 搜索</el-button>
-        <el-button @click="loadRandom">🎲 随机一题</el-button>
+        <el-button class="btn-smart-practice" @click="loadSmartPractice">
+          <el-icon><Aim /></el-icon>
+          <span>智能练习</span>
+        </el-button>
         <el-button @click="resetFilters">重置</el-button>
       </div>
 
@@ -68,6 +75,7 @@
       <!-- 题目网格 -->
       <div v-if="questions.length > 0" class="question-grid">
         <div v-for="q in questions" :key="q.q_id" class="q-card" @click="openDialog(q)">
+          <div v-if="q.last_score != null" class="answered-ribbon"></div>
           <div class="q-card-header">
             <div class="q-text">{{ q.question_text }}</div>
             <div class="q-card-badges">
@@ -81,7 +89,7 @@
           </div>
           <div class="q-meta">
             <span v-if="q.last_score != null" class="score-chip" :class="q.last_score >= 3 ? 'score-ok' : 'score-low'">
-              📝 {{ q.last_score }}/5
+              {{ q.last_score }}/5
             </span>
             <span v-if="q.company" class="meta-chip">🏢 {{ q.company }}</span>
             <span v-if="q.position" class="meta-chip">💼 {{ q.position }}</span>
@@ -117,20 +125,45 @@
       </div>
     </div>
 
-    <!-- 题目详情弹窗 -->
-    <QuestionDialog v-model="dialogVisible" :question="selectedQ"
-                    :user-id="userId"
-                    @send-to-chat="handleSendToChat"
-                    @submit-complete="handleSubmitComplete" />
+      <!-- 普通题目详情弹窗（点击题卡） -->
+      <QuestionDialog
+        v-model="dialogVisible"
+        :question="selectedQ"
+        :user-id="userId"
+        @send-to-chat="handleSendToChat"
+        @submit-complete="handleSubmitComplete"
+      />
+
+      <!-- 智能练习专用弹窗（与普通题目分离） -->
+      <SmartPracticeDialog
+        v-model="smartDialogVisible"
+        :question="currentPracticeQuestion"
+        :user-id="userId"
+        :practice-progress="practiceProgress"
+        @send-to-chat="handleSendToChat"
+        @submit-complete="handleSmartSubmitComplete"
+        @prev-question="handlePrevQuestion"
+        @next-question="handleNextQuestion"
+      />
+
+    <!-- 全学完庆祝弹窗 -->
+    <el-dialog v-model="allLearnedVisible" title="🎉 恭喜！" width="400px" align-center>
+      <div class="all-learned-content">
+        <div class="celebration-emoji">🏆</div>
+        <p>你已经学完了题库全部 <strong>{{ practiceStats.total_count }}</strong> 道题目！</p>
+        <p class="sub">继续保持，定期复习巩固～</p>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Loading } from '@element-plus/icons-vue'
+import { Loading, Aim } from '@element-plus/icons-vue'
 import { api } from '../api.js'
 import QuestionDialog from '../components/QuestionDialog.vue'
+import SmartPracticeDialog from '../components/SmartPracticeDialog.vue'
 
 const props = defineProps({
   meta: { type: Object, default: () => ({}) },
@@ -164,8 +197,15 @@ const toggleSort = (colKey) => {
 }
 const questions = ref([])
 const loading   = ref(false)
-const dialogVisible = ref(false)
+const dialogVisible = ref(false)           // 普通题目弹窗
 const selectedQ     = ref(null)
+
+// 智能练习专用状态：批次 + 当前索引 + 弹窗显隐
+const practiceBatch = ref([])
+const practiceStats = ref({ practiced_count: 0, total_count: 0, all_learned: false })
+const practiceIndex = ref(0)
+const smartDialogVisible = ref(false)
+const allLearnedVisible = ref(false)
 
 const diffLabel     = (d) => ({ easy: '简单', medium: '中等', hard: '困难' }[d] || '中等')
 const platformLabel = (p) => ({ nowcoder: '牛客', xiaohongshu: '小红书' }[p] || p)
@@ -219,17 +259,47 @@ const onPageSizeChange = () => {
   loadQuestions(1)
 }
 
-const loadRandom = async () => {
+const practiceProgress = computed(() => {
+  const total = practiceBatch.value.length
+  if (!total) return null
+  return { current: practiceIndex.value + 1, total }
+})
+
+const currentPracticeQuestion = computed(() => {
+  if (!practiceBatch.value.length) return null
+  return practiceBatch.value[practiceIndex.value] || null
+})
+
+const loadSmartPractice = async () => {
   loading.value = true
   try {
-    const d = await api.getQuestions({ ...filters, rand: true, user_id: props.userId || undefined })
-    questions.value = d.questions || []
-    pagination.total = d.total ?? 0
-    pagination.totalPages = 1
-    pagination.page = 1
-    if (questions.value.length) openDialog(questions.value[0])
+    const d = await api.getSmartPracticeQuestions({
+      user_id: props.userId || undefined,
+      limit: 20,
+      company: filters.company || undefined,
+      difficulty: filters.difficulty || undefined,
+      question_type: filters.question_type || undefined,
+      tag: filters.tag || undefined,
+      source_platform: filters.source_platform || undefined,
+    })
+    practiceBatch.value = d.questions || []
+    practiceStats.value = {
+      practiced_count: d.practiced_count ?? 0,
+      total_count: d.total_count ?? 0,
+      all_learned: d.all_learned ?? false,
+    }
+    // 智能练习使用独立弹窗，不再复用普通题目弹窗
+    if (practiceBatch.value.length) {
+      practiceIndex.value = 0
+      smartDialogVisible.value = true
+    }
+    if (practiceStats.value.all_learned) {
+      allLearnedVisible.value = true
+    } else if (!practiceBatch.value.length) {
+      ElMessage.info('暂无推荐题目，请先做题积累薄弱点或到期复习数据')
+    }
   } catch {
-    ElMessage.error('随机取题失败')
+    ElMessage.error('智能练习取题失败')
   } finally {
     loading.value = false
   }
@@ -250,7 +320,46 @@ const handleSendToChat = (event) => {
   emit('send-to-chat', event)
 }
 
+const handlePrevQuestion = () => {
+  if (!practiceBatch.value.length) return
+  if (practiceIndex.value > 0) {
+    practiceIndex.value -= 1
+  }
+}
+
+const handleNextQuestion = () => {
+  if (!practiceBatch.value.length) return
+  if (practiceIndex.value < practiceBatch.value.length - 1) {
+    practiceIndex.value += 1
+  }
+}
+
 const handleSubmitComplete = (payload) => {
+  // 普通题目提交完成，仅关闭弹窗并向外抛事件
+  dialogVisible.value = false
+  emit('submit-complete', payload)
+}
+
+const handleSmartSubmitComplete = (payload) => {
+  const batch = practiceBatch.value
+  const idx = batch.findIndex(q => q?.q_id === payload?.question?.q_id)
+  if (idx >= 0 && idx < batch.length - 1) {
+    // 本批还有下一题，自动打开
+    practiceIndex.value = idx + 1
+  } else {
+    smartDialogVisible.value = false
+  }
+  // 刷新练习统计（提交后 practiced_count 会变化）
+  if (props.userId) {
+    api.getPracticeStats(props.userId).then(d => {
+      practiceStats.value = {
+        practiced_count: d.practiced_count ?? 0,
+        total_count: d.total_count ?? 0,
+        all_learned: d.all_learned ?? false,
+      }
+      if (practiceStats.value.all_learned) allLearnedVisible.value = true
+    }).catch(() => {})
+  }
   emit('submit-complete', payload)
 }
 
@@ -264,19 +373,53 @@ watch(() => props.isActive, (newVal, oldVal) => {
 </script>
 
 <style scoped>
-.filter-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
-.filter-row .el-select { width: 110px; }
-.filter-row .el-input { width: 140px; }
-.filter-row .el-button { padding: 8px 12px; }
+.filter-row { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 8px; }
+.filter-row .el-select { width: 100px; }
+.filter-row .el-input { width: 130px; }
+
+.action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  gap: 8px;
+}
+.btn-smart-practice {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px !important;
+  background: linear-gradient(135deg, var(--primary) 0%, #7c8cff 100%) !important;
+  color: #fff !important;
+  border: none !important;
+  border-radius: 10px;
+  font-weight: 600;
+  font-size: 14px;
+  box-shadow: 0 2px 8px rgba(91, 110, 245, 0.35);
+  transition: transform 0.15s ease, box-shadow 0.2s ease;
+}
+.btn-smart-practice:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(91, 110, 245, 0.45);
+  background: linear-gradient(135deg, #4a5ef5 0%, #6b7bff 100%) !important;
+  color: #fff !important;
+  border: none !important;
+}
+.btn-smart-practice:active {
+  transform: translateY(0);
+}
+.btn-smart-practice .el-icon {
+  font-size: 16px;
+}
 .stats-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
   color: var(--text-sub);
-  font-size: 13px;
-  margin-bottom: 8px;
+  font-size: 12px;
+  margin-bottom: 6px;
 }
 .col-header-bar {
   display: flex;
@@ -337,20 +480,32 @@ watch(() => props.isActive, (newVal, oldVal) => {
 
 .question-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
 }
 .q-card {
   background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 14px 16px;
+  border-radius: 8px;
+  padding: 10px 12px;
   cursor: pointer;
   transition: box-shadow .15s, border-color .15s;
+  position: relative;
+  overflow: hidden;
 }
 .q-card:hover { box-shadow: 0 4px 16px rgba(91,110,245,.12); border-color: var(--primary); }
+
+.answered-ribbon {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 3px;
+  height: 100%;
+  background: linear-gradient(180deg, #4F46E5 0%, #6366f1 100%);
+  border-radius: 0 2px 2px 0;
+}
 .q-card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
-.q-text { font-size: 14px; line-height: 1.5; flex: 1; min-width: 0; display: -webkit-box;
+.q-text { font-size: 13px; line-height: 1.45; flex: 1; min-width: 0; display: -webkit-box;
           -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .q-card-badges { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
 .type-badge { font-size: 10px; padding: 2px 6px; border-radius: 8px; white-space: nowrap; font-weight: 600; }
@@ -363,7 +518,7 @@ watch(() => props.isActive, (newVal, oldVal) => {
 .diff-easy   { background: #d1fae5; color: #065f46; }
 .diff-medium { background: #fef3c7; color: #92400e; }
 .diff-hard   { background: #fee2e2; color: #991b1b; }
-.q-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.q-meta { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .meta-chip { font-size: 11px; background: var(--primary-light); color: var(--primary);
              padding: 2px 8px; border-radius: 10px; }
 .score-chip { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
@@ -378,9 +533,9 @@ watch(() => props.isActive, (newVal, oldVal) => {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 16px;
-  margin-top: 24px;
-  padding-top: 16px;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 10px;
   border-top: 1px solid var(--border);
 }
 .pagination-info {
@@ -388,4 +543,11 @@ watch(() => props.isActive, (newVal, oldVal) => {
   color: var(--text-sub);
   text-align: center;
 }
+.all-learned-content { text-align: center; padding: 20px 0; }
+.celebration-emoji { font-size: 64px; margin-bottom: 16px; animation: bounce 0.6s ease infinite; }
+@keyframes bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-12px); }
+}
+.all-learned-content .sub { color: var(--text-sub); font-size: 13px; margin-top: 8px; }
 </style>

@@ -129,6 +129,17 @@ def prepare_extract_pending() -> tuple[int, Dict[str, int]]:
     return pending, initial
 
 
+def get_fetched_task_ids(batch_size: int) -> list[str]:
+    """获取 fetched 状态的 task_id 列表（供子进程批量提取使用）"""
+    with sqlite3.connect(sqlite_service.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT task_id FROM crawl_tasks WHERE status='fetched' LIMIT ?",
+            (batch_size,),
+        ).fetchall()
+        return [r["task_id"] for r in rows if r["task_id"]]
+
+
 def _execute_extract_pending(batch_size: int, source_info: Dict[str, str]) -> Dict[str, Any]:
     """仅提取 fetched 状态帖子（无 DB 变更，直接触发 process_tasks）"""
     pending, _ = prepare_extract_pending()
