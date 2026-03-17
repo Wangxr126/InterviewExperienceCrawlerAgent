@@ -42,6 +42,35 @@ def _save_eval_failure(input_preview: str, raw_output: str, error: str) -> None:
         logger.debug(f"保存评估失败记录异常: {e}")
 
 
+def _fix_json_invalid_escape(s: str) -> str:
+    """修复 LLM 返回的 JSON 中非法转义，避免 Invalid \\escape 解析失败。"""
+    if not s or "\\" not in s:
+        return s
+    res = []
+    i = 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            n = s[i + 1]
+            if n in '"\\/bfnrt':
+                res.append(s[i])
+                res.append(n)
+                i += 2
+                continue
+            if n == "u" and i + 5 <= len(s):
+                hex_part = s[i + 2 : i + 6]
+                if all(c in "0123456789abcdefABCDEF" for c in hex_part):
+                    res.append(s[i : i + 6])
+                    i += 6
+                    continue
+            res.append("\\\\")
+            res.append(n)
+            i += 2
+            continue
+        res.append(s[i])
+        i += 1
+    return "".join(res)
+
+
 _knowledge_recommender = KnowledgeRecommender()
 
 
@@ -63,11 +92,19 @@ def _evaluate_answer_structured(question_text: str,
         '"error_points":[{"wrong":"错误表述","correct":"正确表述"}],'
         '"missed_points":["遗漏点"],"strong_points":["答对的点"],"tags":["标签"]}'
         "\n\n【评分规则】"
-        "\n1. 0=完全不会，1=基本不会，2=大部分不会，3=勉强会有遗漏，4=基本掌握，5=完全掌握有延伸"
+        "\n1. score 取值仅为以下之一：0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0"
         "\n2. score<5 时，shortcomings 必须列出具体不足"
         "\n3. error_points：含 wrong（错误）和 correct（正确），用于纠正"
         "\n4. missed_points：用户遗漏的知识点"
         "\n5. feedback：分条列点，包含亮点、不足、错误纠正、遗漏补充、改进建议"
+        "\n\n【评分细则】"
+        "\n依据：①答对要点占比 ②遗漏要点数 ③混淆/错误数"
+        "\n· 5.0：答对核心要点 ≥90%，无遗漏、无错误"
+        "\n· 4.0-4.5：答对 ≥70%，遗漏 ≤1 个次要点，无错误"
+        "\n· 3.0-3.5：答对 ≥50%，遗漏 1-2 个要点，无严重错误"
+        "\n· 2.0-2.5：答对 30%-50%，或存在 1 处概念混淆/错误"
+        "\n· 1.0-1.5：答对 <30%，或存在 2+ 处错误"
+        "\n· 0-0.5：几乎未答对、大量错误或完全偏题"
     )
     prompt = f"【面试题目】\n{question_text}\n\n【用户回答】\n{user_answer}{ref_block}"
 
@@ -76,28 +113,47 @@ def _evaluate_answer_structured(question_text: str,
                "strong_points": [], "tags": [], "_eval_failed": True}
     try:
         _model = settings.interviewer_model or settings.llm_model_id
-        _base = (settings.llm_base_url or "").rstrip("/")
+        # 优先使用 interviewer 专用配置，避免 base_url/api_key 混用导致 404
+        _base = (settings.interviewer_base_url or settings.llm_base_url or "").rstrip("/")
+        _api_key = settings.interviewer_api_key or settings.llm_api_key
+        _timeout = settings.interviewer_timeout or settings.llm_timeout or 60
         _url = f"{_base}/chat/completions" if "/chat/completions" not in _base else _base
+        # deepseek-reasoner（R1）不支持 response_format json_object，需去掉该参数
+        _is_reasoner = "reasoner" in _model.lower() or "r1" in _model.lower()
+        _req_body: Dict[str, Any] = {
+            "model": _model,
+            "messages": [{"role": "user", "content": f"{system}\n\n{prompt}"}] if _is_reasoner
+                         else [{"role": "system", "content": system},
+                               {"role": "user", "content": prompt}],
+            "temperature": 0.1 if not _is_reasoner else 1,  # reasoner 温度固定为 1
+        }
+        if not _is_reasoner:
+            _req_body["response_format"] = {"type": "json_object"}
         resp = requests.post(
             _url,
-            headers={"Authorization": f"Bearer {settings.llm_api_key}",
+            headers={"Authorization": f"Bearer {_api_key}",
                      "Content-Type": "application/json"},
-            json={"model": _model,
-                  "messages": [{"role": "system", "content": system},
-                               {"role": "user", "content": prompt}],
-                  "temperature": 0.1,
-                  "response_format": {"type": "json_object"}},
-            timeout=settings.llm_timeout or 60,
+            json=_req_body,
+            timeout=_timeout,
         )
         if resp.status_code == 200:
             content = resp.json()["choices"][0]["message"]["content"]
+            result = None
             try:
                 result = json.loads(content)
-            except json.JSONDecodeError as e:
-                logger.error(f"_evaluate_answer_structured JSON 解析失败: {e}")
-                _save_eval_failure(prompt, content, error=str(e))
-                return default
-            result["score"] = max(0, min(5, int(result.get("score", 3))))
+            except json.JSONDecodeError:
+                try:
+                    result = json.loads(_fix_json_invalid_escape(content))
+                except json.JSONDecodeError as e:
+                    logger.error(f"_evaluate_answer_structured JSON 解析失败: {e}")
+                    _save_eval_failure(prompt, content, error=str(e))
+                    return default
+            raw_score = result.get("score", 3)
+            try:
+                score_val = float(raw_score)
+            except (TypeError, ValueError):
+                score_val = 3.0
+            result["score"] = max(0.0, min(5.0, round(score_val * 2) / 2))
             return result
         else:
             logger.warning(f"评估 LLM 返回 {resp.status_code}")
@@ -146,16 +202,17 @@ def _generate_explanation(question_text: str,
     )
     try:
         _model = settings.interviewer_model or settings.llm_model_id
-        _base = (settings.llm_base_url or "").rstrip("/")
+        _base = (settings.interviewer_base_url or settings.llm_base_url or "").rstrip("/")
         _url = f"{_base}/chat/completions" if "/chat/completions" not in _base else _base
+        _key = settings.interviewer_api_key or settings.llm_api_key
         resp = requests.post(
             _url,
-            headers={"Authorization": f"Bearer {settings.llm_api_key}",
+            headers={"Authorization": f"Bearer {_key}",
                      "Content-Type": "application/json"},
             json={"model": _model,
                   "messages": [{"role": "user", "content": prompt}],
                   "temperature": 0.7},
-            timeout=settings.llm_timeout or 60,
+            timeout=settings.interviewer_timeout or settings.llm_timeout or 60,
         )
         if resp.status_code == 200:
             return resp.json()["choices"][0]["message"]["content"]
@@ -297,7 +354,7 @@ class InterviewerAgent(ReActAgent):
             stream_enabled=True,
             stream_buffer_size=100,
             stream_include_thinking=True,
-            stream_include_tool_calls=False,
+            stream_include_tool_calls=True,
         )
 
         max_steps = getattr(settings, "interviewer_max_steps", 3)
@@ -869,6 +926,7 @@ class InterviewerAgent(ReActAgent):
         last_save_time = time.time()
         thinking_steps: List[dict] = []
         current_step: dict = {}
+        _current_step_no: int = 0  # 追踪当前步编号，检测 step_start 未触发时的步切换
         stream_stats: Dict[str, Any] = {"steps": 0, "tool_calls": []}
 
         from hello_agents.core.lifecycle import AgentEvent
@@ -960,7 +1018,7 @@ class InterviewerAgent(ReActAgent):
                         chunk = event.data.get("chunk") or event.data.get("content") or ""
                         if chunk.strip().startswith('[') and '"name"' in chunk and '"parameters"' in chunk:
                             continue
-                    elif event.type.value in ("tool_call_finish", "step_finish", "agent_finish"):
+                    if event.type.value in ("tool_call_finish", "step_finish", "agent_finish"):
                         # tool_call_finish 是 invoke_with_tools 完成后的第一个事件，
                         # 此时 last_reasoning 已由 DeepSeekThinkingOpenAIAdapter 写入。
                         # step_finish / agent_finish 也兜底处理，避免遗漏。
@@ -987,8 +1045,22 @@ class InterviewerAgent(ReActAgent):
                         result_pre = event.data.get("result") or ""
                         if result_pre:
                             full_content = result_pre
+                        # 把 current_step 中剩余内容合并到 thinking_steps。
+                        # 若 thinking_steps 最后一步的 __step 与当前步号相同，则合并工具列表，
+                        # 避免因 step_start 已提交了部分工具而导致同步的工具被拆到两条记录里。
                         if current_step.get("thought") or current_step.get("tools"):
-                            thinking_steps.append({k: v for k, v in current_step.items() if v})
+                            last = thinking_steps[-1] if thinking_steps else None
+                            cur_step_no = _current_step_no or 1
+                            if last and last.get("__step", cur_step_no) == cur_step_no:
+                                # 合并：把 current_step 的工具追加到已有步，thought 补充
+                                existing_tools = last.get("tools") or []
+                                new_tools = current_step.get("tools") or []
+                                last["tools"] = existing_tools + new_tools
+                                if current_step.get("thought") and not last.get("thought"):
+                                    last["thought"] = current_step["thought"]
+                            else:
+                                current_step["__step"] = cur_step_no
+                                thinking_steps.append({k: v for k, v in current_step.items() if v})
                             current_step = {}
                         # 注入 thinking_steps 到 agent_finish 事件，供前端存储并展示推理过程
                         try:
@@ -1000,6 +1072,22 @@ class InterviewerAgent(ReActAgent):
                                 d['thinking'] = thinking_steps
                             duration_ms_now = int((time.time() - start_time) * 1000)
                             d['duration_ms'] = d.get('duration_ms') or duration_ms_now
+                            # ✅ 兜底：result 为空时，从 full_content 或 thinking_steps 最后一步的 thought 提取
+                            # 原因：DeepSeek 等模型有时把最终答案写在 reasoning_content（thinking）而非 content，
+                            # 导致 agent_finish.result 为空，前端显示空白。
+                            if not d.get('result') and not full_content.strip():
+                                fallback = ''
+                                # 优先取最后一步的 thought（DeepSeek 把答案写在思考里的场景）
+                                if thinking_steps:
+                                    last_thought = thinking_steps[-1].get('thought', '')
+                                    if last_thought and last_thought.strip():
+                                        fallback = last_thought.strip()
+                                if fallback:
+                                    d['result'] = fallback
+                                    full_content = fallback
+                                    logger.info(f'[chat_stream] agent_finish.result 为空，已从 thinking 兜底 ({len(fallback)}字)')
+                            elif not d.get('result') and full_content.strip():
+                                d['result'] = full_content.strip()
                             sse_line = f"event: {et}\ndata: {json.dumps(d, ensure_ascii=False)}\n\n"
                         except Exception:
                             pass
@@ -1024,10 +1112,19 @@ class InterviewerAgent(ReActAgent):
                         thinking_steps.append({k: v for k, v in current_step.items() if v})
                         current_step = {}
                 elif event.type.value == "step_start":
-                    # 提交上一步（如果有内容）
-                    if current_step.get("thought") or current_step.get("tools"):
-                        thinking_steps.append({k: v for k, v in current_step.items() if v})
-                    current_step = {"tools": []}
+                    # ⚠️ step_start 到来时并发工具可能尚未全部完成（tool_call_finish 还在途中），
+                    # 不在此处提交 current_step，避免把同一步的多个工具拆到不同步。
+                    # 只更新步编号；统一在 agent_finish（或 ev_step_no 变化）时提交。
+                    new_step_no = int(event.data.get("step") or stream_stats.get("steps") or _current_step_no + 1)
+                    if new_step_no != _current_step_no and _current_step_no > 0:
+                        # 步编号真正切换：把旧步提交，开启新步
+                        # 但此时旧步可能还有工具未完成，标记步编号后继续累积
+                        # 用 __pending_step_no 记录旧步编号，供 tool_call_finish 兜底归属
+                        if current_step.get("thought") or current_step.get("tools"):
+                            current_step["__step"] = _current_step_no
+                            thinking_steps.append({k: v for k, v in current_step.items() if v})
+                        current_step = {"tools": []}
+                    _current_step_no = new_step_no
                 elif event.type.value == "thinking":
                     thought_content = (
                         event.data.get("content") or event.data.get("reasoning")
@@ -1067,6 +1164,21 @@ class InterviewerAgent(ReActAgent):
                             or _pending_tool_args.pop(tool_name, None)
                             or {}
                         )
+                        # 检测步骤切换（兜底，step_start 未触发时）：
+                        # ev_step_no=0 表示 step 字段缺失，不触发步骤切换，所有工具归属当前步。
+                        # ev_step_no 变化时才切换，但要先把 current_step 并入已有对应步（避免并发工具丢失）。
+                        ev_step_no = int(event.data.get("step") or 0)
+                        if ev_step_no == 0:
+                            # step 字段缺失：首次工具调用时初始化为1，后续保持不变
+                            if _current_step_no == 0:
+                                _current_step_no = 1
+                        elif ev_step_no != _current_step_no:
+                            # step 编号变化：提交旧步，开启新步
+                            if _current_step_no > 0 and (current_step.get("thought") or current_step.get("tools")):
+                                current_step["__step"] = _current_step_no
+                                thinking_steps.append({k: v for k, v in current_step.items() if v})
+                            current_step = {"tools": []}
+                            _current_step_no = ev_step_no
                         if "tools" not in current_step:
                             current_step["tools"] = []
                         current_step["tools"].append({

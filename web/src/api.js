@@ -18,6 +18,13 @@ export const api = {
     return r.json()
   },
 
+  async clearChatSession(userId) {
+    const r = await fetch(`${BASE}/api/user/${userId}/chat/clear`, {
+      method: 'POST',
+    })
+    return r.json()
+  },
+
   // ── 题库 ──────────────────────────────────────────────
   async getMeta() {
     const r = await fetch(`${BASE}/api/questions/meta`)
@@ -79,6 +86,20 @@ export const api = {
       throw new Error(msg)
     }
     return data  // 返回 {task_id, status, result/error}
+  },
+
+  // ── 答题流式评估（SSE，Agent 评分）────────────────────────
+  // 返回 Response 对象，由调用方自行读取 SSE 流，格式与 chatStream 相同
+  async submitAnswerStream(payload, signal) {
+    return fetch(`${STREAM_BASE || BASE}/api/submit_answer/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+      },
+      body: JSON.stringify(payload),
+      signal,
+    })
   },
 
   // ── 对话（普通，用于兜底）──────────────────────────────

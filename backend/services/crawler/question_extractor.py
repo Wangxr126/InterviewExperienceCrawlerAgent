@@ -59,7 +59,7 @@ _MAX_LOG_OUTPUT = 3000         # 输出最大字符
 _OCR_PLACEHOLDER = "[OCR 省略]"  # 替换大段 OCR 噪音
 
 # 每次提取最大字符数（避免超 token）
-MAX_CONTENT_CHARS = 6000
+MAX_CONTENT_CHARS = 65535*2
 
 # 重新提取所有时使用的时间戳后缀，写入独立文件；None 则用默认路径
 _llm_log_run_suffix: Optional[str] = None
@@ -180,6 +180,8 @@ def _append_llm_log_to_csv(user_prompt: str, llm_response: str, response_time_se
             p = log_dir / filename
             
             record = {
+                "标题": title[:100] if title else "",
+                "链接": source_url or "",
                 "原始": content[:_MAX_LOG_INPUT_PREVIEW],
                 "输出": llm_raw[:_MAX_LOG_OUTPUT],
                 "操作时间": round(response_time_sec, 2) if response_time_sec is not None else None,
@@ -614,16 +616,11 @@ def extract_questions_from_post(
     
     # 只检查是否完全为空（不检查长度）
     if not content and not image_paths:
-        logger.warning(f"内容和图片均为空，跳过提取: {source_url}")
+        logger.warning(f"内容和图片均为空，跳过提取 | url={source_url} | title={post_title[:30] if post_title else ''}")
         return [], "empty", False, True, None
 
-    # 截断过长内容
-    truncated = content[:MAX_CONTENT_CHARS] if content else ""
-    if content and len(content) > MAX_CONTENT_CHARS:
-        logger.info(f"内容截断: {len(content)} → {MAX_CONTENT_CHARS} chars")
-
-    # 拼接标题和内容
-    full_content = f"【标题】{post_title}\n\n【正文】\n{truncated}" if post_title else truncated
+    # 不截断，保留完整内容
+    full_content = f"【标题】{post_title}\n\n【正文】\n{content}" if post_title else content
 
     # 使用新的 Prompt 系统
     user_prompt = format_miner_user_prompt(full_content, has_image=bool(image_paths), company=company, position=position)
@@ -782,12 +779,12 @@ def extract_questions_from_post(
         if attempt < max_retries:
             time.sleep(1)
         else:
-            logger.warning(f"提取失败，已达最大重试次数 {max_retries}: {source_url}")
+            logger.warning(f"提取失败，已达最大重试次数 {max_retries} | url={source_url} | title={post_title[:30] if post_title else ''}")
             if raw:
                 logger.info(f"LLM 原始返回（前500字）: {raw[:500]}")
 
     if not items:
-        logger.warning(f"LLM 未提取到题目: {source_url}")
+        logger.warning(f"LLM 未提取到题目 | url={source_url} | title={post_title[:30] if post_title else ''}")
         return [], status, agent_used_tool, True, trace_session_id
 
     questions: List[Dict] = []
@@ -845,7 +842,7 @@ def extract_questions_from_post(
 
     # 只在成功提取到题目时输出日志
     if questions:
-        logger.info(f"✅ 提取成功: {len(questions)} 道题目 | {post_title[:30] or source_url}")
+        logger.info(f"✅ 提取成功: {len(questions)} 道题目 | title={post_title[:30] if post_title else ''} | url={source_url}")
     return questions, "ok", agent_used_tool, agent_succeeded, trace_session_id
 
 

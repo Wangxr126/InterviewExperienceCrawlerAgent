@@ -176,21 +176,22 @@
             <div class="editor-panel">
               <div class="panel-header">
                 <span class="panel-title">① 原始面经正文</span>
+                <a
+                  v-if="currentSample.source_url"
+                  :href="currentSample.source_url"
+                  target="_blank"
+                  class="post-link-inline"
+                  :title="currentSample.source_url"
+                >
+                  🔗 原帖
+                </a>
               </div>
               
-              <!-- 标题和链接 -->
-              <div class="post-meta" v-if="currentSample.title || currentSample.source_url">
-                <div class="post-title" v-if="currentSample.title">
+              <!-- 标题 -->
+              <div class="post-meta" v-if="currentSample.title">
+                <div class="post-title">
                   {{ currentSample.title }}
                 </div>
-                <a 
-                  v-if="currentSample.source_url" 
-                  :href="currentSample.source_url" 
-                  target="_blank" 
-                  class="post-link"
-                >
-                  🔗 查看原帖
-                </a>
               </div>
               
               <div class="panel-content">
@@ -226,7 +227,12 @@
             <!-- 右栏：标注编辑 + 大模型辅助 -->
             <div class="editor-panel">
               <div class="panel-header">
-                <span class="panel-title">③ 标注编辑 <el-tag type="info" size="small">默认 Stage2 豆包生成</el-tag></span>
+                <span class="panel-title">③ 标注编辑
+                  <el-tag
+                    :type="currentSample?.final_output ? 'warning' : 'info'"
+                    size="small"
+                  >{{ currentSample?.final_output ? '已修改内容' : (currentSample?.stage2_output ? 'Stage2 豆包生成' : 'Stage1 本地生成') }}</el-tag>
+                </span>
                 <el-button 
                   type="primary" 
                   @click="callAssist"
@@ -948,8 +954,13 @@ const doReplaceAll = () => {
 }
 
 const isModified = computed(() => {
-  const orig = currentSample.value?.final_output || currentSample.value?.assist_output || currentSample.value?.stage2_output || ''
-  return editOutput.value.trim() !== orig.trim() && editOutput.value.trim() !== ''
+  if (!editOutput.value.trim()) return false
+  // 以 final_output（上次保存的修改内容）为基准，若没有则以 stage2_output 为基准
+  const baseline = currentSample.value?.final_output || currentSample.value?.assist_output || currentSample.value?.stage2_output || ''
+  if (!baseline) return true
+  // 比较时忽略格式差异（都格式化成 JSON 再比较）
+  const normalizeJson = (s) => { try { return JSON.stringify(JSON.parse(s)) } catch { return s.trim() } }
+  return normalizeJson(editOutput.value) !== normalizeJson(baseline)
 })
 
 const parseJson = (str) => {
@@ -1526,6 +1537,30 @@ onActivated(async () => {
 .post-link:hover {
   background: #dbeafe;
   color: #2563eb;
+}
+
+.post-link-inline {
+  display: inline-flex;
+  align-items: center;
+  font-size: 13px;
+  color: #3b82f6;
+  text-decoration: none;
+  padding: 3px 10px;
+  border-radius: 6px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  transition: all 0.2s;
+  white-space: nowrap;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-left: auto;
+}
+
+.post-link-inline:hover {
+  background: #dbeafe;
+  color: #2563eb;
+  border-color: #93c5fd;
 }
 
 .panel-title {

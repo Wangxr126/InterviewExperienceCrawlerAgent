@@ -33,9 +33,19 @@ def _is_ocr_garbled(text: str) -> bool:
     if len(t) < 5:
         return False  # 太短不判定
     chinese = len(re.findall(r"[\u4e00-\u9fff]", t))
+    english = len(re.findall(r"[a-zA-Z]", t))
+    # 非中非英字符（如阿拉伯文、韩文、俄文等）
+    non_cjk_non_latin = len(re.findall(
+        r"[\u0600-\u06FF\u0400-\u04FF\uAC00-\uD7AF\u3040-\u30FF]", t
+    ))
     total = len(t)
-    # 面经应为中文为主，若中文占比 < 15% 且总长 > 20，可能乱码（如阿拉伯文等）
-    if total > 20 and chinese / total < 0.15:
+    # 有意义的中文或英文字符占比
+    meaningful = chinese + english
+    # 仅当非中非英乱码字符占比超过 30% 才判定为乱码
+    if total > 5 and non_cjk_non_latin / total > 0.30:
+        return True
+    # 既无中文也无英文（纯符号/数字/空白等），且内容较长，判定为无效
+    if total > 30 and meaningful / total < 0.05:
         return True
     return False
 

@@ -53,10 +53,11 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted, nextTick } from 'vue'
+import { ref, watch, onMounted, nextTick, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import { User } from '@element-plus/icons-vue'
 import { api } from './api.js'
+import { useChatStore } from './stores/chatStore.js'
 import BrowseView   from './views/BrowseView.vue'
 import ChatView     from './views/ChatView.vue'
 import IngestView   from './views/IngestView.vue'
@@ -66,12 +67,16 @@ import ReportView   from './views/ReportView.vue'
 import FinetuneView from './views/FinetuneView.vue'
 import MasteryDialog from './components/MasteryDialog.vue'
 
+const chatStore   = useChatStore()
 const userId      = ref('')
 // 从 localStorage 恢复上次的视图，默认为 'browse'
 const currentView = ref(localStorage.getItem('currentView') || 'browse')
 const showMastery = ref(false)
 const chatViewRef = ref(null)
 const meta        = ref({ total: 0, companies: [], tags: [], positions: [], difficulties: [] })
+
+// 始终使用 chatStore 中的固定 session，若尚未初始化则生成一个稳定的 session
+const chatSessionId = computed(() => chatStore.sessionId || `sess_${userId.value || 'default'}`)
 
 // 监听视图变化，保存到 localStorage
 watch(currentView, (newView) => {
@@ -106,33 +111,37 @@ const loadConfig = async () => {
   if (!userId.value) userId.value = 'Wangxr'
 }
 
-// 提交作答：跳转 chat，屏幕只展示题目+作答，完整信息（q_id、公司、难度、标签等）发给 AI
+// 提交作答：跳转到 Chat，延续固定 session，由 Agent 调用 submit_answer 工具完成评分
 const onSubmitComplete = ({ question, userAnswer }) => {
-  const displayParts = []
-  displayParts.push(`题目：${question?.question_text || ''}`)
-  displayParts.push(`我的作答：${userAnswer || ''}`)
-  const displayMsg = displayParts.join('\n')
+  const metaParts = []
+  if (question?.company) metaParts.push(`公司：${question.company}`)
+  if (question?.difficulty) metaParts.push(`难度：${question.difficulty === 'easy' ? '简单' : question.difficulty === 'hard' ? '困难' : '中等'}`)
 
-  const apiParts = []
-  apiParts.push(`【已作答】题目：${question?.question_text || ''}【q_id:${question?.q_id || ''}】`)
-  const meta = []
-  if (question?.company) meta.push(`公司：${question.company}`)
-  if (question?.difficulty) meta.push(`难度：${question.difficulty === 'easy' ? '简单' : question.difficulty === 'hard' ? '困难' : '中等'}`)
-  if (question?.topic_tags?.length) meta.push(`标签：${question.topic_tags.join('、')}`)
-  if (meta.length) apiParts.push(`【题目信息】${meta.join(' | ')}`)
-  apiParts.push(`【我的作答】${userAnswer || ''}`)
-  const apiMsg = apiParts.join('\n')
+  // API 消息：带 q_id 和作答，让 Agent 调用 submit_answer 工具评分
+  const lines = []
+  // lines.push(`我已作答以下题目，请调用 submit_answer 工具为我评分。`)
+  lines.push(`题目：${question?.question_text || ''}【q_id:${question?.q_id || ''}】`)
+  if (metaParts.length) lines.push(`【题目信息】${metaParts.join(' | ')}`)
+  lines.push(`我的作答：${userAnswer || ''}`)
+  const apiMsg = lines.join('\n')
+
+  // 屏幕展示：题目全文 + 我的作答，清晰直观
+  const displayLines = []
+  displayLines.push(`题目：${question?.question_text || ''}`)
+  displayLines.push(`我的作答：${userAnswer || ''}`)
+  const displayMsg = displayLines.join('\n')
+
+  // 使用 chatStore 中的固定 session，保持对话连续
+  if (!chatStore.sessionId) {
+    chatStore.sessionId = `sess_${userId.value || Date.now()}`
+  }
 
   currentView.value = 'chat'
   nextTick(() => {
-    const tryPrefill = () => {
-      if (!chatViewRef.value) {
-        ElMessage.error('对话组件未就绪，请稍后再试')
-        return
-      }
+    setTimeout(() => {
+      if (!chatViewRef.value) return
       chatViewRef.value.prefillAndSend({ display: displayMsg, api: apiMsg })
-    }
-    setTimeout(tryPrefill, 200)
+    }, 200)
   })
 }
 

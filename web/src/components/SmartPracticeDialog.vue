@@ -250,7 +250,7 @@ watch(visible, (v) => {
   }
 })
 
-const submit = async () => {
+const submit = () => {
   if (!myAnswer.value.trim()) {
     ElMessage.warning('请先输入你的答案')
     return
@@ -260,71 +260,14 @@ const submit = async () => {
     return
   }
 
-  submitting.value = true
-  evalResult.value = null
+  const userAnswer = myAnswer.value.trim()
 
-  try {
-    const userAnswer = myAnswer.value.trim()
-    const { api } = await import('../api.js')
-    
-    // Step 1: 提交答案，获取任务 ID
-    const submitResp = await api.submitAnswer({
-      user_id: props.userId,
-      session_id: props.sessionId || `sess_${Date.now()}`,
-      question_id: props.question.q_id,
-      question_text: props.question.question_text,
-      user_answer: userAnswer,
-      question_tags: props.question.topic_tags || [],
-    })
-    
-    const taskId = submitResp.task_id
-    ElMessage.info('正在评分中，请稍候...')
-    
-    // Step 2: 轮询获取评分结果（最多等待 60 秒）
-    let result = null
-    let attempts = 0
-    const maxAttempts = 120  // 60 秒（每 500ms 轮询一次）
-    
-    while (attempts < maxAttempts) {
-      await new Promise(resolve => setTimeout(resolve, 500))  // 等待 500ms
-      attempts++
-      
-      try {
-        const statusResp = await api.getSubmitAnswerStatus(taskId)
-        
-        if (statusResp.status === 'completed') {
-          result = statusResp.result
-          break
-        } else if (statusResp.status === 'failed') {
-          throw new Error(`评分失败: ${statusResp.error}`)
-        }
-        // 继续轮询
-      } catch (pollError) {
-        console.error('轮询状态失败:', pollError)
-        if (attempts >= maxAttempts) {
-          throw new Error('评分超时，请稍后重试')
-        }
-      }
-    }
-    
-    if (!result) {
-      throw new Error('评分超时（60秒），请稍后重试')
-    }
-    
-    evalResult.value = result
-    // 不再弹出分数提示，由 Agent 在对话中展示评分结果
-
-    emit('submit-complete', {
-      question: props.question,
-      userAnswer,
-      result,
-    })
-  } catch (error) {
-    console.error('提交答案失败:', error)
-    ElMessage.error(error.message || '提交失败，请重试')
-  } finally {
-    submitting.value = false
-  }
+  // 直接通知父组件跳转到 Chat，由 Agent 交互后调用 submit_answer 工具完成评分
+  emit('submit-complete', {
+    question: props.question,
+    userAnswer,
+    result: null,
+  })
 }
 
 const openSourceUrl = () => {

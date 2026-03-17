@@ -319,6 +319,8 @@ class TwoStageExtractor:
                         stage1_output=rough_result,
                         stage2_output=enrich_result,
                         stage2_model_used=model_name,
+                        source_url=source_url or "",
+                        post_title=post_title or "",
                     )
 
                     logger.info("[TwoStageExtractor] Stage 2 完成 model=%s，输出长度: %d", model_name, len(enrich_result))
@@ -350,6 +352,8 @@ class TwoStageExtractor:
         stage1_output: str,
         stage2_output: str,
         stage2_model_used: str = "",
+        source_url: str = "",
+        post_title: str = "",
     ) -> None:
         """保存两阶段结果，用于后续本地模型微调（Stage1 vs Stage2 对比）"""
         log_path = settings.miner_two_stage_log_path
@@ -362,6 +366,8 @@ class TwoStageExtractor:
             record = {
                 "ts": datetime.now().isoformat(),
                 "content_preview": content[:500] + ("..." if len(content) > 500 else ""),
+                "title": post_title or "",
+                "source_url": source_url or "",
                 "stage1_output": stage1_output,
                 "stage2_output": stage2_output,
                 "stage1_model": settings.miner_local_model,
@@ -371,9 +377,9 @@ class TwoStageExtractor:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-            logger.debug(f"[TwoStageExtractor] 两阶段日志已保存: {log_path}")
+            logger.debug(f"[TwoStageExtractor] 两阶段日志已保存: {log_path} | url={source_url} | title={post_title[:30] if post_title else ''}")
         except Exception as e:
-            logger.warning(f"[TwoStageExtractor] 保存两阶段日志失败: {e}")
+            logger.warning(f"[TwoStageExtractor] 保存两阶段日志失败: {e} | url={source_url} | title={post_title[:30] if post_title else ''}")
 
     def _check_mark_unrelated_called(self) -> bool:
         """检查是否调用了 mark_unrelated 工具（LLM 调用后可能只输出自然语言，不含 __UNRELATED__）"""

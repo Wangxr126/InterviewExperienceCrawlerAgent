@@ -104,9 +104,10 @@ class DeepSeekThinkingOpenAIAdapter(OpenAIAdapter):
                     except Exception:
                         # stdout 写入失败不影响主流程
                         pass
-                else:
-                    # 本步无 reasoning，重置为空，避免上一步数据残留
-                    self.last_reasoning = ""
+                # ⚠️ 不再在 reasoning 为空时清空 last_reasoning：
+                # astream_invoke 流式阶段已收集到 reasoning，invoke_with_tools
+                # 紧随其后执行时 tool_calls 响应可能不含 reasoning_content（为空），
+                # 若此处清空会导致流式收集的推理内容丢失，chat_stream 无法推送 thinking SSE。
             return response
         except Exception as e:
             raise HelloAgentsException(f"OpenAI Function Calling调用失败: {e}")

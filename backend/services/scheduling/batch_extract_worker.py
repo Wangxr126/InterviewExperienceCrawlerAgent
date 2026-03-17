@@ -12,6 +12,13 @@
 import logging
 import sys
 from datetime import datetime
+from pathlib import Path
+
+# 子进程独立运行，必须手动加载 .env，否则 MINER_MODE/LLM_PROVIDER 等配置读取不到
+_env_file = Path(__file__).parent.parent.parent.parent / ".env"
+if _env_file.exists():
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=str(_env_file), override=True)
 
 # 子进程独立运行，需配置基础 logging 输出到 stderr（主进程会重定向到 batch_extract.log）
 logging.basicConfig(

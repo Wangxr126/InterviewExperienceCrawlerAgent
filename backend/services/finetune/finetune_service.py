@@ -145,6 +145,8 @@ def import_from_log_file(log_path: str, skip_existing: bool = True) -> Dict[str,
                         stage2 = merge_stage2_with_stage1(stage2, stage1)
                     stage1_model = rec.get("stage1_model", "")
                     stage2_model = rec.get("stage2_model", "")
+                    title = rec.get("title", "")
+                    source_url = rec.get("source_url", "")
                     ts = rec.get("ts", now_ts)
                     if not content and not stage1 and not stage2:
                         continue
@@ -158,9 +160,9 @@ def import_from_log_file(log_path: str, skip_existing: bool = True) -> Dict[str,
                             continue
                     conn.execute(
                         """INSERT INTO finetune_samples
-                           (content, stage1_output, stage2_output, stage1_model, stage2_model, status, source, created_at)
-                           VALUES (?,?,?,?,?,?,?,?)""",
-                        (content or "(无原文)", stage1, stage2, stage1_model, stage2_model, "pending", "miner_two_stage", ts)
+                           (content, stage1_output, stage2_output, stage1_model, stage2_model, title, source_url, status, source, created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (content or "(无原文)", stage1, stage2, stage1_model, stage2_model, title, source_url, "pending", "miner_two_stage", ts)
                     )
                 else:
                     # 旧版 llm_logs 格式（兼容）

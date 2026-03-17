@@ -974,6 +974,16 @@ class SqliteService:
             conn.commit()
             return msg["message_id"]
 
+    def clear_conversation_history(self, session_id: str, user_id: str):
+        """清空指定 session 的 conversation_history，若 session 不存在则先创建"""
+        self.ensure_session_exists(session_id, user_id)
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE interview_sessions SET conversation_history = ? WHERE session_id = ?",
+                ("[]", session_id),
+            )
+            conn.commit()
+
     def ensure_session_exists(self, session_id: str, user_id: str) -> bool:
         """确保 session 存在，不存在则创建。返回是否为新创建"""
         with self._get_conn() as conn:

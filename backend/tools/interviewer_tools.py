@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, logging, re, random
+import json, logging, re, random, requests
 from typing import Any, List, Dict, Optional
 from hello_agents.tools import Tool, ToolParameter
 from hello_agents.tools.response import ToolResponse
@@ -11,6 +11,135 @@ from backend.services.rerank_service import rerank_candidates
 from backend.services.multi_recall_recommender import multi_recall_recommender
 
 logger = logging.getLogger(__name__)
+
+
+# ===========================================================
+# 评估辅助函数
+# ===========================================================
+
+def _fix_json_invalid_escape(s: str) -> str:
+    """修复 LLM 返回的 JSON 中非法转义（如 \\x、\\N 等），避免 Invalid \\escape 解析失败。"""
+    if not s or "\\" not in s:
+        return s
+    res = []
+    i = 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            n = s[i + 1]
+            if n in '"\\/bfnrt':
+                res.append(s[i])
+                res.append(n)
+                i += 2
+                continue
+            if n == "u" and i + 5 <= len(s):
+                hex_part = s[i + 2 : i + 6]
+                if all(c in "0123456789abcdefABCDEF" for c in hex_part):
+                    res.append(s[i : i + 6])
+                    i += 6
+                    continue
+            # 非法转义：保留反斜杠为双反斜杠，下一字符原样保留
+            res.append("\\\\")
+            res.append(n)
+            i += 2
+            continue
+        res.append(s[i])
+        i += 1
+    return "".join(res)
+
+
+def _save_eval_failure(input_preview: str, raw_output: str, error: str) -> None:
+    try:
+        from backend.services.logging.llm_parse_failures import save_failure
+        save_failure(source="answer_eval", input_preview=input_preview,
+                     raw_output=raw_output, error=error, metadata={})
+    except Exception as e:
+        logger.debug(f"保存评估失败记录异常: {e}")
+
+
+def _evaluate_answer_structured(question_text: str,
+                                user_answer: str,
+                                reference_answer: Optional[str] = None) -> Dict[str, Any]:
+    """
+    结构化评估：直接调用 LLM（JSON mode），不走 ReAct 循环。
+    Returns: {score, feedback, shortcomings, error_points, missed_points, strong_points, tags}
+    """
+    ref_block = ""
+    if reference_answer and reference_answer.strip():
+        ref_block = f"\n【参考答案/标准答案】（来自题库，用于对比）\n{reference_answer.strip()}\n"
+
+    system = (
+        "你是一位技术面试评委。用户将提交面试题目和他们的回答。"
+        "你需要评估回答质量，严格按以下 JSON 格式返回，不得添加任何额外字段或注释：\n"
+        '{"score":3,"feedback":"总体评价","shortcomings":["不足1"],'
+        '"error_points":[{"wrong":"错误表述","correct":"正确表述"}],'
+        '"missed_points":["遗漏点"],"strong_points":["答对的点"],"tags":["标签"]}'
+        "\n\n【评分规则】"
+        "\n1. score 取值仅为以下之一：0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0"
+        "\n2. score<5 时，shortcomings 必须列出具体不足"
+        "\n3. error_points：含 wrong（错误）和 correct（正确），用于纠正"
+        "\n4. missed_points：用户遗漏的知识点"
+        "\n5. feedback：分条列点，包含亮点、不足、错误纠正、遗漏补充、改进建议"
+        "\n\n【评分细则】"
+        "\n依据：①答对要点占比 ②遗漏要点数 ③混淆/错误数"
+        "\n· 5.0：答对核心要点 ≥90%，无遗漏、无错误"
+        "\n· 4.0-4.5：答对 ≥70%，遗漏 ≤1 个次要点，无错误"
+        "\n· 3.0-3.5：答对 ≥50%，遗漏 1-2 个要点，无严重错误"
+        "\n· 2.0-2.5：答对 30%-50%，或存在 1 处概念混淆/错误"
+        "\n· 1.0-1.5：答对 <30%，或存在 2+ 处错误"
+        "\n· 0-0.5：几乎未答对、大量错误或完全偏题"
+    )
+    prompt = f"【面试题目】\n{question_text}\n\n【用户回答】\n{user_answer}{ref_block}"
+
+    default = {"score": 3, "feedback": "（评估服务暂时不可用，已记录原始答案）",
+               "shortcomings": [], "error_points": [], "missed_points": [],
+               "strong_points": [], "tags": [], "_eval_failed": True}
+    try:
+        _model = settings.interviewer_model or settings.llm_model_id
+        # 优先使用 interviewer 专用配置，避免 base_url/api_key 混用导致 404
+        _base = (settings.interviewer_base_url or settings.llm_base_url or "").rstrip("/")
+        _api_key = settings.interviewer_api_key or settings.llm_api_key
+        _timeout = settings.interviewer_timeout or settings.llm_timeout or 60
+        _url = f"{_base}/chat/completions" if "/chat/completions" not in _base else _base
+        resp = requests.post(
+            _url,
+            headers={"Authorization": f"Bearer {_api_key}",
+                     "Content-Type": "application/json"},
+            json={"model": _model,
+                  "messages": [{"role": "system", "content": system},
+                               {"role": "user", "content": prompt}],
+                  "temperature": 0.1,
+                  "response_format": {"type": "json_object"}},
+            timeout=_timeout,
+        )
+        if resp.status_code == 200:
+            content = resp.json()["choices"][0]["message"]["content"]
+            result = None
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                try:
+                    result = json.loads(_fix_json_invalid_escape(content))
+                except json.JSONDecodeError as e:
+                    logger.error(f"_evaluate_answer_structured JSON 解析失败: {e}")
+                    _save_eval_failure(prompt, content, error=str(e))
+                    return default
+            raw_score = result.get("score", 3)
+            try:
+                score_val = float(raw_score)
+            except (TypeError, ValueError):
+                score_val = 3.0
+            # 支持 0.5 档位，四舍五入到最近 0.5 并限制在 [0, 5]
+            result["score"] = max(0.0, min(5.0, round(score_val * 2) / 2))
+            return result
+        else:
+            logger.warning(f"评估 LLM 返回 {resp.status_code}")
+            _save_eval_failure(prompt, resp.text[:2000] if resp.text else "",
+                               error=f"HTTP {resp.status_code}")
+            return default
+    except Exception as e:
+        logger.error(f"_evaluate_answer_structured 异常: {e}")
+        _save_eval_failure(prompt, "", error=str(e))
+        return default
 
 
 def _get_seen_question_ids(user_id: str, limit: int = 100) -> List[str]:
@@ -27,6 +156,7 @@ class GetRecommendedQuestionTool(Tool):
                 "【调用时机】用户说「来道题」「下一题」「字节的MySQL题」「出一道Redis题」时。"
                 "【功能】从题库推荐多道题（默认5道）：① 遗忘曲线到期 ② 薄弱标签 ③ 按 topic/company 随机。"
                 "【填槽】topic、company、difficulty。若说「某公司的题」未指定公司，先询问补全。"
+                "【返回】题目列表（题目ID、题目、难度、标签、公司、推荐理由）、总数、筛选条件；无符合题目时返回失败原因。"
                 "【严禁】用户说「我想练习这道题【q_id:xxx】」时严禁调用，直接输出题目即可。"
             ),
         )
@@ -186,6 +316,7 @@ class FindSimilarQuestionsTool(Tool):
                 "【调用时机】用户说「换个问法」「同公司的类似题」「出几道类似的」且对话中有上一题时。"
                 "【功能】向量检索相似题，排除 exclude_id，返回 limit 道。"
                 "【填槽】question_text（必填）、exclude_id、company、difficulty。若说「同公司的」未指定公司，先询问。"
+                "【返回】相似题列表（题目ID、题目、难度、标签、公司）；检索失败时返回失败原因。"
                 "【严禁】用户说「我想练习这道题」时严禁调用。"
             ),
         )
@@ -387,8 +518,9 @@ class FilterQuestionsTool(Tool):
             name="filter_questions",
             description=(
                 "【调用时机】用户说「列出字节的题」「这周收录的题」「Redis中等难度」时。"
-                "【功能】按 company/tags/difficulty/keyword/日期 筛选，返回题目列表。"
-                "【填槽】company、tags、difficulty、keyword、date_from、date_to（YYYY-MM-DD）。"
+                "【功能】按 company/tags/difficulty/keyword/日期 筛选，返回题目列表（默认最多10条，最多30条）。"
+                "【填槽】company、tags、difficulty、keyword、date_from、date_to（YYYY-MM-DD）、limit。"
+                "【返回】题目列表（q_id、题目、难度、标签、公司、来源）、符合条件的总数、本次返回条数；失败时返回原因。"
                 "【严禁】用户说「我想练习这道题」时严禁调用。"
             ),
         )
@@ -466,9 +598,10 @@ class GetQuestionDetailTool(Tool):
         super().__init__(
             name="get_question_detail",
             description=(
-                "【调用时机】用户想查看题目详情、参考答案时；submit_answer 流程无需调用（工具内部自动取题）。"
-                "【功能】返回 question_text、answer_text、topic_tags、difficulty。"
+                "【调用时机】用户想查看题目详情、参考答案时；你评估用户作答前可先调用取标准答案。"
+                "【功能】根据题目ID获取题目全文、参考答案、标签、难度。"
                 "【填槽】question_id（必填）。"
+                "【返回】question_id、question_text、answer_text、topic_tags、difficulty；未找到题目时返回失败原因。"
             ),
         )
 
@@ -504,67 +637,16 @@ class GetQuestionDetailTool(Tool):
             return ToolResponse.error(code="EXECUTION_ERROR", message=f"get_question_detail failed: {e}")
 
 
-def _VALID_INTENTS() -> set:
-    return {
-        "submit_answer", "practice_specified", "get_recommended_question",
-        "find_similar_questions", "explain", "get_mastery_report", "filter_questions",
-        "record_weakness", "manage_note", "get_session_context", "analyze_resume",
-        "get_knowledge_recommendation", "unknown",
-    }
-
-
-class RecognizeIntentTool(Tool):
-    """记录 Agent 推断的意图，不做规则解析。"""
-
-    def __init__(self):
-        super().__init__(
-            name="recognize_intent",
-            description=(
-                "【调用时机】每轮对话**第一步必须**调用，再根据 intent 选择后续工具。"
-                "【功能】记录你根据对话上下文推断的意图与槽位，不进行规则解析。"
-                "【填槽】intent（必填）、slots（可选，如 submit_answer 需 {question_id, user_answer}）。"
-            ),
-        )
-
-    def get_parameters(self):
-        return [
-            ToolParameter("intent", "string",
-                          "你根据上下文推断的意图，如 submit_answer、practice_specified、get_recommended_question 等", required=True),
-            ToolParameter("slots", "object",
-                          "提取的槽位：practice_specified 填 {question_id}；submit_answer 仅填 {question_id}，勿填 user_answer（系统自动取本轮用户消息）", required=False),
-        ]
-
-    def run(self, parameters):
-        intent = (parameters.get("intent") or "").strip() or "unknown"
-        slots = parameters.get("slots")
-        if slots is None:
-            slots = {}
-        if isinstance(slots, str):
-            try:
-                slots = json.loads(slots) if slots.strip() else {}
-            except json.JSONDecodeError:
-                slots = {}
-        if not isinstance(slots, dict):
-            slots = {}
-
-        valid = _VALID_INTENTS()
-        if intent not in valid:
-            intent = "unknown"
-
-        result = {"intent": intent, "slots": slots}
-        return ToolResponse.success(
-            text=json.dumps(result, ensure_ascii=False, indent=2))
-
-
 class SubmitAnswerTool(Tool):
-    """填槽评分+持久化：Agent 传入 question_id 和 user_answer，工具内部调用 LLM 自动评分，再写入 study_records / SM-2 / 会话历史。"""
+    """仅记录：由 Agent 自行评估后传入评分结果，工具只负责写入 study_records / SM-2 / 会话历史，不调用任何评估 LLM。"""
     def __init__(self):
         super().__init__(
             name="submit_answer",
             description=(
-                "【调用时机】用户提交答案后，调用此工具完成评分和记录。"
-                "【功能】① 自动调用评估 LLM 对答案打分（无需 Agent 自行评分）② 写入 study_records、SM-2 遗忘曲线、会话历史。"
-                "【填槽】question_id 必填；user_answer 可不传（自动取本轮用户消息）。score/feedback 无需传入，工具自动评分。"
+                "【调用时机】用户提交答案后，由你先根据题目与标准答案自行评估，再调用此工具**记录**你的评估结果。"
+                "【功能】仅将你给出的 score、feedback、strong_points、missed_points、error_points 写入数据库（学习记录、SM-2、会话历史），工具内部不评分、不调用任何 LLM。"
+                "【填槽】question_id、user_answer、score、feedback 必填；strong_points、missed_points、error_points 选填（数组）。"
+                "【返回】记录成功：score、feedback、standard_answer、sm2（含下次复习时间）、message_id；记录失败：返回失败原因（如未传 score、题目未找到、user_answer 为空等）。"
             ),
         )
 
@@ -572,6 +654,11 @@ class SubmitAnswerTool(Tool):
         return [
             ToolParameter("question_id", "string", "题目ID（q_id），必填", required=True),
             ToolParameter("user_answer", "string", "用户作答内容，可不传（系统自动取本轮用户消息）", required=False),
+            ToolParameter("score", "number", "你给出的分数，取值 0/0.5/1.0/.../5.0，必填", required=True),
+            ToolParameter("feedback", "string", "你对作答的总体点评，必填", required=True),
+            ToolParameter("strong_points", "array", "答对的要点列表，如 [\"要点1\", \"要点2\"]", required=False),
+            ToolParameter("missed_points", "array", "遗漏的要点列表", required=False),
+            ToolParameter("error_points", "array", "混淆/错误列表，每项为 {wrong:\"错误表述\", correct:\"正确表述\"}", required=False),
         ]
 
     def run(self, parameters):
@@ -585,7 +672,47 @@ class SubmitAnswerTool(Tool):
         if not question_id or not user_answer:
             return ToolResponse.error(code="INVALID_PARAM", message="question_id 和 user_answer 不能为空")
 
-        # ── 填槽：自动从题库获取题目文本和标准答案 ──────────────────────
+        # 从 Agent 传入的评估结果取值（Agent 自行评估，工具只记录）
+        score_raw = parameters.get("score")
+        if score_raw is None:
+            return ToolResponse.error(code="INVALID_PARAM", message="请先完成评估并传入 score（0～5，支持 0.5 档位）")
+        try:
+            score_val = float(score_raw)
+        except (TypeError, ValueError):
+            return ToolResponse.error(code="INVALID_PARAM", message="score 必须为数字（0～5）")
+        score_display = max(0.0, min(5.0, round(score_val * 2) / 2))
+        score = score_display
+
+        feedback = (parameters.get("feedback") or "").strip()
+        if not feedback:
+            return ToolResponse.error(code="INVALID_PARAM", message="请传入 feedback（你对作答的点评）")
+
+        def _norm_list(v, default=None):
+            if v is None:
+                return default or []
+            if isinstance(v, list):
+                return v
+            if isinstance(v, str):
+                try:
+                    return json.loads(v) if v.strip() else []
+                except Exception:
+                    return [v] if v.strip() else []
+            return []
+
+        strong_points: List[str] = _norm_list(parameters.get("strong_points"), [])
+        missed_points: List[str] = _norm_list(parameters.get("missed_points"), [])
+        error_points_raw = _norm_list(parameters.get("error_points"), [])
+        error_points: List[dict] = []
+        for ep in error_points_raw:
+            if isinstance(ep, dict):
+                error_points.append(ep)
+            elif isinstance(ep, str):
+                try:
+                    error_points.append(json.loads(ep))
+                except Exception:
+                    error_points.append({"wrong": ep, "correct": ""})
+
+        # ── 从题库获取题目信息（仅用于校验与返回 standard_answer）──────────────────────
         question_text = ""
         reference_answer = ""
         question_tags: List[str] = []
@@ -617,19 +744,13 @@ class SubmitAnswerTool(Tool):
                 message="user_answer 与题目相同或为题目片段，用户尚未作答。"
             )
 
-        # 评估逻辑已移除：提交作答只记录，不调用 LLM 评分
-        score_display = 0.0
-        score = 0
-        feedback = "已记录作答。"
-        missed_points: List[str] = []
-        error_points: List[dict] = []
-        merged_tags = list(question_tags)
-
+        logger.info("📝 [submit_answer] 记录 q=%s score=%s（由 Agent 评估）", question_id, score_display)
+        merged_tags = list(dict.fromkeys(question_tags))
         eval_details = {
             "shortcomings": [],
             "error_points": error_points,
             "missed_points": missed_points,
-            "strong_points": [],
+            "strong_points": strong_points,
         }
 
         try:
@@ -666,15 +787,56 @@ class SubmitAnswerTool(Tool):
                 except Exception as ex:
                     logger.debug("Neo4j 同步复习时间失败（不影响主流程）: %s", ex)
 
-            # ⚠️ 修复：不再自动写入 note，而是返回 missed_points/error_points
-            # 让 Agent 根据返回结果主动调用 RecordWeaknessTool 或 ManageNoteTool 来记录
-            # 这样职责清晰：submit_answer 只负责评分，note 记录由 Agent 决策
+            # ✅ 直接内联记录薄弱点（不依赖 Agent 再调 record_weakness）
+            # 原因：Agent 在高负载/步数限制下可能跳过 record_weakness 调用
             note_count_log = len(missed_points) + len(error_points)
             if note_count_log:
                 logger.info(
-                    "[submit_answer] 返回 %d 条遗漏/混淆点，由 Agent 主动调用 RecordWeaknessTool 记录",
+                    "[submit_answer] 内联记录 %d 条遗漏/混淆点到 episodic_log + user_notes",
                     note_count_log,
                 )
+                for m in missed_points:
+                    if not (m and str(m).strip()):
+                        continue
+                    content = f"遗漏点：{m}"
+                    if merged_tags:
+                        content += f" | 标签：{', '.join(str(t) for t in merged_tags[:5])}"
+                    try:
+                        sqlite_service.add_episodic_log(
+                            user_id=user_id, content=content, importance=0.85,
+                            event_type="user_missed", session_id=session_id or "",
+                            question_id=question_id, score=score_display,
+                        )
+                        sqlite_service.add_note(
+                            user_id=user_id, content=content,
+                            question_id=question_id,
+                            note_type="weakness", tags=["遗漏点"] + [str(t) for t in merged_tags[:3]],
+                        )
+                    except Exception as _ex:
+                        logger.debug("submit_answer 内联记录遗漏点失败: %s", _ex)
+                for ep in error_points:
+                    if not isinstance(ep, dict):
+                        continue
+                    w, c = ep.get("wrong", ""), ep.get("correct", "")
+                    content = (
+                        f"混淆点：用户说的「{w}」应改为「{c}」"
+                        if w and c and w != c else f"混淆点：{w or c}"
+                    )
+                    if merged_tags:
+                        content += f" | 标签：{', '.join(str(t) for t in merged_tags[:5])}"
+                    try:
+                        sqlite_service.add_episodic_log(
+                            user_id=user_id, content=content, importance=0.85,
+                            event_type="user_confusion", session_id=session_id or "",
+                            question_id=question_id, score=score_display,
+                        )
+                        sqlite_service.add_note(
+                            user_id=user_id, content=content,
+                            question_id=question_id,
+                            note_type="confusion", tags=["混淆点"] + [str(t) for t in merged_tags[:3]],
+                        )
+                    except Exception as _ex:
+                        logger.debug("submit_answer 内联记录混淆点失败: %s", _ex)
 
             # 同时更新对话历史，记录评分结果
             if session_id:
@@ -706,7 +868,7 @@ class SubmitAnswerTool(Tool):
                 "message": (
                     f"评分完成：{score_display}/5。"
                     + ("下次复习：" + sm2["next_review_at"] if sm2 else "")
-                    + (f" 检测到 {note_count} 条遗漏/混淆点，请调用 record_weakness 工具记录。" if note_count else "")
+                    + (f" 已自动记录 {note_count} 条遗漏/混淆点。" if note_count else "")
                 ),
             }
             return ToolResponse.success(
@@ -721,9 +883,10 @@ class RecordWeaknessTool(Tool):
         super().__init__(
             name="record_weakness",
             description=(
-                "【调用时机】用户说「我搞混了X和Y」「我漏了Z」「分不清A和B」时。"
-                "【功能】写入 episodic 记忆，学习报告中展示。"
-                "【填槽】confusion_points、missed_points、tags。至少提供其一。"
+                "【调用时机】用户说「我搞混了X和Y」「我漏了Z」「分不清A和B」时；或 submit_answer 返回遗漏/混淆点后由你主动调用记录。"
+                "【功能】将混淆点、遗漏点写入情节记忆与用户笔记，供学习报告/薄弱点页面展示。"
+                "【填槽】confusion_points、missed_points、tags；至少提供 confusion_points 或 missed_points 其一。"
+                "【返回】记录成功：已记录 N 条薄弱点、count；记录失败：返回失败原因（如未提供 confusion_points 或 missed_points）。"
             ),
         )
 
@@ -822,7 +985,8 @@ class ManageNoteTool(Tool):
             description=(
                 "【调用时机】用户说「记一下」「保存笔记」→ create；「查看笔记」→ list；「修改/删除笔记」→ update/delete。"
                 "【功能】笔记增删改查。action=create/list/update/delete。"
-                "【填槽】action 必填；create/update 需 content；update/delete 需 note_id；list 可选 keyword/tags。"
+                "【填槽】action 必填；create 需 content；update/delete 需 note_id；list 可选 keyword/tags/question_id。"
+                "【返回】create：记录成功返回 note_id、message；记录失败返回原因（如缺少 content）。list：返回笔记列表、count。update/delete：记录成功返回 success、message；记录失败或未找到返回原因。"
                 "【严禁】出题、练习、评分场景严禁调用。"
             ),
         )
@@ -930,7 +1094,8 @@ class GetSessionContextTool(Tool):
             name="get_session_context",
             description=(
                 "【调用时机】用户说「做了几道」「会话进度」「今天练了几题」时。"
-                "【功能】返回本次会话已做题数、平均分、已练标签。"
+                "【功能】根据当前 session_id 统计本次会话内的答题记录。"
+                "【返回】本次会话已做题数（total_questions）、平均分（avg_score）、已练标签（tags_practiced）、说明文案；无活跃会话时返回 total=0、空 records。失败时返回原因。"
                 "【严禁】用户说「我想练习这道题」时严禁调用。"
             ),
         )
@@ -981,9 +1146,10 @@ class GetMasteryReportTool(Tool):
             name="get_mastery_report",
             description=(
                 "【调用时机】用户说「复习」「薄弱点」「错题总结」「总结薄弱点」「这周的错题」「今天的遗漏」时。"
-                "【功能】返回历史答题统计、薄弱标签、错题、note 记录的遗漏/混淆点、待复习题、建议。"
-                "【填槽】用户**未指定时间**时（如仅说「总结薄弱知识点」）**不传** date_from、date_to，表示全部；仅当用户明确说「今天」「近三天」等时才填槽。"
-                "【严禁】默认填 today；用户说「我想练习这道题」时严禁调用。"
+                "【功能】汇总历史答题统计、按掌握度分档的标签、薄弱题样例、用户记录的遗漏/混淆点、遗忘曲线待复习题、文字建议。"
+                "【填槽】用户未指定时间时不传 date_from/date_to（表示全部）；用户明确说「今天」「近三天」「近7天」等时填对应日期。"
+                "【返回】总练题数、整体正确率、各档掌握度（mastery_by_level）、薄弱标签、薄弱题样例、薄弱点笔记、待复习题列表、advice 文案；失败时返回原因。"
+                "【严禁】用户说「我想练习这道题」时严禁调用。"
             ),
         )
 
@@ -1098,14 +1264,15 @@ class GetMasteryReportTool(Tool):
             return ToolResponse.error(code="EXECUTION_ERROR", message=f"get_mastery_report failed: {e}")
 
 class GetKnowledgeRecommendationTool(Tool):
-    """查库+RAG：延伸知识点、相关题目、学习资源。"""
+    """查库+图库：延伸知识点、相关题目、学习资源。"""
     def __init__(self):
         super().__init__(
             name="get_knowledge_recommendation",
             description=(
                 "【调用时机】用户说「延伸一下」「拓展考点」「还有哪些相关」「推荐学习资料」时。"
-                "【功能】GraphRAG 相关概念 + 对应题目 + 学习资源。"
-                "【填槽】topic、question_id（当前题可延伸）。"
+                "【功能】根据 topic 或当前 question_id 从知识图谱取相关概念、延伸题目、学习资源及近期错题。"
+                "【填槽】topic（知识点名）、question_id（当前题 ID 可选）、limit_concepts、limit_questions。"
+                "【返回】related_concepts（相关知识点）、extension_questions（延伸题列表）、resources（学习资源）、recent_mistakes（近期错题）；失败时返回原因。"
                 "【严禁】用户说「我想练习这道题」时严禁调用。"
             ),
         )
@@ -1241,8 +1408,9 @@ class AnalyzeResumeTool(Tool):
             name="analyze_resume",
             description=(
                 "【调用时机】用户粘贴简历或说「分析我的简历」时，你解析后调用此工具记录。"
-                "【功能】更新用户画像（技术栈、目标岗位、经验级别等）。"
+                "【功能】将解析出的技术栈、目标岗位、经验级别等写入用户画像（user_profiles），不调用外部 LLM。"
                 "【填槽】resume_text、tech_stack、target_position、experience_level 必填；target_company、preferred_topics 可选。"
+                "【返回】记录成功：message（简历分析完成，用户画像已更新）、tech_stack、target_position、experience_level 等摘要；记录失败：返回失败原因（如 resume_text 为空）。"
                 "【严禁】出题、练习、评分场景严禁调用。"
             ),
         )
@@ -1371,7 +1539,6 @@ class KnowledgeRecommender:
 def get_interviewer_tools() -> list:
     """返回 Interviewer Agent 所有工具实例列表。"""
     return [
-        RecognizeIntentTool(),
         GetSessionContextTool(),
         GetRecommendedQuestionTool(),
         FindSimilarQuestionsTool(),

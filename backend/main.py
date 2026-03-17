@@ -569,8 +569,11 @@ def get_chat_history(user_id: str):
     """获取用户最近一次对话历史，用于前端打开时自动加载"""
     from datetime import datetime
     import time
-    
-    session = sqlite_service.get_latest_session_for_user(user_id)
+
+    fixed_session_id = "sess_" + user_id
+    session = sqlite_service.get_session(fixed_session_id)
+    if not session or session.get("user_id") != user_id:
+        session = sqlite_service.get_latest_session_for_user(user_id)
     if not session:
         return {"session_id": None, "messages": []}
     history = session.get("conversation_history") or []
@@ -606,6 +609,15 @@ def get_chat_history(user_id: str):
             messages.append(msg)
     
     return {"session_id": session["session_id"], "messages": messages}
+
+
+@app.post("/api/user/{user_id}/chat/clear")
+def clear_chat_session(user_id: str):
+    """清空用户 sess_{user_id} 的 conversation_history"""
+    fixed_session_id = "sess_" + user_id
+    sqlite_service.clear_conversation_history(fixed_session_id, user_id)
+    return {"ok": True, "session_id": fixed_session_id}
+
 
 @app.get("/")
 
@@ -1012,7 +1024,7 @@ async def api_chat(req: ChatRequest):
 
                 f"[Chat →] user={_user_id} | reply({len(reply)}chars): "
 
-                f"{reply[:300]}{'...' if len(reply) > 300 else ''}"
+                f"{reply}"
 
             )
 
@@ -1148,7 +1160,7 @@ async def api_submit_answer_stream(req: SubmitAnswerRequest):
     """
     答题提交接口（SSE 流式，Agent 先评分）：
     将用户答案构造成对话消息，通过 chat_stream 让 Agent 完整执行：
-      recognize_intent → get_question_detail → Agent自行评分 → submit_answer记录 → record_weakness记录薄弱点
+      submit_answer记录（工具自动评分）→ record_weakness记录薄弱点
     前端监听 SSE 事件流，与 /api/chat/stream 完全相同的事件格式。
     """
     from backend.config.config import settings as _settings
@@ -1158,7 +1170,7 @@ async def api_submit_answer_stream(req: SubmitAnswerRequest):
     _question_text = (req.question_text or "").strip()
     _user_answer = (req.user_answer or "").strip()
 
-    # 构造包含题目 ID 标记的消息，Agent 的 recognize_intent 会识别为 submit_answer 意图
+    # 构造包含题目 ID 标记的消息，Agent 会识别为 submit_answer 意图
     # 格式：「我的答案：{user_answer}\n\n【q_id:{question_id}】」
     # 这样 Agent 能提取 question_id，并把本轮消息作为 user_answer
     if _question_id:
@@ -2196,7 +2208,8 @@ def _spawn_batch_extract_subprocess(cmd: list, log_path: Path, total_count: int)
             bar_len = 20
             filled = int(bar_len * completed / total_count) if total_count else 0
             bar = "█" * filled + "░" * (bar_len - filled)
-            sys.stdout.write(f"\r[批量提取] {bar} {completed}/{total_count} ({pct}%)\n")
+            ts = now_beijing_str("%Y-%m-%d %H:%M:%S")
+            sys.stdout.write(f"\r{ts} | INFO    | [批量提取] {bar} {completed}/{total_count} ({pct}%)\n")
             sys.stdout.flush()
 
     def read_and_tee(pipe):

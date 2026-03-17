@@ -242,40 +242,13 @@ watch(visible, (v) => {
 const submit = async () => {
   if (!myAnswer.value.trim()) { ElMessage.warning('请先输入你的答案'); return }
   if (!props.question?.q_id) { ElMessage.warning('题目 ID 缺失，无法记录'); return }
-  
+
+  // 仅通过事件把题目+作答交给上层视图，由 ChatView 统一走 /api/chat/stream →
+  // InterviewerAgent + submit_answer 工具完成评分，避免在这里额外创建临时 session_id
   submitting.value = true
-  evalResult.value = null
-  
   try {
     const userAnswer = myAnswer.value.trim()
-    
-    // 调用后端 submit_answer 接口
-    const { api } = await import('../api.js')
-    const result = await api.submitAnswer({
-      user_id: props.userId,
-      session_id: props.sessionId || `sess_${Date.now()}`,
-      question_id: props.question.q_id,
-      question_text: props.question.question_text,
-      user_answer: userAnswer,
-      question_tags: props.question.topic_tags || []
-    })
-    
-    // 显示评估结果
-    evalResult.value = result
-    ElMessage.success(`已提交！得分：${result.score}/5`)
-    
-    // 刷新本弹窗内的作答记录
-    loadPastRecords()
-    // 触发完成事件（用于刷新列表等）
-    emit('submit-complete', { 
-      question: props.question, 
-      userAnswer,
-      result 
-    })
-    
-  } catch (error) {
-    console.error('提交答案失败:', error)
-    ElMessage.error(error.message || '提交失败，请重试')
+    emit('submit-complete', { question: props.question, userAnswer, result: null })
   } finally {
     submitting.value = false
   }
@@ -305,26 +278,20 @@ const handleNextClick = () => {
   emitNext()
 }
 
+const sendToChatPending = ref(false)
 const handleSendToChat = () => {
-  console.log('🔵 QuestionDialog: 触发 send-to-chat 事件')
-  console.log('🔵 question:', props.question)
-  
   // 防止重复点击
-  if (handleSendToChat._pending) {
-    console.log('🔵 防止重复点击，忽略本次调用')
-    return
-  }
-  handleSendToChat._pending = true
-  
+  if (sendToChatPending.value) return
+  sendToChatPending.value = true
+
   // 先关闭当前对话框
   visible.value = false
-  
+
   // 延迟触发事件，确保对话框已关闭
   setTimeout(() => {
     emit('send-to-chat', { question: props.question })
-    // 500ms 后重置标志
     setTimeout(() => {
-      handleSendToChat._pending = false
+      sendToChatPending.value = false
     }, 500)
   }, 100)
 }
