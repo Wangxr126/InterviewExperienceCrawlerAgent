@@ -275,6 +275,11 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
         # Agent 成功返回，但 result 是拒绝文本时降级为直接 LLM 调用
         if result and not is_unrelated:
             _stripped = result.strip()
+            # 特殊处理：__STAGE2_PENDING__ 表示已入队异步处理，不应降级
+            if _stripped == "__STAGE2_PENDING__":
+                logger.info("[MinerAgent] 返回 __STAGE2_PENDING__，已入队异步 Stage 2 处理")
+                return result, ocr_called, is_unrelated
+            
             # 检测拒绝文本
             if any(re.search(p, _stripped, re.IGNORECASE) for p in _REFUSE_QUICK):
                 logger.warning(f"[MinerAgent] Agent 返回拒绝文本，降级为直接 LLM 调用: {_stripped[:60]}")

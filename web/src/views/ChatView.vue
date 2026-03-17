@@ -1,4 +1,4 @@
-<template>
+﻿<template>
   <div class="chat-wrap">
     <div class="chat-header">
       <span class="chat-title">💬 练习对话</span>
@@ -429,17 +429,24 @@ function countToolsInStep(step) {
 }
 
 /**
- * 计算步骤的显示序号：跳过 pending 步，只给已完成的步骤编号
- * 这样 pending 步不占用编号，避免序号跳空
+ * 计算步骤的显示序号：直接使用后端传来的 __step 值
+ * 后端已经保证 __step 是正确的步号，无需重新计算
+ * ✅ 修复：后端推送 step=1 时，前端直接显示"第 1 步"，不再错位
  */
 function computeStepDisplay(thinking, idx) {
+  const step = thinking[idx]
+  if (!step) return idx + 1
+  // 优先使用后端的 __step 值（已验证正确）
+  if (typeof step.__step === 'number' && step.__step > 0) {
+    return step.__step
+  }
+  // 降级：按数组位置计算（兼容旧数据）
   let num = 0
   for (let i = 0; i <= idx; i++) {
     if (thinking[i].__step !== 'pending') num++
   }
   return num
 }
-
 /**
  * 计算 badge 中显示的步数：
  * - 已完成步（__step !== 'pending'）直接计数
@@ -747,12 +754,16 @@ const loadHistory = async () => {
           }
         })
       }
-      const apiMsgs = d.messages.map(m => ({
-        ...m,
-        thinking: normalizeThinkingFromDb(m.thinking),
-        thinkingOpen: (m.thinking?.length ?? 0) > 0,
-        timestamp: m.timestamp || new Date().toISOString(),
-      }))
+      const apiMsgs = d.messages.map(m => {
+        const normalizedThinking = normalizeThinkingFromDb(m.thinking)
+        return {
+          ...m,
+          thinking: normalizedThinking,
+          // 🔧 修复：有推理步骤时自动展开，刷新后能立即看到推理过程
+          thinkingOpen: (normalizedThinking?.length ?? 0) > 0,
+          timestamp: m.timestamp || new Date().toISOString(),
+        }
+      })
       const lastStore = chatStore.messages[chatStore.messages.length - 1]
       const lastApi = apiMsgs[apiMsgs.length - 1]
       const storeHasNewer = chatStore.userId === props.userId && lastStore?.role === 'assistant' &&
@@ -968,7 +979,8 @@ const send = async () => {
       } else if (evType === 'tool' && !payload.data) {
         const phase = data.phase || 'start'
         const stepNo = data.step ?? 1
-        const toolName = data.tool_name ?? ''
+        // 清理后端写入的 🔧 前缀
+        const toolName = (data.tool_name ?? '').replace(/^🔧\s*/u, '').trim()
         if (!toolName || toolName === 'Thought' || toolName === 'Finish') {
           chatStore.syncMessages(messages.value)
           return
@@ -1099,13 +1111,15 @@ const send = async () => {
       } else if (evType === 'step_start') {
         currentStep = {}
       } else if (evType === 'thinking') {
-        const content = data.content ?? ''
+        // 兼容两种格式：自定义协议用 chunk，hello_agents 官方用 content
+        const content = data.chunk ?? data.content ?? ''
         if (content) {
           currentStep.thought = normalizeThoughtForStep(content)
           currentStep.isReasoning = true
         }
       } else if (evType === 'tool_call_start') {
-        const toolName = data.tool_name ?? ''
+        // 清理后端写入的 🔧 前缀，前端模板自带图标避免双重显示
+        const toolName = (data.tool_name ?? '').replace(/^🔧\s*/u, '').trim()
         const toolArgs = data.tool_args ?? {}
         if (toolName && toolName !== 'Thought' && toolName !== 'Finish') {
           // 如果当前 pending 步已经有工具且最新已知步号更大，说明进入新步骤。
@@ -1146,7 +1160,8 @@ const send = async () => {
           currentStep.pendingArgs = Object.keys(toolArgs).length ? toolArgs : null
         }
       } else if (evType === 'tool_call_finish') {
-        const toolName = data.tool_name ?? ''
+        // 清理后端写入的 🔧 前缀，前端模板自带图标避免双重显示
+        const toolName = (data.tool_name ?? '').replace(/^🔧\s*/u, '').trim()
         const result = data.result ?? ''
         const toolArgs = data.tool_args ?? {}
 
@@ -1183,6 +1198,9 @@ const send = async () => {
           }
         } else {
           const obs = String(result)
+          // ✅ 从 SSE 事件中读取工具的 step 信息（后端已在 _execute_tools_async_stream 中设置）
+          const toolStep = data.step ?? null
+          
           // 从 pendingToolsMap 按 FIFO 顺序取出最早匹配此工具名的占位条目
           // key 格式为 "toolName__callIndex"，按插入顺序遍历 Map 取第一个匹配的
           let pendingEntry = null
@@ -1202,6 +1220,11 @@ const send = async () => {
             pendingEntry.observation = obs
             pendingEntry.observationIsJson = isObsJson(obs)
             pendingEntry._pending = false
+            // ✅ 记录工具所属的步号，供后续步骤分配使用
+            if (toolStep !== null) {
+              pendingEntry.step = toolStep
+              _lastKnownStepNo = Math.max(_lastKnownStepNo, toolStep)
+            }
             if (Object.keys(toolArgs || {}).length && !Object.keys(pendingEntry.args || {}).length) {
               pendingEntry.args = toolArgs
             }
@@ -1600,7 +1623,7 @@ onUnmounted(() => {
   font-size: 11px; font-weight: 600; color: #64748b; margin-bottom: 6px;
 }
 .obs-answer-body {
-  max-height: 320px; overflow-y: auto; padding: 8px 0;
+  max-height: none; overflow-y: visible; padding: 8px 0;
   color: #334155; white-space: pre-wrap; word-break: break-word;
 }
 .obs-answer-body br { display: block; content: ''; margin-bottom: 0.25em; }
@@ -1624,7 +1647,7 @@ onUnmounted(() => {
 }
 .obs-kv-val pre.obs-kv-json {
   margin: 0; padding: 8px; background: #f1f5f9; border-radius: 4px;
-  font-size: 11px; overflow-x: auto; max-height: 200px; overflow-y: auto;
+  font-size: 11px; overflow-x: auto; max-height: none; overflow-y: visible;
 }
 .obs-expand-btn {
   margin-top: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer;
@@ -1638,7 +1661,7 @@ onUnmounted(() => {
 }
 .step-obs-json {
   margin: 0; padding: 12px 14px; background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
-  font-size: 12px; max-height: 400px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+  font-size: 12px; max-height: none; overflow: visible; white-space: pre-wrap; word-break: break-all;
   color: #1e293b; font-family: 'Fira Code', 'Consolas', 'Monaco', monospace;
   line-height: 1.5;
 }
@@ -2107,3 +2130,4 @@ onUnmounted(() => {
   border-top: 1px solid rgba(255, 255, 255, 0.2);
 }
 </style>
+

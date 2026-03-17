@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import logging
 from typing import List, Dict, Any, Union, AsyncIterator, Iterator
@@ -27,7 +28,36 @@ class DeepSeekThinkingOpenAIAdapter(OpenAIAdapter):
             - 若 reasoning_content 为 None，也改成 ""。
         * 不修改原始列表，使用浅拷贝 + 针对需要修改的项做 deepcopy。
     - 仅在 DeepSeek / reasoning 模型下启用，其他模型保持原逻辑。
+
+    ⚠️ 并发安全说明：
+    - 原先使用 threading.local() 保存 last_reasoning，但 invoke_with_tools 在线程池执行，
+      而 chat_stream 在异步主线程读取，两者线程不同，导致 last_reasoning 永远读不到值。
+    - 改为普通实例属性 _last_reasoning，用 asyncio.Lock 保护异步并发，
+      同步方法（invoke_with_tools）直接写属性即可（GIL 保护）。
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 普通实例属性，跨线程可见（GIL 保护写操作）
+        self._last_reasoning: str = ""
+        self._reasoning_lock = asyncio.Lock() if self._get_running_loop() else None
+
+    @staticmethod
+    def _get_running_loop():
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+
+    @property
+    def last_reasoning(self) -> str:
+        """读取最近一次推理内容（跨线程可见）"""
+        return self._last_reasoning
+
+    @last_reasoning.setter
+    def last_reasoning(self, value: str):
+        """写入推理内容（跨线程可见，GIL 保护）"""
+        self._last_reasoning = value
 
     def _is_thinking_model(self, model_name: str) -> bool:
         """
@@ -73,7 +103,7 @@ class DeepSeekThinkingOpenAIAdapter(OpenAIAdapter):
     ) -> Any:
         """
         在原 OpenAIAdapter.invoke_with_tools 基础上，对 thinking 模型自动规范化 messages。
-        同时将每步产生的 reasoning_content 累积到 self.last_reasoning，
+        同时将每步产生的 reasoning_content 写入 self._last_reasoning（普通属性，跨线程可见），
         供 chat_stream 在 step_finish/agent_finish 时读取并推送 thinking SSE。
         """
         if not self._client:
@@ -96,18 +126,20 @@ class DeepSeekThinkingOpenAIAdapter(OpenAIAdapter):
                 msg = response.choices[0].message
                 reasoning = getattr(msg, "reasoning_content", None) or ""
                 if reasoning:
-                    # 保存到 last_reasoning，供 chat_stream 流程读取推送 SSE
-                    self.last_reasoning = reasoning
-                    # 同步一份到 stdout，供 ThinkingCapture 捕获并展示为「思考」步骤。
+                    # ✅ 写入普通实例属性，跨线程可见
+                    self._last_reasoning = reasoning
+                    logger.info(
+                        f"[DeepSeekThinkingOpenAIAdapter] invoke_with_tools "
+                        f"收集 reasoning ({len(reasoning)}字)"
+                    )
                     try:
                         print(f"🤔 思考: {reasoning}")
                     except Exception:
-                        # stdout 写入失败不影响主流程
                         pass
-                # ⚠️ 不再在 reasoning 为空时清空 last_reasoning：
+                # ⚠️ reasoning 为空时不清空 _last_reasoning：
                 # astream_invoke 流式阶段已收集到 reasoning，invoke_with_tools
-                # 紧随其后执行时 tool_calls 响应可能不含 reasoning_content（为空），
-                # 若此处清空会导致流式收集的推理内容丢失，chat_stream 无法推送 thinking SSE。
+                # 紧随其后执行时 tool_calls 响应可能不含 reasoning_content，
+                # 若此处清空会导致流式收集的推理内容丢失。
             return response
         except Exception as e:
             raise HelloAgentsException(f"OpenAI Function Calling调用失败: {e}")
@@ -132,13 +164,15 @@ class DeepSeekThinkingOpenAIAdapter(OpenAIAdapter):
     async def astream_invoke(self, messages: List[Dict], **kwargs: Any) -> AsyncIterator[str]:
         """
         异步流式调用：规范化 messages（防止 400），收集 reasoning_content 到
-        self.last_reasoning，供 chat_stream 在流结束后一次性读取推送给前端。
+        self._last_reasoning，供 chat_stream 在流结束后一次性读取推送给前端。
         普通文本 chunk 直接 yield，行为与父类完全一致。
 
-        特殊处理（deepseek-reasoner 等 thinking 模型）：
-        当消息历史中已有 tool_calls 时，跳过流式预调——框架的 arun_stream 在流式调用
-        之后还会再次调用 invoke_with_tools 获取真正的工具调用结构；如果此处不跳过，
-        模型在没有 tools schema 的流式请求中会退化输出原生 DSML 格式文本，污染输出。
+        ⚠️ 重要修改（v3）：
+        - 移除了"检测到 tool_calls 就跳过流式"的逻辑
+        - 原因：第 3 步（最终评分）的 reasoning_content 必须被收集
+        - 原来的问题：第 2 步工具调用后，历史有 tool_calls，第 3 步直接 return，
+          导致最终评分的 reasoning_content 永远丢失
+        - 新策略：始终执行流式调用，根据 kwargs 是否含 tools 决定是否传入工具
         """
         send_messages = messages
         if self._is_thinking_model(self.model):
@@ -149,27 +183,38 @@ class DeepSeekThinkingOpenAIAdapter(OpenAIAdapter):
                 yield chunk
             return
 
-        # thinking 模型：若历史已含 tool_calls，跳过流式预调，避免输出 DSML 文本
-        if self._messages_have_tool_calls(send_messages):
-            logger.debug(
-                "[DeepSeekThinkingOpenAIAdapter] 检测到历史 tool_calls，"
-                "跳过流式预调，由后续 invoke_with_tools 处理工具调用"
-            )
-            self.last_reasoning = ""
-            return
-
         if not self._async_client:
             self._async_client = self.create_async_client()
 
-        self.last_reasoning = ""  # 每次调用前重置
+        self._last_reasoning = ""  # 每次调用前重置（异步主线程安全）
 
         try:
-            response = await self._async_client.chat.completions.create(
-                model=self.model,
-                messages=send_messages,
-                stream=True,
+            # 提取 tools 和 tool_choice（不一定传入，避免 DSML 格式污染）
+            tools = kwargs.pop('tools', None)
+            tool_choice = kwargs.pop('tool_choice', 'auto')
+
+            request_params: Dict[str, Any] = {
+                "model": self.model,
+                "messages": send_messages,
+                "stream": True,
                 **kwargs,
-            )
+            }
+
+            # 只有当 kwargs 中明确有 tools 时，才传入工具参数
+            if tools:
+                request_params["tools"] = tools
+                request_params["tool_choice"] = tool_choice
+                logger.debug(
+                    "[DeepSeekThinkingOpenAIAdapter] astream_invoke 含 tools，"
+                    "传入工具参数"
+                )
+            else:
+                logger.debug(
+                    "[DeepSeekThinkingOpenAIAdapter] astream_invoke 不含 tools，"
+                    "纯推理模式，收集 reasoning_content"
+                )
+
+            response = await self._async_client.chat.completions.create(**request_params)
 
             async for chunk in response:
                 if not chunk.choices:
@@ -179,12 +224,17 @@ class DeepSeekThinkingOpenAIAdapter(OpenAIAdapter):
                 # 收集 reasoning_content（不 yield，避免污染 full_response）
                 reasoning_chunk = getattr(delta, "reasoning_content", None)
                 if reasoning_chunk:
-                    self.last_reasoning += reasoning_chunk
+                    self._last_reasoning += reasoning_chunk
 
                 # 普通文本 chunk 正常 yield
                 if delta.content:
                     yield delta.content
 
+            if self._last_reasoning:
+                logger.info(
+                    f"[DeepSeekThinkingOpenAIAdapter] astream_invoke 完成，"
+                    f"收集 reasoning ({len(self._last_reasoning)}字)"
+                )
+
         except Exception as e:
             raise HelloAgentsException(f"DeepSeek 异步流式调用失败: {e}")
-

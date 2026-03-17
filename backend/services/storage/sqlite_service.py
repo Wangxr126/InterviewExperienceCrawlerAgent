@@ -1058,6 +1058,13 @@ class SqliteService:
         duration_ms: Optional[int] = None,
     ):
         """将最后一条 assistant 消息的 content 替换为完整内容，并可选保存推理过程、耗时"""
+        # ⚠️ 防止并发写入覆盖：只在 full_content 非空时才更新
+        # 原因：快速刷新时两个 chat_stream 可能同时调用此方法，
+        # 后调用的空内容会覆盖先调用的完整内容
+        if not full_content or not full_content.strip():
+            logger.debug(f"[patch_last_assistant_content] 跳过空内容更新 session_id={session_id}")
+            return
+        
         with self._get_conn() as conn:
             row = conn.execute(
                 "SELECT conversation_history FROM interview_sessions WHERE session_id = ?",
@@ -1068,14 +1075,25 @@ class SqliteService:
             history = json.loads(row["conversation_history"] or "[]")
             for i in range(len(history) - 1, -1, -1):
                 if history[i].get("role") == "assistant":
-                    history[i]["content"] = full_content
-                    ts = now_beijing().isoformat()
-                    history[i]["ts"] = ts
-                    history[i]["timestamp"] = ts  # 双写，确保前端能读取
-                    if thinking is not None and len(thinking) > 0:
-                        history[i]["thinking"] = thinking
-                    if duration_ms is not None:
-                        history[i]["duration_ms"] = duration_ms
+                    # ⚠️ 只在当前内容为占位符或为空时才更新，避免覆盖已有的完整内容
+                    current_content = history[i].get("content", "").strip()
+                    if current_content in ("（生成中...）", "", "（无文本回答，仅有推理过程）"):
+                        history[i]["content"] = full_content
+                        ts = now_beijing().isoformat()
+                        history[i]["ts"] = ts
+                        history[i]["timestamp"] = ts  # 双写，确保前端能读取
+                        if thinking is not None and len(thinking) > 0:
+                            history[i]["thinking"] = thinking
+                        if duration_ms is not None:
+                            history[i]["duration_ms"] = duration_ms
+                        logger.info(f"[patch_last_assistant_content] 更新 session_id={session_id} content_len={len(full_content)} thinking_steps={len(thinking) if thinking else 0}")
+                    else:
+                        # 已有完整内容，只补充 thinking/duration_ms
+                        if thinking is not None and len(thinking) > 0 and not history[i].get("thinking"):
+                            history[i]["thinking"] = thinking
+                        if duration_ms is not None and history[i].get("duration_ms") is None:
+                            history[i]["duration_ms"] = duration_ms
+                        logger.debug(f"[patch_last_assistant_content] 保留已有内容，仅补充元数据 session_id={session_id}")
                     break
             conn.execute(
                 "UPDATE interview_sessions SET conversation_history = ? WHERE session_id = ?",

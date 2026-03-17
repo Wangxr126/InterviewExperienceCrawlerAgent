@@ -1008,7 +1008,10 @@ class InterviewerAgent(ReActAgent):
                         if dl:
                             d = json.loads(dl)
                             if 'step' not in d:
-                                d['step'] = stream_stats.get("steps", 1)
+                                # ✅ 优先使用 event.data 中的 step（已在 _execute_tools_async_stream 中设置）
+                                # 其次使用 stream_stats 中的步号
+                                ev_step = event.data.get('step') or stream_stats.get("steps") or 1
+                                d['step'] = int(ev_step)
                             sse_line = f"event: {et}\ndata: {json.dumps(d, ensure_ascii=False)}\n\n"
                     except Exception:
                         pass
@@ -1019,25 +1022,28 @@ class InterviewerAgent(ReActAgent):
                         if chunk.strip().startswith('[') and '"name"' in chunk and '"parameters"' in chunk:
                             continue
                     if event.type.value in ("tool_call_finish", "step_finish", "agent_finish"):
-                        # tool_call_finish 是 invoke_with_tools 完成后的第一个事件，
-                        # 此时 last_reasoning 已由 DeepSeekThinkingOpenAIAdapter 写入。
-                        # step_finish / agent_finish 也兜底处理，避免遗漏。
                         try:
                             from backend.llm.deepseek_thinking_adapter import DeepSeekThinkingOpenAIAdapter
                             _adapter = getattr(self.llm, '_adapter', None)
                             if isinstance(_adapter, DeepSeekThinkingOpenAIAdapter):
                                 _reasoning = getattr(_adapter, 'last_reasoning', '') or ''
                                 if _reasoning.strip():
-                                    step_no = event.data.get('step') or stream_stats.get('steps') or 1
-                                    yield (
-                                        'event: thinking\n'
-                                        f'data: {json.dumps({"type": "thinking", "step": int(step_no), "chunk": _reasoning}, ensure_ascii=False)}\n\n'
-                                    )
-                                    normalized = _normalize_thought_for_step(_reasoning)
-                                    if not current_step.get('thought'):
-                                        current_step['thought'] = normalized
-                                    logger.info(f'[chat_stream] 推送 reasoning SSE ({len(_reasoning)}字) at {event.type.value}')
-                                    # 消费掉，防止同一步重复推送
+                                    if event.type.value == 'tool_call_finish':
+                                        # 中间工具调用的推理 → 推 thinking SSE
+                                        step_no = event.data.get('step') or stream_stats.get('steps') or 1
+                                        yield (
+                                            'event: thinking\n'
+                                            f'data: {json.dumps({"type": "thinking", "step": int(step_no), "chunk": _reasoning}, ensure_ascii=False)}\n\n'
+                                        )
+                                        normalized = _normalize_thought_for_step(_reasoning)
+                                        if not current_step.get('thought'):
+                                            current_step['thought'] = normalized
+                                        logger.info(f'[chat_stream] tool_call_finish 推送 thinking SSE ({len(_reasoning)}字)')
+                                    else:
+                                        # agent_finish/step_finish：reasoning 是最终答案 → 填入 full_content
+                                        full_content = _reasoning
+                                        logger.info(f'[chat_stream] {event.type.value} reasoning ({len(_reasoning)}字) 作为最终答案')
+                                    # 消费掉，防止重复推送
                                     _adapter.last_reasoning = ''
                         except Exception as _e:
                             logger.debug(f'[chat_stream] 读取 last_reasoning 失败: {_e}')
@@ -1072,22 +1078,15 @@ class InterviewerAgent(ReActAgent):
                                 d['thinking'] = thinking_steps
                             duration_ms_now = int((time.time() - start_time) * 1000)
                             d['duration_ms'] = d.get('duration_ms') or duration_ms_now
-                            # ✅ 兜底：result 为空时，从 full_content 或 thinking_steps 最后一步的 thought 提取
-                            # 原因：DeepSeek 等模型有时把最终答案写在 reasoning_content（thinking）而非 content，
-                            # 导致 agent_finish.result 为空，前端显示空白。
-                            if not d.get('result') and not full_content.strip():
-                                fallback = ''
-                                # 优先取最后一步的 thought（DeepSeek 把答案写在思考里的场景）
-                                if thinking_steps:
-                                    last_thought = thinking_steps[-1].get('thought', '')
-                                    if last_thought and last_thought.strip():
-                                        fallback = last_thought.strip()
-                                if fallback:
-                                    d['result'] = fallback
-                                    full_content = fallback
-                                    logger.info(f'[chat_stream] agent_finish.result 为空，已从 thinking 兜底 ({len(fallback)}字)')
-                            elif not d.get('result') and full_content.strip():
-                                d['result'] = full_content.strip()
+                            # ✅ 修复：result 优先使用 full_content（llm_chunk 累积的最终答案）
+                            # 不从 thinking_steps 提取，避免把推理内容当成最终答案
+                            if not d.get('result'):
+                                if full_content.strip():
+                                    d['result'] = full_content.strip()
+                                else:
+                                    # 仅当 full_content 完全为空时，才用占位符
+                                    d['result'] = "（无文本回答，仅有推理过程）"
+                                    logger.warning(f'[chat_stream] agent_finish.result 为空，使用占位符')
                             sse_line = f"event: {et}\ndata: {json.dumps(d, ensure_ascii=False)}\n\n"
                         except Exception:
                             pass
@@ -1164,21 +1163,20 @@ class InterviewerAgent(ReActAgent):
                             or _pending_tool_args.pop(tool_name, None)
                             or {}
                         )
-                        # 检测步骤切换（兜底，step_start 未触发时）：
-                        # ev_step_no=0 表示 step 字段缺失，不触发步骤切换，所有工具归属当前步。
-                        # ev_step_no 变化时才切换，但要先把 current_step 并入已有对应步（避免并发工具丢失）。
-                        ev_step_no = int(event.data.get("step") or 0)
-                        if ev_step_no == 0:
-                            # step 字段缺失：首次工具调用时初始化为1，后续保持不变
-                            if _current_step_no == 0:
-                                _current_step_no = 1
-                        elif ev_step_no != _current_step_no:
-                            # step 编号变化：提交旧步，开启新步
+                        # ✅ 修复：严格的step编号同步
+                        # 从event.data获取step编号，确保与后端一致
+                        ev_step_no = int(event.data.get("step") or _current_step_no or 1)
+                        
+                        # 检测步骤切换
+                        if ev_step_no != _current_step_no:
+                            # 步编号变化：提交旧步，开启新步
                             if _current_step_no > 0 and (current_step.get("thought") or current_step.get("tools")):
                                 current_step["__step"] = _current_step_no
                                 thinking_steps.append({k: v for k, v in current_step.items() if v})
                             current_step = {"tools": []}
                             _current_step_no = ev_step_no
+                        
+                        target_step_no = _current_step_no
                         if "tools" not in current_step:
                             current_step["tools"] = []
                         current_step["tools"].append({
@@ -1186,6 +1184,7 @@ class InterviewerAgent(ReActAgent):
                             "args": tool_args if isinstance(tool_args, dict) else {},
                             "observation": obs_str,
                             "observationIsJson": _is_obs_json(obs_str),
+                            "step": target_step_no,  # ✅ 显式记录工具所属的步号
                         })
                     # ✅ 不在此处 append thinking_steps！
                     # 推理和工具同属一步，统一在 step_start（新步开始）或 agent_finish 时提交。

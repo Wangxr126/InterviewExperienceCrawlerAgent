@@ -183,7 +183,7 @@ class MinerAgent(ReActAgent):
     @staticmethod
     def _extract_json_if_direct_reply(text: str) -> str:
         """当 LLM 直接回复（未调用 Finish 工具）时，尝试从回复文本中提取 JSON 数组。
-        如果提取到合法 JSON 数组则返回该数组字符串，否则返回原文。
+        如果提取到合法 JSON 数组则返回该数组字符串，否则返回空字符串（触发降级）。
         这是对「LLM 直接输出而非调用工具」行为的兜底处理。
         """
         import json, re
@@ -232,7 +232,8 @@ class MinerAgent(ReActAgent):
                             pass
                         break
                 i += 1
-        return best if best else text
+        # 修复：无法提取有效 JSON 时返回空字符串，触发降级而非返回垃圾文本
+        return best if best else ""
 
     @staticmethod
     def _strip_think_tags(text: str) -> str:
