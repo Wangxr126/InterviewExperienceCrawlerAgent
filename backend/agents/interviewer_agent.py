@@ -25,6 +25,7 @@ from backend.tools.interviewer_tools import get_interviewer_tools, KnowledgeReco
 from backend.agents.prompts.interviewer_prompt import interviewer_prompt
 from backend.llm.deepseek_thinking_adapter import DeepSeekThinkingOpenAIAdapter
 from backend.services.storage.sqlite_service import sqlite_service
+from backend.services.logging.agent_tool_runtime_stats import agent_tool_runtime_stats
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,58 @@ def _fix_json_invalid_escape(s: str) -> str:
 
 
 _knowledge_recommender = KnowledgeRecommender()
+
+
+def _is_obs_json(s: str) -> bool:
+    """判断观察结果是否为 JSON 格式"""
+    if not s or not isinstance(s, str):
+        return False
+    s = s.strip()
+    if not (s.startswith('{') or s.startswith('[')):
+        return False
+    try:
+        import json as _j; _j.loads(s); return True
+    except Exception:
+        return False
+
+
+def _normalize_thinking_steps_for_db(steps: list) -> list:
+    """
+    规范化 thinking_steps 为统一的 DB 存储格式：
+    - 去除工具名的 🔧 前缀
+    - 统一 result/observation 字段
+    - 保留 thought、__step、tools 字段
+    """
+    if not isinstance(steps, list):
+        return []
+    result = []
+    for idx, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        tools = []
+        for t in (step.get('tools') or []):
+            if not isinstance(t, dict):
+                continue
+            name = t.get('name', '') or ''
+            if isinstance(name, str):
+                name = name.strip()
+                while name.startswith('🔧'):
+                    name = name[len('🔧'):].strip()
+            obs = t.get('result') or t.get('observation') or ''
+            obs_str = str(obs) if obs else ''
+            tools.append({
+                'name': name,
+                'args': t.get('args') or {},
+                'result': obs_str,
+                'observation': obs_str,
+                'observationIsJson': _is_obs_json(obs_str),
+            })
+        result.append({
+            '__step': step.get('__step', idx + 1),
+            'thought': step.get('thought', ''),
+            'tools': tools,
+        })
+    return result
 
 
 def _evaluate_answer_structured(question_text: str,
@@ -179,7 +232,7 @@ def _generate_explanation(question_text: str,
 
     parts = [
         f"题目：{question_text[:200]}",
-        f"得分：{score}/5",
+        f"得分：{score:.1f}/5",
         f"答对的点：{', '.join(strong) if strong else '无'}",
     ]
     if score < 5 and shortcomings:
@@ -220,7 +273,7 @@ def _generate_explanation(question_text: str,
         logger.warning(f"_generate_explanation 异常: {e}")
 
     # 降级
-    lines = [f"✅ 你的得分：{score}/5\n"]
+    lines = [f"✅ 你的得分：{score:.1f}/5\n"]
     if score < 5 and shortcomings:
         lines.append("**不足：** " + "、".join(shortcomings))
     if error_points:
@@ -431,6 +484,7 @@ class InterviewerAgent(ReActAgent):
         import asyncio as _asyncio
         from hello_agents.core.streaming import StreamEvent, StreamEventType
         from hello_agents.core.lifecycle import EventType
+        from backend.agents.context import get_current_user_id
 
         results = []
 
@@ -441,10 +495,18 @@ class InterviewerAgent(ReActAgent):
         for tc in builtin_calls:
             tool_name = tc.function.name
             tool_call_id = tc.id
+            _t0 = time.time()
             try:
                 arguments = json.loads(tc.function.arguments)
             except json.JSONDecodeError as e:
                 results.append((tool_name, tool_call_id, {"content": f"错误：参数格式不正确 - {str(e)}", "args": {}}))
+                agent_tool_runtime_stats.record(
+                    agent_name=self.name,
+                    tool_name=tool_name,
+                    success=False,
+                    execution_time_ms=(time.time() - _t0) * 1000.0,
+                    user_id=get_current_user_id(),
+                )
                 continue
 
             await self._emit_event(
@@ -465,6 +527,13 @@ class InterviewerAgent(ReActAgent):
                 result_content = f"未知的内置工具: {tool_name}"
 
             results.append((tool_name, tool_call_id, {"content": result_content, "args": arguments}))
+            agent_tool_runtime_stats.record(
+                agent_name=self.name,
+                tool_name=tool_name,
+                success=not str(result_content).startswith("❌"),
+                execution_time_ms=(time.time() - _t0) * 1000.0,
+                user_id=get_current_user_id(),
+            )
 
         # 2. 并行执行用户工具
         if user_calls:
@@ -475,9 +544,17 @@ class InterviewerAgent(ReActAgent):
                 async with semaphore:
                     tool_name = tc.function.name
                     tool_call_id = tc.id
+                    _t0 = time.time()
                     try:
                         arguments = json.loads(tc.function.arguments)
                     except json.JSONDecodeError as e:
+                        agent_tool_runtime_stats.record(
+                            agent_name=self.name,
+                            tool_name=tool_name,
+                            success=False,
+                            execution_time_ms=(time.time() - _t0) * 1000.0,
+                            user_id=get_current_user_id(),
+                        )
                         return (tool_name, tool_call_id, {"content": f"错误：参数格式不正确 - {str(e)}", "args": {}})
 
                     await self._emit_event(
@@ -514,6 +591,14 @@ class InterviewerAgent(ReActAgent):
                     else:
                         print(f"👀 观察: {result_content}")
 
+                    agent_tool_runtime_stats.record(
+                        agent_name=self.name,
+                        tool_name=tool_name,
+                        success=not str(result_content).startswith("❌"),
+                        execution_time_ms=(time.time() - _t0) * 1000.0,
+                        user_id=get_current_user_id(),
+                    )
+
                     # ✅ 携带 args，供 chat_stream 的 tool_call_finish 处理逻辑读取
                     return (tool_name, tool_call_id, {"content": result_content, "args": arguments})
 
@@ -521,6 +606,34 @@ class InterviewerAgent(ReActAgent):
             results.extend(user_results)
 
         return results
+
+    def _execute_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        """
+        同步 run() 路径的工具调用统计（chat 非流式兜底）。
+        """
+        from backend.agents.context import get_current_user_id
+
+        _t0 = time.time()
+        try:
+            result = super()._execute_tool_call(tool_name, arguments)
+            ok = not str(result).startswith("❌")
+            agent_tool_runtime_stats.record(
+                agent_name=self.name,
+                tool_name=tool_name,
+                success=ok,
+                execution_time_ms=(time.time() - _t0) * 1000.0,
+                user_id=get_current_user_id(),
+            )
+            return result
+        except Exception:
+            agent_tool_runtime_stats.record(
+                agent_name=self.name,
+                tool_name=tool_name,
+                success=False,
+                execution_time_ms=(time.time() - _t0) * 1000.0,
+                user_id=get_current_user_id(),
+            )
+            raise
 
     def _write_episodic(self, user_id: str, content: str,
                         importance: float = 0.75,
@@ -888,7 +1001,7 @@ class InterviewerAgent(ReActAgent):
         resume: Optional[str] = None,
         session_id: Optional[str] = None,
     ):
-        """流式对话：arun_stream() + SSE 格式。"""
+        """流式对话：直接使用 hello_agents arun_stream()，所有事件原样推送前端。"""
         start_time = time.time()
         if not session_id:
             session_id = settings.default_session_id
@@ -922,285 +1035,40 @@ class InterviewerAgent(ReActAgent):
         await asyncio.to_thread(sqlite_service.update_session_history, session_id, "assistant", "（生成中...）")
 
         full_content = ""
-        chunk_count = 0
-        last_save_time = time.time()
-        thinking_steps: List[dict] = []
-        current_step: dict = {}
-        _current_step_no: int = 0  # 追踪当前步编号，检测 step_start 未触发时的步切换
-        stream_stats: Dict[str, Any] = {"steps": 0, "tool_calls": []}
-
-        from hello_agents.core.lifecycle import AgentEvent
-
-        # 缓存工具调用参数：tool_call_id -> args
-        # _on_tool_call 钩子早于 tool_call_finish 事件触发，用于补充 args
-        _pending_tool_args: Dict[str, dict] = {}
-
-        async def _on_start(ev: AgentEvent):
-            logger.info(f"[Stream] Agent 开始")
-
-        async def _on_step(ev: AgentEvent):
-            stream_stats["steps"] = ev.data.get("step", 0)
-
-        async def _on_tool_call(ev: AgentEvent):
-            name = ev.data.get("tool_name", "")
-            args = ev.data.get("args") or {}
-            call_id = ev.data.get("tool_call_id", "")
-            # 缓存参数，供 tool_call_finish 事件读取
-            if call_id:
-                _pending_tool_args[call_id] = args
-            elif name:
-                _pending_tool_args[name] = args
-            if name and name not in ("Thought", "Finish"):
-                stream_stats["tool_calls"].append(name)
-                try:
-                    from backend.services.logging.interviewer_logger import get_interviewer_logger
-                    await asyncio.to_thread(
-                        get_interviewer_logger().log_tool_call,
-                        user_id, session_id, name, args, "(stream)", True
-                    )
-                except Exception as e:
-                    logger.debug(f"[Stream] log_tool_call 忽略: {e}")
-
-        async def _on_finish(ev: AgentEvent):
-            logger.info(f"[Stream] 完成 steps={stream_stats['steps']} tools={stream_stats['tool_calls']}")
-
-        async def _on_error(ev: AgentEvent):
-            logger.warning(f"[Stream] 错误: {ev.data.get('error', '')}")
+        duration_ms = 0
+        final_thinking_steps: list = []  # 从 agent_finish 提取的完整推理步骤
 
         try:
-            async for event in self.arun_stream(
-                full_input,
-                on_start=_on_start, on_step=_on_step, on_tool_call=_on_tool_call,
-                on_finish=_on_finish, on_error=_on_error,
-            ):
-                reasoning_chunk = ""
-                if event.type.value == "thinking":
-                    reasoning_chunk = (
-                        event.data.get("content") or event.data.get("reasoning")
-                        or event.data.get("reasoning_content") or ""
-                    )
-                elif event.type.value == "tool_call_start":
-                    if event.data.get("tool_name") == "Thought":
-                        tool_args = event.data.get("tool_args") or event.data.get("args") or {}
-                        reasoning_chunk = tool_args.get("reasoning", "")
-                elif event.type.value == "llm_chunk":
-                    reasoning_chunk = ""  # reasoning 在流结束后从 adapter.last_reasoning 统一取
-                else:
-                    reasoning_chunk = event.data.get("reasoning_content") or ""
-
-                if reasoning_chunk and isinstance(reasoning_chunk, str) and reasoning_chunk.strip():
-                    step_no = event.data.get("step") or stream_stats.get("steps") or 1
-                    yield (
-                        "event: thinking\n"
-                        f"data: {json.dumps({'type': 'thinking', 'step': int(step_no), 'chunk': reasoning_chunk}, ensure_ascii=False)}\n\n"
-                    )
-
-                # ⚠️ thinking 事件已在上方单独 yield，跳过 to_sse() 避免重复推送
-                if reasoning_chunk and event.type.value == "thinking":
-                    continue
-
+            async for event in self.arun_stream(full_input):
                 sse_line = event.to_sse()
-                if event.type.value == "tool_call_finish" and isinstance(sse_line, str):
-                    try:
-                        lines = sse_line.split('\n')
-                        et = next((l[7:] for l in lines if l.startswith('event: ')), '')
-                        dl = next((l[6:] for l in lines if l.startswith('data: ')), '')
-                        if dl:
-                            d = json.loads(dl)
-                            if 'step' not in d:
-                                # ✅ 优先使用 event.data 中的 step（已在 _execute_tools_async_stream 中设置）
-                                # 其次使用 stream_stats 中的步号
-                                ev_step = event.data.get('step') or stream_stats.get("steps") or 1
-                                d['step'] = int(ev_step)
-                            sse_line = f"event: {et}\ndata: {json.dumps(d, ensure_ascii=False)}\n\n"
-                    except Exception:
-                        pass
-
-                if isinstance(sse_line, str):
-                    if event.type.value == "llm_chunk":
-                        chunk = event.data.get("chunk") or event.data.get("content") or ""
-                        if chunk.strip().startswith('[') and '"name"' in chunk and '"parameters"' in chunk:
-                            continue
-                    if event.type.value in ("tool_call_finish", "step_finish", "agent_finish"):
-                        try:
-                            from backend.llm.deepseek_thinking_adapter import DeepSeekThinkingOpenAIAdapter
-                            _adapter = getattr(self.llm, '_adapter', None)
-                            if isinstance(_adapter, DeepSeekThinkingOpenAIAdapter):
-                                _reasoning = getattr(_adapter, 'last_reasoning', '') or ''
-                                if _reasoning.strip():
-                                    if event.type.value == 'tool_call_finish':
-                                        # 中间工具调用的推理 → 推 thinking SSE
-                                        step_no = event.data.get('step') or stream_stats.get('steps') or 1
-                                        yield (
-                                            'event: thinking\n'
-                                            f'data: {json.dumps({"type": "thinking", "step": int(step_no), "chunk": _reasoning}, ensure_ascii=False)}\n\n'
-                                        )
-                                        normalized = _normalize_thought_for_step(_reasoning)
-                                        if not current_step.get('thought'):
-                                            current_step['thought'] = normalized
-                                        logger.info(f'[chat_stream] tool_call_finish 推送 thinking SSE ({len(_reasoning)}字)')
-                                    else:
-                                        # agent_finish/step_finish：reasoning 是最终答案 → 填入 full_content
-                                        full_content = _reasoning
-                                        logger.info(f'[chat_stream] {event.type.value} reasoning ({len(_reasoning)}字) 作为最终答案')
-                                    # 消费掉，防止重复推送
-                                    _adapter.last_reasoning = ''
-                        except Exception as _e:
-                            logger.debug(f'[chat_stream] 读取 last_reasoning 失败: {_e}')
-                    if event.type.value == "agent_finish":
-                        result_pre = event.data.get("result") or ""
-                        if result_pre:
-                            full_content = result_pre
-                        # 把 current_step 中剩余内容合并到 thinking_steps。
-                        # 若 thinking_steps 最后一步的 __step 与当前步号相同，则合并工具列表，
-                        # 避免因 step_start 已提交了部分工具而导致同步的工具被拆到两条记录里。
-                        if current_step.get("thought") or current_step.get("tools"):
-                            last = thinking_steps[-1] if thinking_steps else None
-                            cur_step_no = _current_step_no or 1
-                            if last and last.get("__step", cur_step_no) == cur_step_no:
-                                # 合并：把 current_step 的工具追加到已有步，thought 补充
-                                existing_tools = last.get("tools") or []
-                                new_tools = current_step.get("tools") or []
-                                last["tools"] = existing_tools + new_tools
-                                if current_step.get("thought") and not last.get("thought"):
-                                    last["thought"] = current_step["thought"]
-                            else:
-                                current_step["__step"] = cur_step_no
-                                thinking_steps.append({k: v for k, v in current_step.items() if v})
-                            current_step = {}
-                        # 注入 thinking_steps 到 agent_finish 事件，供前端存储并展示推理过程
-                        try:
-                            lines = sse_line.split('\n')
-                            et = next((l[7:] for l in lines if l.startswith('event: ')), 'agent_finish')
-                            dl = next((l[6:] for l in lines if l.startswith('data: ')), '')
-                            d = json.loads(dl) if dl else {}
-                            if thinking_steps:
-                                d['thinking'] = thinking_steps
-                            duration_ms_now = int((time.time() - start_time) * 1000)
-                            d['duration_ms'] = d.get('duration_ms') or duration_ms_now
-                            # ✅ 修复：result 优先使用 full_content（llm_chunk 累积的最终答案）
-                            # 不从 thinking_steps 提取，避免把推理内容当成最终答案
-                            if not d.get('result'):
-                                if full_content.strip():
-                                    d['result'] = full_content.strip()
-                                else:
-                                    # 仅当 full_content 完全为空时，才用占位符
-                                    d['result'] = "（无文本回答，仅有推理过程）"
-                                    logger.warning(f'[chat_stream] agent_finish.result 为空，使用占位符')
-                            sse_line = f"event: {et}\ndata: {json.dumps(d, ensure_ascii=False)}\n\n"
-                        except Exception:
-                            pass
-                    if not sse_line.endswith('\n\n'):
-                        sse_line += '\n\n'
-                yield sse_line
-
+                # 累积最终文本 & 推理步骤
                 if event.type.value == "llm_chunk":
                     chunk = event.data.get("chunk") or event.data.get("content") or ""
                     full_content += chunk
-                    chunk_count += 1
-                    cur = time.time()
-                    if chunk_count % 50 == 0 or (cur - last_save_time) >= 5:
-                        if full_content.strip():
-                            await asyncio.to_thread(
-                                sqlite_service.patch_last_assistant_content, session_id, full_content
-                            )
-                            last_save_time = cur
                 elif event.type.value == "agent_finish":
-                    # current_step 已在 yield 前处理，此处只做空检（double-safe）
-                    if current_step.get("thought") or current_step.get("tools"):
-                        thinking_steps.append({k: v for k, v in current_step.items() if v})
-                        current_step = {}
-                elif event.type.value == "step_start":
-                    # ⚠️ step_start 到来时并发工具可能尚未全部完成（tool_call_finish 还在途中），
-                    # 不在此处提交 current_step，避免把同一步的多个工具拆到不同步。
-                    # 只更新步编号；统一在 agent_finish（或 ev_step_no 变化）时提交。
-                    new_step_no = int(event.data.get("step") or stream_stats.get("steps") or _current_step_no + 1)
-                    if new_step_no != _current_step_no and _current_step_no > 0:
-                        # 步编号真正切换：把旧步提交，开启新步
-                        # 但此时旧步可能还有工具未完成，标记步编号后继续累积
-                        # 用 __pending_step_no 记录旧步编号，供 tool_call_finish 兜底归属
-                        if current_step.get("thought") or current_step.get("tools"):
-                            current_step["__step"] = _current_step_no
-                            thinking_steps.append({k: v for k, v in current_step.items() if v})
-                        current_step = {"tools": []}
-                    _current_step_no = new_step_no
-                elif event.type.value == "thinking":
-                    thought_content = (
-                        event.data.get("content") or event.data.get("reasoning")
-                        or event.data.get("reasoning_content") or ""
-                    )
-                    if thought_content and thought_content.strip():
-                        normalized = _normalize_thought_for_step(thought_content)
-                        # 追加到当前 step（reasoning 可能分多块推送）
-                        existing = current_step.get("thought", "")
-                        current_step["thought"] = (existing + "\n" + normalized).strip() if existing else normalized
-                elif event.type.value == "tool_call_finish":
-                    tool_name = event.data.get("tool_name") or ""
                     result = event.data.get("result") or ""
-                    if tool_name == "Thought":
-                        # Thought 工具：将推理内容写入当前步的 thought，不立即提交
-                        thought = result
-                        for prefix in ("已记录推理过程:", "推理:"):
-                            if thought.startswith(prefix):
-                                thought = thought[len(prefix):].strip()
-                                break
-                        normalized = _normalize_thought_for_step(thought or result)
-                        existing = current_step.get("thought", "")
-                        current_step["thought"] = (existing + "\n" + normalized).strip() if existing else normalized
-                    elif tool_name == "Finish":
-                        # Finish 工具：不计入推理步骤
-                        pass
-                    else:
-                        # 普通工具：填入当前步的 tools，不立即提交
-                        obs_str = str(result)[:500]
-                        # 优先从 event.data 取 args（重写的 _execute_tools_async_stream 已携带）
-                        # 其次从 _on_tool_call 钩子缓存的 _pending_tool_args 中读取
-                        call_id = event.data.get("tool_call_id", "")
-                        tool_args = (
-                            event.data.get("args")
-                            or event.data.get("tool_args")
-                            or _pending_tool_args.pop(call_id, None)
-                            or _pending_tool_args.pop(tool_name, None)
-                            or {}
-                        )
-                        # ✅ 修复：严格的step编号同步
-                        # 从event.data获取step编号，确保与后端一致
-                        ev_step_no = int(event.data.get("step") or _current_step_no or 1)
-                        
-                        # 检测步骤切换
-                        if ev_step_no != _current_step_no:
-                            # 步编号变化：提交旧步，开启新步
-                            if _current_step_no > 0 and (current_step.get("thought") or current_step.get("tools")):
-                                current_step["__step"] = _current_step_no
-                                thinking_steps.append({k: v for k, v in current_step.items() if v})
-                            current_step = {"tools": []}
-                            _current_step_no = ev_step_no
-                        
-                        target_step_no = _current_step_no
-                        if "tools" not in current_step:
-                            current_step["tools"] = []
-                        current_step["tools"].append({
-                            "name": f"🔧 {tool_name}",
-                            "args": tool_args if isinstance(tool_args, dict) else {},
-                            "observation": obs_str,
-                            "observationIsJson": _is_obs_json(obs_str),
-                            "step": target_step_no,  # ✅ 显式记录工具所属的步号
-                        })
-                    # ✅ 不在此处 append thinking_steps！
-                    # 推理和工具同属一步，统一在 step_start（新步开始）或 agent_finish 时提交。
+                    if result.strip():
+                        full_content = result  # agent_finish.result 是最终完整答案，直接覆盖
+                    # 提取 arun_stream 附加的完整 thinking_steps
+                    raw_steps = event.data.get("thinking") or []
+                    if isinstance(raw_steps, list) and raw_steps:
+                        final_thinking_steps = _normalize_thinking_steps_for_db(raw_steps)
+                if isinstance(sse_line, str) and sse_line.strip():
+                    if not sse_line.endswith("\n\n"):
+                        sse_line += "\n\n"
+                    yield sse_line
 
             # 流结束：持久化
             duration_ms = int((time.time() - start_time) * 1000)
             try:
                 await asyncio.to_thread(self.save_session, session_id)
-                if full_content.strip() or thinking_steps:
-                    await asyncio.to_thread(
-                        sqlite_service.patch_last_assistant_content,
-                        session_id,
-                        full_content or "（无文本回答，仅有推理过程）",
-                        thinking_steps if thinking_steps else None,
-                        duration_ms,
-                    )
+                await asyncio.to_thread(
+                    sqlite_service.patch_last_assistant_content,
+                    session_id,
+                    full_content or "（无文本回答）",
+                    final_thinking_steps or None,
+                    duration_ms,
+                )
             except Exception as e:
                 logger.error(f"[chat_stream] 保存失败: {e}", exc_info=True)
 
@@ -1222,7 +1090,21 @@ class InterviewerAgent(ReActAgent):
         except Exception as e:
             logger.error(f"[chat_stream] 异常: {e}", exc_info=True)
             from hello_agents.core.streaming import StreamEvent, StreamEventType
-            err_ev = StreamEvent.create(StreamEventType.ERROR, "InterviewerAgent", error=str(e)[:500])
+            error_msg = str(e)
+            if "Connection error" in error_msg or "连接" in error_msg:
+                display_msg = "⚠️ 工具调用失败：连接错误，请检查后端服务状态"
+            elif "timeout" in error_msg.lower():
+                display_msg = "⚠️ 工具调用失败：请求超时，请稍后重试"
+            elif "submit_answer" in error_msg:
+                display_msg = "⚠️ 答案提交失败：无法保存评分，请检查数据库连接"
+            else:
+                display_msg = f"⚠️ 工具调用失败：{error_msg[:200]}"
+            err_ev = StreamEvent.create(
+                StreamEventType.ERROR,
+                "InterviewerAgent",
+                error=display_msg,
+                tool_error=error_msg[:500]
+            )
             yield err_ev.to_sse()
 
     # ===========================================================
@@ -1285,12 +1167,123 @@ class InterviewerAgent(ReActAgent):
         logger.info(f"✅ 用户 {user_id} 技术画像写入语义记忆")
 
     async def arun_stream(self, input_text: str, **kwargs):
-        """覆盖父类，保留步骤计数（调试用）。"""
+        """
+        覆盖父类：
+        1. 在 LLM_CHUNK 之后检测 reasoning_content，补推 THINKING 事件（DeepSeek 思维链）
+        2. 在 TOOL_CALL_FINISH 之前补推 TOOL_CALL_START 事件
+        3. 在 AGENT_FINISH 时把完整 thinking_steps 附加到事件 data 中
+        """
+        from hello_agents.core.streaming import StreamEvent, StreamEventType
+
         step_counter = 0
+        current_step = 0
+        thinking_steps: list = []           # 汇总所有步骤，附到 agent_finish
+        current_step_obj: dict = {}          # 当前步骤的数据
+        step_tools_started: dict = {}        # step_no -> [tool_name, ...]
+        thinking_emitted_for_step: set = set()  # 已推 thinking 的 step 编号
+
+        def _normalize_tool_args(raw_args: Any) -> Dict[str, Any]:
+            if raw_args is None:
+                return {}
+            if isinstance(raw_args, dict):
+                return raw_args
+            if isinstance(raw_args, str):
+                s = raw_args.strip()
+                if not s:
+                    return {}
+                try:
+                    parsed = json.loads(s)
+                    return parsed if isinstance(parsed, dict) else {"_raw": s}
+                except Exception:
+                    return {"_raw": s}
+            return {"_raw": str(raw_args)}
+
         async for event in super().arun_stream(input_text, **kwargs):
-            if event.type.name == "STEP_START":
+            ev_name = event.type.name  # 'STEP_START' / 'LLM_CHUNK' / ...
+
+            if ev_name == "STEP_START":
                 step_counter += 1
-            yield event
+                current_step = event.data.get("step", step_counter)
+                current_step_obj = {"__step": current_step, "thought": "", "tools": []}
+                step_tools_started[current_step] = []
+                yield event
+
+            elif ev_name == "LLM_CHUNK":
+                yield event
+            elif ev_name == "TOOL_CALL_FINISH":
+                tool_name = event.data.get("tool_name", "")
+                step_no = event.data.get("step", current_step)
+                raw_args = (
+                    event.data.get("args")
+                    if "args" in event.data
+                    else event.data.get("tool_args", event.data.get("arguments"))
+                )
+                args = _normalize_tool_args(raw_args)
+                result = event.data.get("result", "")
+
+                # 若该工具尚未推 start，补发一个（框架未推 TOOL_CALL_START）
+                started = step_tools_started.get(step_no, [])
+                if tool_name not in started and tool_name not in ("Thought", "Finish"):
+                    started.append(tool_name)
+                    step_tools_started[step_no] = started
+                    yield StreamEvent.create(
+                        StreamEventType.TOOL_CALL_START,
+                        self.name,
+                        tool_name=tool_name,
+                        args=args,
+                        step=step_no,
+                    )
+
+                # 记录到当前步骤汇总
+                if tool_name not in ("Thought", "Finish"):
+                    current_step_obj["tools"].append({
+                        "name": tool_name,
+                        "args": args,
+                        "result": result,
+                    })
+
+                yield event
+
+            elif ev_name == "STEP_FINISH":
+                # 保存当前步骤到汇总
+                # Read reasoning_content here: stream is done, last_stats is ready
+                if current_step not in thinking_emitted_for_step:
+                    rc = ""
+                    # Try adapter.last_stats first (written after astream_invoke finishes)
+                    _adapter = getattr(getattr(self, "llm", None), "_adapter", None)
+                    if _adapter and hasattr(_adapter, "last_stats"):
+                        _stats = _adapter.last_stats
+                        rc = getattr(_stats, "reasoning_content", None) or ""
+                    # Fallback: llm.last_call_stats
+                    if not rc:
+                        _llm = getattr(self, "llm", None)
+                        _stats = getattr(_llm, "last_call_stats", None)
+                        rc = getattr(_stats, "reasoning_content", None) or ""
+                    if rc:
+                        thinking_emitted_for_step.add(current_step)
+                        current_step_obj["thought"] = rc
+                        yield StreamEvent.create(
+                            StreamEventType.THINKING,
+                            self.name,
+                            chunk=rc,
+                            step=current_step,
+                        )
+                if current_step_obj.get("__step"):
+                    thinking_steps.append(dict(current_step_obj))
+                yield event
+
+            elif ev_name == "AGENT_FINISH":
+                # 把完整 thinking_steps 附加到 agent_finish 事件
+                enriched = dict(event.data)
+                enriched["thinking"] = thinking_steps
+                yield StreamEvent.create(
+                    StreamEventType.AGENT_FINISH,
+                    self.name,
+                    **enriched,
+                )
+
+            else:
+                yield event
 
 
 # ===========================================================

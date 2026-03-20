@@ -1,7 +1,7 @@
 <template>
   <el-dialog v-model="visible" title="📊 我的掌握度" width="560px" align-center>
     <div v-if="loading" style="text-align:center;padding:30px">
-      <el-icon class="is-loading" style="font-size:28px;color:var(--primary)"><Loading /></el-icon>
+      <Loading class="is-loading" style="font-size:28px;color:var(--primary)" />
     </div>
     <template v-if="data && !loading">
       <div class="ov-row">
@@ -39,6 +39,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { Loading } from '@element-plus/icons-vue'
 import { api } from '../api.js'
 
 const props = defineProps({

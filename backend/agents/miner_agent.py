@@ -7,6 +7,7 @@ Miner Agent - 信息挖掘师（ReAct版）
 """
 import logging
 import re
+import time
 from typing import List, Tuple
 
 from hello_agents import ReActAgent
@@ -16,6 +17,7 @@ from hello_agents.tools import ToolRegistry
 
 from backend.config.config import settings
 from backend.agents.prompts.miner_prompt import get_miner_prompt, format_miner_user_prompt
+from backend.services.logging.agent_tool_runtime_stats import agent_tool_runtime_stats
 from backend.tools.miner_tools import OcrImagesTool, MarkUnrelatedTool
 
 logger = logging.getLogger(__name__)
@@ -121,7 +123,7 @@ class MinerAgent(ReActAgent):
             (answer, ocr_called, is_unrelated)
             - answer       : JSON字符串（有题）/ UNRELATED_SIGNAL（无关）/ ""（失败）
             - ocr_called   : 是否调用了 ocr_images
-            - is_unrelated : LLM 是否主动调用了 mark_unrelated
+            - is_unrelated : LLM 是否主动调用了 mark_unrelated 或输出了 unrelated 对象
         """
         # 格式化用户输入（重试时使用外部传入的 override，含纠错指令）
         user_input = user_input_override or format_miner_user_prompt(content, has_image, company, position)
@@ -165,7 +167,11 @@ class MinerAgent(ReActAgent):
                             break
                     if mark_unrelated_called:
                         break
-            if UNRELATED_SIGNAL in result_text or mark_unrelated_called:
+            
+            # 检查是否输出了 unrelated 对象
+            is_unrelated_obj = self._is_unrelated_object(result_text)
+            
+            if UNRELATED_SIGNAL in result_text or mark_unrelated_called or is_unrelated_obj:
                 logger.debug(f"[MinerAgent] 执行完成，输出长度: {len(result_text)}, ocr_called={self._ocr_called}, is_unrelated=True")
                 return UNRELATED_SIGNAL, self._ocr_called, True
 
@@ -179,6 +185,76 @@ class MinerAgent(ReActAgent):
         except Exception as e:
             logger.error(f"[MinerAgent] 执行异常: {e}")
             return "", self._ocr_called, False
+
+    def _execute_tool_call(self, tool_name: str, arguments):
+        """统一记录 Miner 的工具调用统计（含子进程链路）。"""
+        from backend.agents.context import get_current_user_id
+
+        _t0 = time.time()
+        try:
+            result = super()._execute_tool_call(tool_name, arguments)
+            agent_tool_runtime_stats.record(
+                agent_name=self.name,
+                tool_name=tool_name,
+                success=not str(result).startswith("❌"),
+                execution_time_ms=(time.time() - _t0) * 1000.0,
+                user_id=get_current_user_id(),
+            )
+            return result
+        except Exception:
+            agent_tool_runtime_stats.record(
+                agent_name=self.name,
+                tool_name=tool_name,
+                success=False,
+                execution_time_ms=(time.time() - _t0) * 1000.0,
+                user_id=get_current_user_id(),
+            )
+            raise
+
+    @staticmethod
+    def _is_unrelated_object(text: str) -> bool:
+        """检查是否输出了 unrelated 对象 {"status":"unrelated",...}"""
+        import json
+        import re
+        
+        stripped = text.strip()
+        # 尝试直接解析
+        if stripped.startswith('{') and stripped.endswith('}'):
+            try:
+                obj = json.loads(stripped)
+                if isinstance(obj, dict) and obj.get('status') == 'unrelated':
+                    return True
+            except json.JSONDecodeError:
+                pass
+        
+        # 尝试从文本中提取 {...} 对象
+        for m in re.finditer(r'\{', stripped):
+            start = m.start()
+            depth, i, in_str, escape = 0, start, None, False
+            while i < len(stripped):
+                c = stripped[i]
+                if in_str:
+                    escape = not escape and c == '\\'
+                    if not escape and c == in_str:
+                        in_str = None
+                elif c in ('"', "'"):
+                    in_str = c
+                elif c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        candidate = stripped[start:i + 1]
+                        try:
+                            obj = json.loads(candidate)
+                            if isinstance(obj, dict) and obj.get('status') == 'unrelated':
+                                return True
+                        except json.JSONDecodeError:
+                            pass
+                        break
+                i += 1
+        
+        return False
 
     @staticmethod
     def _extract_json_if_direct_reply(text: str) -> str:

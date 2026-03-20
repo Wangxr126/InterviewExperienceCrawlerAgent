@@ -8,6 +8,7 @@ Miner Agent V3 - 整合版（Few-shot + 结构化输出 + 两阶段提取）
 import logging
 import re
 import json
+import time
 from typing import List, Tuple, Optional, Literal
 
 from hello_agents import ReActAgent
@@ -17,6 +18,7 @@ from hello_agents.tools import ToolRegistry
 
 from backend.config.config import settings
 from backend.agents.prompts.miner_prompt import get_miner_prompt, format_miner_user_prompt
+from backend.services.logging.agent_tool_runtime_stats import agent_tool_runtime_stats
 from backend.tools.miner_tools import OcrImagesTool, MarkUnrelatedTool
 from backend.agents.two_stage_miner_agent import TwoStageExtractor
 
@@ -284,6 +286,31 @@ class MinerAgentV3(ReActAgent):
         except Exception as e:
             logger.error(f"[MinerAgentV3] 结构化输出失败: {e}，降级到普通模式")
             return super().run(user_input)
+
+    def _execute_tool_call(self, tool_name: str, arguments):
+        """统一记录 Miner V3 的工具调用统计。"""
+        from backend.agents.context import get_current_user_id
+
+        _t0 = time.time()
+        try:
+            result = super()._execute_tool_call(tool_name, arguments)
+            agent_tool_runtime_stats.record(
+                agent_name=self.name,
+                tool_name=tool_name,
+                success=not str(result).startswith("❌"),
+                execution_time_ms=(time.time() - _t0) * 1000.0,
+                user_id=get_current_user_id(),
+            )
+            return result
+        except Exception:
+            agent_tool_runtime_stats.record(
+                agent_name=self.name,
+                tool_name=tool_name,
+                success=False,
+                execution_time_ms=(time.time() - _t0) * 1000.0,
+                user_id=get_current_user_id(),
+            )
+            raise
 
     @staticmethod
     def _extract_json_if_direct_reply(text: str) -> str:

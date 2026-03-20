@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <div class="chat-wrap">
     <div class="chat-header">
       <span class="chat-title">💬 练习对话</span>
@@ -55,58 +55,26 @@
                       <code class="step-code">{{ step.action }}</code>
                       <div v-if="step.toolArgs && Object.keys(step.toolArgs).length" class="tool-args">
                         <span class="args-label">参数:</span>
-                        <pre class="args-json">{{ JSON.stringify(step.toolArgs, null, 2) }}</pre>
+                        <div class="args-rich-json" v-html="renderToolDataHtml(step.toolArgs)"></div>
                       </div>
                     </template>
                     <!-- 新协议：同一步多工具 -->
                     <template v-else>
                       <div v-for="(tool, ti) in step.tools" :key="ti" class="tool-item" :class="{ 'tool-pending': tool._pending }">
-                        <!-- submit_answer 工具：展示参数 + 图2 格式的评分/点评/标准答案 -->
+                        <!-- submit_answer 工具：推理过程中只显示原始 JSON，不渲染 -->
                         <template v-if="tool.name === 'submit_answer' || tool.name === '🔧 submit_answer'">
                           <div class="tool-item-header">
                             <code class="step-code">{{ tool.name }}</code>
-                            <span v-if="tool._pending" class="tool-pending-badge">调用中…</span>
+                            <span v-if="tool._pending" class="tool-pending-badge">评分中…</span>
                           </div>
-                          <div v-if="tool.args && (tool.args.question_id || tool.args.user_answer)" class="tool-args-inner">
-                            <span class="args-label">参数:</span>
-                            <pre class="args-json">{{ JSON.stringify({ question_id: tool.args.question_id, user_answer: tool.args.user_answer }, null, 2) }}</pre>
-                          </div>
-                          <div v-if="tool._pending" class="tool-args-inner tool-pending-result">
-                            <span class="tool-spinner"></span>
-                            <span class="step-text" style="color:#94a3b8">正在评价…</span>
-                          </div>
-                          <template v-else-if="!tool._pending && (tool.result != null || tool.observation != null)">
-                            <div v-if="getSubmitAnswerEval(tool)" class="submit-answer-eval-card">
-                              <div class="eval-score-badge">📝 评分: {{ getSubmitAnswerEval(tool).score }}/5</div>
-                              <div v-if="getSubmitAnswerEval(tool).feedback" class="eval-feedback">{{ getSubmitAnswerEval(tool).feedback }}</div>
-                              <div v-if="(getSubmitAnswerEval(tool).strong_points || []).length" class="eval-points">
-                                <span class="eval-point-label">✓ 答对:</span>
-                                <ul class="eval-list">
-                                  <li v-for="(p, i) in getSubmitAnswerEval(tool).strong_points" :key="'s'+i" class="icon-correct">{{ p }}</li>
-                                </ul>
-                              </div>
-                              <div v-if="(getSubmitAnswerEval(tool).missed_points || []).length" class="eval-points">
-                                <span class="eval-point-label">✗ 遗漏:</span>
-                                <ul class="eval-list">
-                                  <li v-for="(p, i) in getSubmitAnswerEval(tool).missed_points" :key="'m'+i" class="icon-missed">{{ p }}</li>
-                                </ul>
-                              </div>
-                              <div v-if="(getSubmitAnswerEval(tool).error_points || []).length" class="eval-points">
-                                <span class="eval-point-label">✗ 错误:</span>
-                                <ul class="eval-list">
-                                  <li v-for="(ep, i) in getSubmitAnswerEval(tool).error_points" :key="'e'+i" class="icon-error">
-                                    {{ typeof ep === 'object' && ep.wrong ? `${ep.wrong} → ${ep.correct || ''}` : (ep.wrong || ep) }}
-                                  </li>
-                                </ul>
-                              </div>
-                              <div v-if="getSubmitAnswerEval(tool).standard_answer" class="eval-standard-answer">
-                                <div class="eval-std-label">📚 标准答案（面试参考）</div>
-                                <div class="eval-std-body" v-html="renderObsRichText(getSubmitAnswerEval(tool).standard_answer)"></div>
-                              </div>
+                          <template v-if="!tool._pending">
+                            <div v-if="hasToolArgs(tool)" class="tool-args-inner">
+                              <span class="args-label">参数:</span>
+                              <div class="args-rich-json" v-html="renderToolDataHtml(getToolArgs(tool))"></div>
                             </div>
-                            <div v-else class="tool-args-inner">
+                            <div v-if="tool.result != null || tool.observation != null" class="tool-args-inner">
                               <span class="args-label">结果:</span>
-                              <span class="step-text">{{ tool.result || tool.observation }}</span>
+                              <div class="args-rich-json" v-html="renderToolDataHtml(tool.result || tool.observation)"></div>
                             </div>
                           </template>
                         </template>
@@ -116,14 +84,13 @@
                             <code class="step-code">{{ tool.name }}</code>
                             <span v-if="tool._pending" class="tool-pending-badge">调用中…</span>
                           </div>
-                          <div v-if="tool.args && Object.keys(tool.args).length" class="tool-args-inner">
+                          <div v-if="hasToolArgs(tool)" class="tool-args-inner">
                             <span class="args-label">参数:</span>
-                            <pre class="args-json">{{ JSON.stringify(tool.args, null, 2) }}</pre>
+                            <div class="args-rich-json" v-html="renderToolDataHtml(getToolArgs(tool))"></div>
                           </div>
                           <div v-if="!tool._pending && (tool.result != null || tool.observation != null)" class="tool-args-inner">
                             <span class="args-label">结果:</span>
-                            <pre v-if="(tool.observationIsJson || isObsJson(tool.result || tool.observation))" class="args-json">{{ formatObsJson(tool.result || tool.observation) }}</pre>
-                            <span v-else class="step-text">{{ tool.result || tool.observation }}</span>
+                            <div class="args-rich-json" v-html="renderToolDataHtml(tool.result || tool.observation)"></div>
                           </div>
                           <div v-if="tool._pending" class="tool-args-inner tool-pending-result">
                             <span class="tool-spinner"></span>
@@ -286,6 +253,7 @@ import { ref, nextTick, watch, onMounted, onUnmounted, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Delete } from '@element-plus/icons-vue'
 import { marked } from 'marked'
+import markedKatex from 'marked-katex-extension'
 import hljs from 'highlight.js'
 import 'highlight.js/styles/github.css'
 import { api } from '../api.js'
@@ -312,6 +280,42 @@ marked.setOptions({
   breaks: true,
   gfm: true,
 })
+marked.use(markedKatex({ throwOnError: false, nonStandard: true }))
+
+const normalizeMathDelimiters = (text) => {
+  if (!text || typeof text !== 'string') return text || ''
+
+  const normalizeMathExpr = (expr) => {
+    if (!expr || typeof expr !== 'string') return expr || ''
+    return expr
+      // 二次转义的 LaTeX 命令：\\frac -> \frac
+      .replace(/\\\\([a-zA-Z]+)/g, '\\$1')
+      // 二次转义的控制符：\\_ \\^ \\{ \\}
+      .replace(/\\\\([_^{}[\]()])/g, '\\$1')
+      .trim()
+  }
+
+  return text
+    // 支持 \[...\] 与 \\[...\\]
+    .replace(/\\{1,2}\[\s*([\s\S]*?)\s*\\{1,2}\]/g, (_, expr) => `$$\n${normalizeMathExpr(expr)}\n$$`)
+    // 支持 \(...\) 与 \\(...\\)
+    .replace(/\\{1,2}\(\s*([\s\S]*?)\s*\\{1,2}\)/g, (_, expr) => `$${normalizeMathExpr(expr)}$`)
+}
+
+const normalizeEscapedText = (text) => {
+  if (!text || typeof text !== 'string') return text || ''
+  // 仅对常见序列做轻量还原，避免把任意反斜杠都吞掉
+  const restored = text
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\\t/g, '  ')
+    // 把二次转义的数学分隔符先降一层，方便后续统一替换
+    .replace(/\\\\\(/g, '\\(')
+    .replace(/\\\\\)/g, '\\)')
+    .replace(/\\\\\[/g, '\\[')
+    .replace(/\\\\\]/g, '\\]')
+  return normalizeMathDelimiters(restored)
+}
 
 /** 推理过程观察：尝试格式化为 JSON 展示（工具调用结果用代码块） */
 const formatObsJson = (text) => {
@@ -361,24 +365,65 @@ function extractJsonFromText(text) {
   return null
 }
 
-/** 去掉 DeepSeek 输出中的 DSML 工具调用块 */
+/** 去掉 DeepSeek 输出中的 DSML 工具调用块（完整块过滤） */
 function stripDsmlBlocks(text) {
   if (!text || typeof text !== 'string') return text
   let s = text
-  const startTag = '<｜DSML｜'
-  const endTag = '</｜DSML｜function_calls>'
-  while (true) {
-    const start = s.indexOf(startTag)
-    if (start === -1) break
-    const end = s.indexOf(endTag, start)
-    if (end === -1) {
-      // 找不到闭合标签，直接丢掉后半段
-      s = s.slice(0, start)
-      break
+  // 兼容全角/半角竖线与空白差异，删除完整 DSML 块
+  s = s.replace(/<[｜|]\s*DSML\s*[｜|]\s*function_calls\s*>[\s\S]*?<\/[｜|]\s*DSML\s*[｜|]\s*function_calls\s*>/gi, '')
+  // 删除独立 DSML 标签行
+  s = s.replace(/^\s*<\/?[｜|]\s*DSML\s*[｜|][^>]*>\s*$/gim, '')
+  // 若存在未闭合 DSML 起始标签，直接截断
+  const danglingStart = s.search(/<[｜|]\s*DSML\s*[｜|]/i)
+  if (danglingStart >= 0) s = s.slice(0, danglingStart)
+  return s.replace(/\n{3,}/g, '\n\n')
+}
+
+/**
+ * 跨 chunk 的 DSML 过滤器：
+ * 当 DSML 开始标签被拆分到多个 chunk 时，先把可疑前缀缓存起来
+ * 等到确认不是 DSML 再放行，或等到完整块结束再丢弃。
+ * 返回 { safe: string, pending: string }
+ */
+function filterChunkWithDsmlGuard(chunk, pendingBuf) {
+  let combined = pendingBuf + chunk
+
+  // 1. 先做完整块过滤
+  combined = stripDsmlBlocks(combined)
+
+  // 2. 检查末尾是否有 DSML 开始标签的前缀（跨 chunk 情况）
+  const startTags = ['<｜DSML｜', '<|DSML|']
+  let newPending = ''
+  for (const startTag of startTags) {
+    for (let len = Math.min(startTag.length - 1, combined.length); len > 0; len--) {
+      const tail = combined.slice(-len)
+      if (startTag.startsWith(tail)) {
+        newPending = tail
+        combined = combined.slice(0, -len)
+        break
+      }
     }
-    s = s.slice(0, start) + s.slice(end + endTag.length)
+    if (newPending) break
   }
-  return s
+  // 3. 最后兜底：过滤残留 DSML 行
+  if (/[｜|]\s*DSML\s*[｜|]/i.test(combined)) {
+    combined = combined
+      .split('\n')
+      .filter(ln => !/[｜|]\s*DSML\s*[｜|]/i.test(ln))
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+  }
+  return { safe: combined, pending: newPending }
+}
+
+const sanitizeDisplayText = (text, trim = true) => {
+  if (!text || typeof text !== 'string') return text || ''
+  const cleaned = stripDsmlBlocks(normalizeEscapedText(text))
+    .split('\n')
+    .filter(ln => !/[｜|]\s*DSML\s*[｜|]/i.test(ln))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+  return trim ? cleaned.trim() : cleaned
 }
 
 /** 判断观察是否为 JSON 格式（工具调用结果优先以 JSON 代码块展示） */
@@ -503,7 +548,10 @@ function getSubmitAnswerEval(tool) {
     feedback: parsed.feedback ?? '',
     strong_points: Array.isArray(parsed.strong_points) ? parsed.strong_points : [],
     missed_points: Array.isArray(parsed.missed_points) ? parsed.missed_points : [],
-    error_points: Array.isArray(parsed.error_points) ? parsed.error_points : [],
+    error_points: [
+      ...( Array.isArray(parsed.error_points) ? parsed.error_points : [] ),
+      ...( Array.isArray(parsed.shortcomings) ? parsed.shortcomings : [] ),
+    ],
     standard_answer: parsed.standard_answer ?? '',
   }
 }
@@ -511,7 +559,13 @@ function getSubmitAnswerEval(tool) {
 /** 观察区富文本：换行 + **粗体**，并转义 HTML 防 XSS */
 function renderObsRichText(str) {
   if (str == null) return ''
-  const s = String(str)
+  const s = normalizeEscapedText(String(str))
+  try {
+    const rendered = marked.parse(s)
+    if (typeof rendered === 'string' && rendered.trim()) return rendered
+  } catch (e) {
+    console.warn('renderObsRichText markdown 渲染失败，降级纯文本:', e)
+  }
   const escape = (t) => t
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -519,6 +573,58 @@ function renderObsRichText(str) {
     .replace(/"/g, '&quot;')
   const withBreaks = escape(s).replace(/\n/g, '<br>')
   return withBreaks.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+}
+
+function getToolArgs(tool) {
+  if (!tool || typeof tool !== 'object') return {}
+  const raw = tool.args ?? tool.toolArgs ?? tool.parameters ?? {}
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw)
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { _raw: raw }
+    } catch {
+      return { _raw: raw }
+    }
+  }
+  return {}
+}
+
+function hasToolArgs(tool) {
+  const args = getToolArgs(tool)
+  return !!(args && Object.keys(args).length)
+}
+
+function renderToolDataHtml(data) {
+  if (data == null) return ''
+  // 1) 字符串：优先按 JSON 解析，失败按 markdown + 公式渲染
+  if (typeof data === 'string') {
+    const text = normalizeEscapedText(data)
+    try {
+      const parsed = JSON.parse(text)
+      return renderToolDataHtml(parsed)
+    } catch {
+      return renderObsRichText(text)
+    }
+  }
+
+  // 2) 对象：做紧凑 key-value 渲染，字符串值支持公式
+  if (typeof data === 'object') {
+    const entries = Array.isArray(data) ? data.map((v, i) => [String(i), v]) : Object.entries(data)
+    const rows = entries.map(([k, v]) => {
+      if (v == null) return `<div class="args-kv-row"><span class="args-kv-key">${k}</span><span class="args-kv-val">null</span></div>`
+      if (typeof v === 'string') {
+        return `<div class="args-kv-row"><span class="args-kv-key">${k}</span><div class="args-kv-val">${renderObsRichText(v)}</div></div>`
+      }
+      if (typeof v === 'number' || typeof v === 'boolean') {
+        return `<div class="args-kv-row"><span class="args-kv-key">${k}</span><span class="args-kv-val">${String(v)}</span></div>`
+      }
+      return `<div class="args-kv-row"><span class="args-kv-key">${k}</span><pre class="args-json">${JSON.stringify(v, null, 2)}</pre></div>`
+    })
+    return `<div class="args-kv-wrap">${rows.join('')}</div>`
+  }
+
+  return renderObsRichText(String(data))
 }
 
 /** 切换某一步某 key 的长文本展开状态 */
@@ -536,7 +642,7 @@ const filterToolCallJson = (text) => {
 /** 不做过滤，原样展示模型输出 */
 const renderMd = (text) => {
   try {
-    const content = filterToolCallJson(text || '')
+    const content = sanitizeDisplayText(filterToolCallJson(text || ''))
     const result = renderEnhancedContent(content, marked)
     if (result instanceof Promise) {
       console.error('❌ renderMd 返回了 Promise，应该返回字符串！')
@@ -546,7 +652,7 @@ const renderMd = (text) => {
   }
   catch (e) {
     console.error('renderMd 错误:', e)
-    return text || ''
+    return sanitizeDisplayText(text || '')
   }
 }
 
@@ -582,6 +688,15 @@ let   abortCtrl    = null
 let   lastLoadedUserId = ''
 let   sendInProgress = false  // 防止并发调用的标志
 const historyLoading = ref(false)  // loadHistory 正在进行中，prefillAndSend 需等待
+const STREAM_SYNC_INTERVAL_MS = 120
+let lastStreamSyncTs = 0
+const syncStreamState = (force = false) => {
+  const now = Date.now()
+  if (force || now - lastStreamSyncTs >= STREAM_SYNC_INTERVAL_MS) {
+    lastStreamSyncTs = now
+    chatStore.syncMessages(messages.value)
+  }
+}
 
 // ── 语音转文字 ──
 const isRecording    = ref(false)
@@ -671,6 +786,22 @@ const quickQuestions = [
 const scrollToBottom = () => {
   nextTick(() => {
     if (msgBox.value) msgBox.value.scrollTop = msgBox.value.scrollHeight
+  })
+}
+
+// 滚动到消息框的最顶部（用于"下一题"等场景）
+const scrollToLatestMessageTop = () => {
+  nextTick(() => {
+    if (msgBox.value) {
+      // 滚动到最后一条消息顶部，避免误回到会话最上方
+      const rows = msgBox.value.querySelectorAll('.msg-row')
+      const lastRow = rows[rows.length - 1]
+      if (lastRow) {
+        msgBox.value.scrollTop = Math.max(0, lastRow.offsetTop - 8)
+        return
+      }
+      msgBox.value.scrollTop = msgBox.value.scrollHeight
+    }
   })
 }
 
@@ -820,7 +951,11 @@ const prefillAndSend = async (textOrOptions) => {
     prefillDisplayRef.value = null
   }
   inputText.value = text
-  nextTick(() => send())
+  nextTick(() => {
+    send()
+    // 发送后滚动到最新消息的顶部（而不是底部）
+    setTimeout(() => scrollToLatestMessageTop(), 100)
+  })
 }
 defineExpose({ prefillAndSend, historyLoading })
 
@@ -842,7 +977,8 @@ const send = async () => {
     thinkingOpen: false,
     timestamp: new Date().toISOString()  // 添加用户消息时间戳
   })
-  scrollToBottom()
+  // 用户消息发送后，滚动到该消息顶部（而不是底部）
+  scrollToLatestMessageTop()
 
   loading.value = true
   abortCtrl = new AbortController()
@@ -858,6 +994,8 @@ const send = async () => {
     if (!res.body) throw new Error('SSE 响应无 body，请检查后端是否返回流式数据')
 
     // AI 消息占位，thinkingOpen 初始 true（有步骤时自动展开）
+    // DSML 跨 chunk 过滤缓冲区
+    let dsmlPendingBuf = ''
     const aiMsgIndex = messages.value.length  // 记录索引而不是对象引用
     messages.value.push({ 
       role: 'assistant', 
@@ -870,397 +1008,239 @@ const send = async () => {
     })
     streamingMsg.value = messages.value[aiMsgIndex]
     chatStore.startStream(props.userId, sessionId.value, messages.value)
+    // AI 消息出现后，滚动到该消息顶部
+    scrollToLatestMessageTop()
 
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
     let receivedFirstDelta = false
-    let currentStep = {}  // 用于构建 thinking（HelloAgents 官方格式）
-    // tool_call_start 阶段：用 Map 暂存「调用中」工具
-    // key 格式：「toolName__callIndex」（callIndex 单调递增），value = 工具条目引用
-    // tool_call_finish 按 FIFO 顺序取出同名工具的最早一条匹配记录
-    const pendingToolsMap = new Map()  // Map<"toolName__N", toolEntry>
-    let _toolCallCounter = 0           // 单调递增，保证同名工具多次调用时 key 不重复
-    let _lastKnownStepNo = 0           // 追踪已知最大步号，用于检测步骤切换
+    let shouldStopStream = false
+    const STREAM_READ_TIMEOUT_MS = 45000
+    let streamEndedByTimeout = false
 
     /**
-     * 把当前 pending 步"升级"为正式步骤（赋予真实步号）。
-     * 当 thinking/tool 事件携带比当前更大的 stepNo 时调用，
-     * 确保每个逻辑步骤独立显示，不混在一起。
+     * 按 stepNo 获取或创建步骤对象。
+     * 后端每个事件携带 step 编号，前端直接按编号索引，无需 pending 机制。
      */
-    const promotePendingStep = (aiMsg, newStepNo) => {
-      const pendingStep = aiMsg.thinking.find(s => s.__step === 'pending')
-      if (!pendingStep) return
-      // 找到下一个可用的正式步号（避免覆盖已有步）
-      const existingNums = aiMsg.thinking
-        .filter(s => s.__step !== 'pending' && typeof s.__step === 'number')
-        .map(s => s.__step)
-      const assignedNo = existingNums.length > 0 ? Math.max(...existingNums) + 1 : (newStepNo - 1 > 0 ? newStepNo - 1 : 1)
-      pendingStep.__step = assignedNo
+    const getOrCreateStep = (aiMsg, stepNo) => {
+      let stepObj = aiMsg.thinking.find(s => s.__step === stepNo)
+      if (!stepObj) {
+        stepObj = { __step: stepNo, thought: '', tools: [] }
+        aiMsg.thinking.push(stepObj)
+        aiMsg.thinking.sort((a, b) => (a.__step || 0) - (b.__step || 0))
+      }
+      return stepObj
     }
 
+    /**
+     * handleEvent — 统一处理后端 hello_agents SSE 事件
+     *
+     * 后端 to_sse() 格式：
+     *   event: <event_type>\n
+     *   data: {"type":"<event_type>","agent_name":"...","timestamp":...,"data":{...}}\n\n
+     *
+     * 前端解析后 payload = 整个 data JSON，即：
+     *   payload.type       → 事件类型字符串
+     *   payload.data       → 实际载荷对象
+     *
+     * 事件类型对照：
+     *   agent_start       → 忽略（仅日志）
+     *   step_start        → 初始化新步骤占位
+     *   llm_chunk         → 流式追加正文
+     *   thinking          → 追加推理内容（DeepSeek reasoning_content）
+     *   tool_call_start   → 添加 pending 工具条目
+     *   tool_call_finish  → 填充工具结果
+     *   step_finish       → 忽略（步骤已完整）
+     *   agent_finish      → 设置最终答案 + thinking_steps
+     *   error             → 显示错误
+     */
     const handleEvent = (payload) => {
       const evType = payload.type
-      const data = payload.data || payload   // 兼容新旧两种事件格式：新协议字段在顶层
-      
-      // 始终从数组中获取最新的消息对象
+      // payload.data 是实际载荷；兼容极少数直接把字段放在顶层的旧格式
+      const data = (payload.data && typeof payload.data === 'object') ? payload.data : payload
+
+      // 始终从数组获取最新消息对象（splice 后引用会变）
       const aiMsg = messages.value[aiMsgIndex]
       if (!aiMsg) return
 
-      // ========== 新版自定义三通道协议 ==========
-      // 后端以 SSE event: message|thinking|tool 推送，data 中直接携带字段：
-      //  - message: { type:'message', phase:'chunk'|'finish', step, chunk }
-      //  - thinking: { type:'thinking', step, chunk }
-      //  - tool: { type:'tool', phase:'start'|'finish', step, tool_name, args, result }
-      if (evType === 'message' && !payload.data) {
-        const phase = data.phase || 'chunk'
-        const chunk = data.chunk ?? ''
-        if (phase === 'chunk') {
-          let c = stripDsmlBlocks(chunk)
-          if (c) {
-            if (!receivedFirstDelta && aiMsg.thinking.length > 0) {
-              aiMsg.thinkingOpen = false
-              receivedFirstDelta = true
-            }
-            aiMsg.content += c
-            messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
-            streamingMsg.value = messages.value[aiMsgIndex]
-            scrollToBottom()
-          }
-        } else if (phase === 'finish') {
-          const cleanResult = stripDsmlBlocks(chunk).trim()
-          aiMsg.content = stripDsmlBlocks(aiMsg.content || '').trim()
-          if (cleanResult) {
-            if (!aiMsg.content) {
-              aiMsg.content = cleanResult
-            } else if (!aiMsg.content.includes(cleanResult)) {
-              aiMsg.content += '\n\n' + cleanResult
-            }
-          }
-          aiMsg.duration_ms = data.duration_ms ?? (Date.now() - (aiMsg._startTs || Date.now()))
-          messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
-          streamingMsg.value = messages.value[aiMsgIndex]
-        }
-      } else if (evType === 'thinking') {
-        // 支持多种格式：自定义 {step, chunk}、hello_agents {data: {content}}、reasoning_content
-        const inner = data.data || data
-        const chunk = data.chunk ?? data.content ?? inner?.content ?? inner?.chunk ?? inner?.reasoning_content ?? ''
-        if (!chunk || typeof chunk !== 'string') {
-          chatStore.syncMessages(messages.value)
-          return
-        }
-        const stepNo = data.step ?? inner?.step ?? 1
-        // 步号增大说明进入新步骤：把现有 pending 步升级为正式步，避免跨步工具混在一起
-        if (stepNo > _lastKnownStepNo && _lastKnownStepNo > 0) {
-          promotePendingStep(aiMsg, stepNo)
-        }
-        if (stepNo > 0) _lastKnownStepNo = stepNo
-        const normalized = normalizeThoughtForStep(chunk)
-        // 优先找同步号的已有正式步
-        let stepObj = aiMsg.thinking.find(s => s.__step === stepNo)
-        if (!stepObj) {
-          // 没有正式步：检查是否有 pending 步，有则把 thought 写入 pending 步
-          // （thinking 和紧随其后的工具属于同一步，不要过早建正式步）
-          let pendingStep = aiMsg.thinking.find(s => s.__step === 'pending')
-          if (pendingStep) {
-            pendingStep.thought = pendingStep.thought ? `${pendingStep.thought}\n${normalized}` : normalized
-            messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
-            streamingMsg.value = messages.value[aiMsgIndex]
-            chatStore.syncMessages(messages.value)
-            return
-          }
-          // 没有 pending 步：新建正式步
-          stepObj = { __step: stepNo, thought: '', tools: [] }
-          aiMsg.thinking.push(stepObj)
-        }
-        stepObj.thought = stepObj.thought ? `${stepObj.thought}\n${normalized}` : normalized
-        messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
-        streamingMsg.value = messages.value[aiMsgIndex]
-      } else if (evType === 'tool' && !payload.data) {
-        const phase = data.phase || 'start'
+      // ── agent_start：忽略 ──────────────────────────────────
+      if (evType === 'agent_start') {
+        // 仅用于调试，不更新 UI
+        return
+      }
+
+      // ── step_start：初始化步骤占位 ────────────────────────
+      if (evType === 'step_start') {
         const stepNo = data.step ?? 1
-        // 清理后端写入的 🔧 前缀
-        const toolName = (data.tool_name ?? '').replace(/^🔧\s*/u, '').trim()
-        if (!toolName || toolName === 'Thought' || toolName === 'Finish') {
-          chatStore.syncMessages(messages.value)
-          return
-        }
-        let stepObj = aiMsg.thinking.find(s => s.__step === stepNo)
-        if (!stepObj) {
-          stepObj = { __step: stepNo, thought: '', tools: [] }
-          aiMsg.thinking.push(stepObj)
-        }
-        if (!Array.isArray(stepObj.tools)) {
-          stepObj.tools = []
-        }
-        if (phase === 'start') {
-          stepObj.tools.push({
-            name: toolName,
-            args: data.args || {},
-            result: null,
-            observationIsJson: false,
-          })
-        } else {
-          // finish：找到最近一个同名且尚未写入 result 的记录，补充结果
-          const toolsArr = stepObj.tools
-          let target = null
-          for (let i = toolsArr.length - 1; i >= 0; i--) {
-            if (toolsArr[i].name === toolName && toolsArr[i].result == null) {
-              target = toolsArr[i]
-              break
-            }
+        getOrCreateStep(aiMsg, stepNo)
+        return
+      }
+
+      // ── llm_chunk：流式追加正文 ───────────────────────────
+      if (evType === 'llm_chunk') {
+        const raw = data.chunk ?? data.content ?? ''
+        const { safe: chunk, pending } = filterChunkWithDsmlGuard(raw, dsmlPendingBuf)
+        dsmlPendingBuf = pending
+        if (chunk) {
+          // 第一个正文 chunk 到达时，自动折叠思考块
+          if (!receivedFirstDelta && aiMsg.thinking.length > 0) {
+            aiMsg.thinkingOpen = false
           }
-          if (!target) {
-            target = {
-              name: toolName,
-              args: data.args || {},
-              result: null,
-              observationIsJson: false,
-            }
-            toolsArr.push(target)
-          }
-          const obs = data.result != null ? String(data.result) : ''
-          target.result = obs
-          target.observationIsJson = isObsJson(obs)
+          receivedFirstDelta = true
+          aiMsg.content += sanitizeDisplayText(chunk, false)
         }
+        syncStreamState()
+        // 流式输出时不自动滚动，保持用户视图稳定
+      }
+
+      // ── thinking：追加推理内容（DeepSeek reasoning_content）─
+      if (evType === 'thinking') {
+        const chunk = data.chunk ?? data.content ?? ''
+        if (!chunk || typeof chunk !== 'string') return
+        const stepNo = data.step ?? 1
+        const normalized = normalizeThoughtForStep(chunk)
+        const stepObj = getOrCreateStep(aiMsg, stepNo)
+        stepObj.thought = stepObj.thought
+          ? `${stepObj.thought}\n${normalized}`
+          : normalized
+        syncStreamState()
+        return
+      }
+
+      // ── tool_call_start：添加 pending 工具条目 ────────────
+      if (evType === 'tool_call_start') {
+        const toolName = (data.tool_name ?? '').replace(/^[🔧\s]+/u, '').trim()
+        const stepNo = data.step ?? 1
+        const args = data.args ?? data.tool_args ?? {}
+        if (!toolName || toolName === 'Thought' || toolName === 'Finish') return
+        const stepObj = getOrCreateStep(aiMsg, stepNo)
+        stepObj.tools.push({
+          name: toolName,
+          args: Object.keys(args).length ? args : {},
+          result: null,
+          observation: null,
+          observationIsJson: false,
+          _pending: true,
+        })
         messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
         streamingMsg.value = messages.value[aiMsgIndex]
         scrollToBottom()
+        return
+      }
 
-      // ========== 旧版 HelloAgents 官方事件格式（向后兼容） ==========
-      } else if (evType === 'llm_chunk') {
-        // llm_chunk 是中间流式片段，不写入聊天框正文。
-        // 正文内容统一由 agent_finish 的 result 决定，确保用户看到的是最终完整回答。
-        const _chunk = stripDsmlBlocks(data.chunk ?? data.content ?? '')
-        if (_chunk && !receivedFirstDelta && aiMsg.thinking.length > 0) {
-          aiMsg.thinkingOpen = false
-          receivedFirstDelta = true
-          messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
-          streamingMsg.value = messages.value[aiMsgIndex]
-        }
-      } else if (evType === 'agent_finish') {
-        const rawResult = data.result ?? ''
-        // agent_finish.result 是最终完整答案，始终以它覆盖聊天框正文
-        // llm_chunk 阶段不再写入聊天框，这里直接赋值即可
-        aiMsg.content = stripDsmlBlocks(rawResult).trim()
-        aiMsg.duration_ms = data.duration_ms ?? (Date.now() - (aiMsg._startTs || Date.now()))
-        // ✅ 优先使用后端 agent_finish 中汇总的完整 thinking_steps
-        // 复用 normalizeThinkingFromDb 同一套规范化逻辑（兼容旧格式 + 补齐 args/result/observation）
-        const normalizeThinkingSteps = (steps) => {
-          if (!Array.isArray(steps)) return []
-          return steps.map(step => {
-            if ((step.action || step.toolArgs) && (!step.tools || !step.tools.length)) {
-              const obs = step.observation ?? step.result ?? null
-              const obsStr = obs != null ? String(obs) : null
-              const convertedTools = step.action ? [{
-                name: step.action,
-                args: step.toolArgs && Object.keys(step.toolArgs).length ? step.toolArgs : {},
-                result: obsStr,
-                observation: obsStr,
-                observationIsJson: obsStr ? isObsJson(obsStr) : false,
-              }] : []
-              return { ...step, tools: convertedTools, action: undefined, toolArgs: undefined, observation: undefined }
-            }
-            return {
-              ...step,
-              tools: Array.isArray(step.tools)
-                ? step.tools.map(t => ({
-                    ...t,
-                    args: t.args && Object.keys(t.args).length ? t.args : (t.toolArgs && Object.keys(t.toolArgs).length ? t.toolArgs : {}),
-                    result: t.result ?? t.observation ?? null,
-                    observation: t.observation ?? t.result ?? null,
-                  }))
-                : [],
-            }
-          })
-        }
-        if (Array.isArray(data.thinking) && data.thinking.length > 0) {
-          // 清理后端写入的 🔧 前缀（前端模板自带图标，避免双重图标）
-          const cleanToolName = (n) => typeof n === 'string' ? n.replace(/^[🔧\s]+/, '').trim() : (n || '')
-          const normalizedSteps = normalizeThinkingSteps(data.thinking)
-          aiMsg.thinking = normalizedSteps.map((step, idx) => ({
-            ...step,
-            // 优先用后端传来的 __step，否则按数组下标+1分配；确保不为 0
-            __step: (step.__step && step.__step !== 'pending') ? step.__step : (idx + 1),
-            tools: Array.isArray(step.tools)
-              ? step.tools.map(t => ({ ...t, name: cleanToolName(t.name) }))
-              : [],
-          }))
-        } else if (aiMsg.thinking.length > 0) {
-          // 降级：保留流式过程中已建好的 thinking 步骤
-          // 把残留的 pending 临时步升级为正式步（而不是直接丢弃，避免丢失工具调用记录）
-          const pendingIdx = aiMsg.thinking.findIndex(s => s.__step === 'pending')
-          if (pendingIdx !== -1) {
-            const existingNums = aiMsg.thinking
-              .filter((s, i) => i !== pendingIdx && typeof s.__step === 'number')
-              .map(s => s.__step)
-            aiMsg.thinking[pendingIdx].__step = existingNums.length > 0 ? Math.max(...existingNums) + 1 : 1
-          }
-          aiMsg.thinking = aiMsg.thinking.filter(s => s.__step !== 'pending')
-        } else if (Object.keys(currentStep).length > 0 && (currentStep.thought || currentStep.action)) {
-          // 最后降级：用 currentStep
-          const last = aiMsg.thinking[aiMsg.thinking.length - 1]
-          if (last?.thought && !last?.action) {
-            Object.assign(last, { ...currentStep })
-          } else {
-            aiMsg.thinking.push({ ...currentStep })
-          }
-        }
-        messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
-        streamingMsg.value = messages.value[aiMsgIndex]
-      } else if (evType === 'step_start') {
-        currentStep = {}
-      } else if (evType === 'thinking') {
-        // 兼容两种格式：自定义协议用 chunk，hello_agents 官方用 content
-        const content = data.chunk ?? data.content ?? ''
-        if (content) {
-          currentStep.thought = normalizeThoughtForStep(content)
-          currentStep.isReasoning = true
-        }
-      } else if (evType === 'tool_call_start') {
-        // 清理后端写入的 🔧 前缀，前端模板自带图标避免双重显示
-        const toolName = (data.tool_name ?? '').replace(/^🔧\s*/u, '').trim()
-        const toolArgs = data.tool_args ?? {}
-        if (toolName && toolName !== 'Thought' && toolName !== 'Finish') {
-          // 如果当前 pending 步已经有工具且最新已知步号更大，说明进入新步骤。
-          // 把旧 pending 步升级为正式步，再新建 pending 步，避免不同步骤的工具混在同一排。
-          const existingPending = aiMsg.thinking.find(s => s.__step === 'pending')
-          if (existingPending && existingPending.tools && existingPending.tools.length > 0 && _lastKnownStepNo > 0) {
-            // 检查所有旧 pending 工具是否都已完成（_pending===false）
-            const allDone = existingPending.tools.every(t => !t._pending)
-            if (allDone) {
-              // 旧步所有工具已完成，安全升级为正式步
-              promotePendingStep(aiMsg, _lastKnownStepNo + 1)
-            }
-          }
-
-          const toolEntry = {
-            name: toolName,
-            args: Object.keys(toolArgs).length ? toolArgs : {},
-            result: null,
-            observationIsJson: false,
-            _pending: true,
-          }
-          // 用单调递增计数器作为唯一 key，避免同名工具多次调用时混淆
-          const callKey = `${toolName}__${_toolCallCounter++}`
-          pendingToolsMap.set(callKey, toolEntry)
-
-          // 找或创建 pending 临时步（__step: 'pending'）供实时展示
-          let pendingStep = aiMsg.thinking.find(s => s.__step === 'pending')
-          if (!pendingStep) {
-            pendingStep = { __step: 'pending', thought: '', tools: [] }
-            aiMsg.thinking.push(pendingStep)
-          }
-          pendingStep.tools.push(toolEntry)
-          messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
-          streamingMsg.value = messages.value[aiMsgIndex]
-          scrollToBottom()
-          // 保留 currentStep 兼容旧路径
-          currentStep.pendingAction = `🔧 ${toolName}`
-          currentStep.pendingArgs = Object.keys(toolArgs).length ? toolArgs : null
-        }
-      } else if (evType === 'tool_call_finish') {
-        // 清理后端写入的 🔧 前缀，前端模板自带图标避免双重显示
-        const toolName = (data.tool_name ?? '').replace(/^🔧\s*/u, '').trim()
+      // ── tool_call_finish：填充工具结果 ────────────────────
+      if (evType === 'tool_call_finish') {
+        const toolName = (data.tool_name ?? '').replace(/^[🔧\s]+/u, '').trim()
+        const stepNo = data.step ?? 1
         const result = data.result ?? ''
-        const toolArgs = data.tool_args ?? {}
+        const args = data.args ?? data.tool_args ?? {}
 
+        // Thought 工具：把推理写入步骤 thought 字段
         if (toolName === 'Thought') {
-          // Thought 工具：把推理内容写入 pending 步（与普通工具同属一步）
           let thought = String(result)
           for (const p of ['已记录推理过程:', '推理:']) {
             if (thought.startsWith(p)) { thought = thought.slice(p.length).trim(); break }
           }
-          const normalizedThought = normalizeThoughtForStep(thought)
-          // 找 pending 步（工具调用所在的步），没有则取最后一步，保证推理和工具在同一步
-          let targetStep = aiMsg.thinking.find(s => s.__step === 'pending')
-          if (!targetStep) {
-            targetStep = aiMsg.thinking[aiMsg.thinking.length - 1]
-          }
-          if (!targetStep) {
-            targetStep = { __step: 'pending', thought: '', tools: [] }
-            aiMsg.thinking.push(targetStep)
-          }
-          targetStep.thought = targetStep.thought
-            ? `${targetStep.thought}\n${normalizedThought}`
-            : normalizedThought
-        } else if (toolName === 'Finish') {
-          // 单步直接 Finish：无 Thought 时也显示一步
-          if (aiMsg.thinking.length === 0 && result) {
-            aiMsg.thinking.push({
-              __step: 1, thought: '', tools: [],
-              action: '📝 输出',
-              observation: result.length > 300 ? result.slice(0, 300) + '…' : result
-            })
-            messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
-            streamingMsg.value = messages.value[aiMsgIndex]
-            scrollToBottom()
-          }
-        } else {
-          const obs = String(result)
-          // ✅ 从 SSE 事件中读取工具的 step 信息（后端已在 _execute_tools_async_stream 中设置）
-          const toolStep = data.step ?? null
-          
-          // 从 pendingToolsMap 按 FIFO 顺序取出最早匹配此工具名的占位条目
-          // key 格式为 "toolName__callIndex"，按插入顺序遍历 Map 取第一个匹配的
-          let pendingEntry = null
-          let pendingKey = null
-          for (const [k, v] of pendingToolsMap.entries()) {
-            if (k.startsWith(toolName + '__')) {
-              pendingEntry = v
-              pendingKey = k
-              break
-            }
-          }
-          if (pendingKey) pendingToolsMap.delete(pendingKey)
-
-          if (pendingEntry) {
-            // 原地更新占位条目（它已经在 pendingStep.tools 里）
-            pendingEntry.result = obs
-            pendingEntry.observation = obs
-            pendingEntry.observationIsJson = isObsJson(obs)
-            pendingEntry._pending = false
-            // ✅ 记录工具所属的步号，供后续步骤分配使用
-            if (toolStep !== null) {
-              pendingEntry.step = toolStep
-              _lastKnownStepNo = Math.max(_lastKnownStepNo, toolStep)
-            }
-            if (Object.keys(toolArgs || {}).length && !Object.keys(pendingEntry.args || {}).length) {
-              pendingEntry.args = toolArgs
-            }
-            // 不在此处把 pendingStep 转为正式步：
-            // 多工具并发时每个工具完成都会触发此分支，过早转步会把后续工具推入新 pending 步，
-            // 导致一个逻辑步被拆成多个步（步数翻倍、工具丢失）。
-            // 正确的做法：保留 pending 状态直到 agent_finish，由后端汇总的 thinking 覆盖。
-          } else {
-            // 没有对应的 start 占位（旧协议只发 finish），追加到 pending 步或新建
-            let pendingStep = aiMsg.thinking.find(s => s.__step === 'pending')
-            if (!pendingStep) {
-              pendingStep = { __step: 'pending', thought: '', tools: [] }
-              aiMsg.thinking.push(pendingStep)
-            }
-            pendingStep.tools.push({
-              name: toolName,
-              args: Object.keys(toolArgs || {}).length ? toolArgs : {},
-              result: obs,
-              observation: obs,
-              observationIsJson: isObsJson(obs),
-            })
-            // 旧协议没有 start 事件：工具直接完成，同样保留 pending 状态等 agent_finish 归并
-          }
+          const stepObj = getOrCreateStep(aiMsg, stepNo)
+          const normalized = normalizeThoughtForStep(thought)
+          stepObj.thought = stepObj.thought
+            ? `${stepObj.thought}\n${normalized}`
+            : normalized
+          messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
+          streamingMsg.value = messages.value[aiMsgIndex]
+          return
         }
 
+        // Finish 工具：不展示在工具列表里，正文由 agent_finish 负责
+        if (toolName === 'Finish') return
+
+        // 普通工具：找到 pending 条目并填充结果
+        const obs = String(result)
+        const stepObj = getOrCreateStep(aiMsg, stepNo)
+        let target = stepObj.tools.find(t => t.name === toolName && t.result == null)
+        if (!target) {
+          // 没有 start 事件（旧版），直接追加
+          target = {
+            name: toolName,
+            args: Object.keys(args).length ? args : {},
+            result: null, observation: null, observationIsJson: false,
+          }
+          stepObj.tools.push(target)
+        }
+        // get_question_detail 的结果由步骤观察区展示，submit_answer 结果需保存供评分卡片渲染
+        const SILENT_TOOLS = ['get_question_detail']
+        if (!SILENT_TOOLS.includes(toolName)) {
+          target.result = obs
+          target.observation = obs
+          target.observationIsJson = isObsJson(obs)
+        }
+        target._pending = false
+        if (Object.keys(args).length && !Object.keys(target.args ?? {}).length) {
+          target.args = args
+        }
         messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
         streamingMsg.value = messages.value[aiMsgIndex]
-        scrollToBottom()
-      } else if (evType === 'error' || (payload && 'error' in payload && payload.error)) {
-        const errMsg = data.error ?? payload?.error ?? '未知错误'
-        aiMsg.content = `⚠️ ${errMsg}`
-        aiMsg.streaming = false
-        messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
-        streamingMsg.value = messages.value[aiMsgIndex]
+        // 工具调用时不自动滚动，保持用户视图稳定
       }
-      chatStore.syncMessages(messages.value)
+
+      // ── step_finish：忽略（步骤已完整）─────────────────────
+      if (evType === 'step_finish') {
+        return
+      }
+
+      // ── agent_finish：设置最终答案 + thinking_steps ────────
+      if (evType === 'agent_finish') {
+        // 清空 DSML 跨 chunk 缓冲区（丢弃未完整的 DSML 前缀）
+        dsmlPendingBuf = ''
+        const finalResult = sanitizeDisplayText(data.result ?? '')
+        // 只在 finalResult 非空时才覆盖；若是通用兜底道歉且已有有效流式内容，则保留流式正文
+        const isGenericApology = /抱歉，我无法回答这个问题/.test(finalResult)
+        const hasUsefulStreamContent = (aiMsg.content || '').trim().length > 20
+        if (finalResult && !(isGenericApology && hasUsefulStreamContent)) {
+          aiMsg.content = finalResult
+        }
+        aiMsg.duration_ms = data.duration_ms ?? (Date.now() - (aiMsg._startTs ?? Date.now()))
+
+        // 优先使用后端汇总的 thinking_steps（比流式增量更完整）
+        if (Array.isArray(data.thinking) && data.thinking.length > 0) {
+          const cleanName = (n) => typeof n === 'string' ? n.replace(/^[🔧\s]+/u, '').trim() : (n || '')
+          aiMsg.thinking = data.thinking.map((step, idx) => ({
+            ...step,
+            __step: (step.__step && step.__step !== 'pending') ? step.__step : (idx + 1),
+            tools: Array.isArray(step.tools)
+              ? step.tools.map(t => ({
+                  ...t,
+                  name: cleanName(t.name),
+                  result: t.result ?? t.observation ?? null,
+                  observation: t.observation ?? t.result ?? null,
+                  observationIsJson: isObsJson(t.result ?? t.observation ?? ''),
+                }))
+              : [],
+          }))
+        }
+        // 流式结束后保留当前展开状态，不强制重新展开
+        messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
+        streamingMsg.value = messages.value[aiMsgIndex]
+        syncStreamState(true)
+        shouldStopStream = true
+        return
+      }
+
+      // ── error：显示错误消息 ───────────────────────────────
+      if (evType === 'error' || data.error) {
+        const errMsg = data.error ?? '未知错误'
+        const toolError = data.tool_error ? `\n\n**技术细节**: ${data.tool_error}` : ''
+        aiMsg.content = `⚠️ **错误**\n\n${errMsg}${toolError}`
+        aiMsg.streaming = false
+        aiMsg.isError = true  // 标记为错误消息
+        messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
+        streamingMsg.value = messages.value[aiMsgIndex]
+        syncStreamState(true)
+        console.error(`[错误事件] ${errMsg}`)
+        shouldStopStream = true
+        return
+      }
     }
 
     let eventCount = 0
@@ -1268,7 +1248,18 @@ const send = async () => {
     
     try {
       while (true) {
-        const { done, value } = await reader.read()
+        const readWithTimeout = Promise.race([
+          reader.read(),
+          new Promise((resolve) => {
+            setTimeout(() => resolve({ done: true, value: undefined, _timeout: true }), STREAM_READ_TIMEOUT_MS)
+          }),
+        ])
+        const { done, value, _timeout } = await readWithTimeout
+        if (_timeout) {
+          console.warn(`[SSE] 读取超时 ${STREAM_READ_TIMEOUT_MS}ms，执行前端收尾`)
+          streamEndedByTimeout = true
+          break
+        }
         if (done) {
           console.log(`[SSE流完成] 共接收 ${eventCount} 个事件`)
           break
@@ -1279,8 +1270,8 @@ const send = async () => {
         buffer += chunk
         console.log(`[SSE接收] 块大小=${chunk.length}字节, 缓冲区=${buffer.length}字节`)
         
-        // 按 \n\n 分割 SSE 事件
-        const lines = buffer.split('\n\n')
+        // 兼容 LF/CRLF 的 SSE 分隔符
+        const lines = buffer.split(/\r?\n\r?\n/)
         
         // 保留最后一个不完整的块在缓冲区
         buffer = lines.pop() || ''
@@ -1293,7 +1284,7 @@ const send = async () => {
           let dataLine = ''
           
           // 解析 SSE 格式: event: xxx\ndata: {...}
-          for (const line of eventBlock.split('\n')) {
+          for (const line of eventBlock.split(/\r?\n/)) {
             const trimmed = line.trim()
             if (trimmed.startsWith('event: ')) {
               eventType = trimmed.slice(7)
@@ -1311,25 +1302,52 @@ const send = async () => {
             }
             
             eventCount++
-            console.log(`[SSE事件 #${eventCount}] type=${payload.type}, data=`, payload.data)
             
             // 处理事件
             handleEvent(payload)
             
-            // 使用 requestAnimationFrame 确保 DOM 实时更新（不阻塞）
-            requestAnimationFrame(() => {
-              scrollToBottom()
-            })
-            
-            // 限制日志频率，避免控制台刷屏
+            // 节流滚动：每 150ms 最多触发一次，避免每个 chunk 都重排
             const now = Date.now()
-            if (now - lastUpdateTime > 100) {
+            if (now - lastUpdateTime > 150) {
               lastUpdateTime = now
+              // 流式过程中不自动滚动，保持用户视图稳定
             }
           } catch (parseErr) {
             console.warn(`[SSE解析失败] 事件#${eventCount}:`, parseErr, 'data:', dataLine)
           }
         }
+        if (shouldStopStream) {
+          try { await reader.cancel('terminal_event_received') } catch (_) {}
+          break
+        }
+      }
+      // done 时可能剩余最后一个未被空行终止的事件块，主动再解析一次
+      if (buffer.trim()) {
+        let eventType = ''
+        let dataLine = ''
+        for (const line of buffer.split(/\r?\n/)) {
+          const trimmed = line.trim()
+          if (trimmed.startsWith('event: ')) {
+            eventType = trimmed.slice(7)
+          } else if (trimmed.startsWith('data: ')) {
+            dataLine = trimmed.slice(6)
+          }
+        }
+        if (dataLine) {
+          try {
+            const payload = JSON.parse(dataLine)
+            if (!payload.type && eventType) payload.type = eventType
+            eventCount++
+            handleEvent(payload)
+          } catch (tailErr) {
+            console.warn('[SSE尾包解析失败]:', tailErr, 'data:', dataLine)
+          }
+        }
+      }
+      if (streamEndedByTimeout) {
+        ElMessage.warning('本次流式响应超时，已自动结束')
+      } else {
+        ElMessage.success('本次流式响应已正常结束')
       }
     } catch (streamErr) {
       console.error(`[SSE流错误]:`, streamErr)
@@ -1343,16 +1361,14 @@ const send = async () => {
         if (finalMsg.duration_ms == null && finalMsg._startTs) {
           finalMsg.duration_ms = Date.now() - finalMsg._startTs
         }
-        // 当前回复的推理过程默认展开，避免用户看到的是上一轮消息的步骤（前后一致）
-        if (finalMsg.thinking?.length > 0) {
-          finalMsg.thinkingOpen = true
-        }
+        // 流式结束后保持思考块当前展开状态（流式过程中已自动折叠），不强制重新展开
         messages.value.splice(aiMsgIndex, 1, { ...finalMsg })
         console.log(`[SSE] 消息状态已更新为 completed，消息ID: ${finalMsg.id}`)
       }
       streamingMsg.value = null
       chatStore.finishStream(messages.value)
-      scrollToBottom()
+      // 流式完成后滚动到消息顶部
+      scrollToLatestMessageTop()
     }
 
   } catch (err) {
@@ -1388,7 +1404,8 @@ const send = async () => {
           thinking: d.thinking || [],
           thinkingOpen: false,
         })
-        scrollToBottom()
+        // 降级接口完成后滚动到消息顶部
+        scrollToLatestMessageTop()
       } catch (e2) {
         messages.value = messages.value.filter(m => !m.streaming)
         messages.value.push({ role: 'assistant', content: '⚠️ 连接失败，请检查后端是否运行', streaming: false, thinking: [], thinkingOpen: false })
@@ -1404,7 +1421,8 @@ const send = async () => {
     }
     chatStore.finishStream(messages.value)
     abortCtrl = null
-    scrollToBottom()
+    // 最后滚动到消息顶部
+    scrollToLatestMessageTop()
   }
 }
 
@@ -1705,6 +1723,41 @@ onUnmounted(() => {
   border-radius: 4px; overflow-x: auto; font-family: 'Consolas', monospace;
   font-size: 10.5px; white-space: pre-wrap; word-break: break-all;
 }
+.args-rich-json {
+  width: 100%;
+}
+.args-kv-wrap {
+  width: 100%;
+  border: 1px solid #dbe3ee;
+  border-radius: 6px;
+  background: #f8fafc;
+  padding: 8px;
+}
+.args-kv-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0;
+  border-bottom: 1px dashed #e2e8f0;
+}
+.args-kv-row:last-child { border-bottom: none; }
+.args-kv-key {
+  font-size: 11px;
+  color: #64748b;
+  font-weight: 600;
+}
+.args-kv-val {
+  font-size: 12px;
+  color: #334155;
+  line-height: 1.55;
+  word-break: break-word;
+}
+.args-kv-val :deep(.katex-display),
+.args-kv-val .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  margin: 6px 0;
+}
 
 /* 工具项头部：工具名 + 状态徽章 */
 .tool-item-header {
@@ -1774,11 +1827,11 @@ onUnmounted(() => {
 
 /* slide 动画 */
 .slide-enter-active, .slide-leave-active {
-  transition: max-height 0.25s ease, opacity 0.2s;
+  transition: max-height 0.35s ease, opacity 0.25s;
   overflow: hidden;
 }
 .slide-enter-from, .slide-leave-to { max-height: 0; opacity: 0; }
-.slide-enter-to, .slide-leave-from { max-height: 1000px; opacity: 1; }
+.slide-enter-to, .slide-leave-from { max-height: 9999px; opacity: 1; }
 
 /* Markdown 内容 */
 .md-content :deep(h1), .md-content :deep(h2), .md-content :deep(h3) {
@@ -2042,6 +2095,75 @@ onUnmounted(() => {
   cursor: not-allowed;
 }
 
+/* ── submit_answer 评分卡片 ── */
+.eval-card {
+  background: #f8faff;
+  border: 1px solid #e0e8ff;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.eval-score-row {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+.eval-score-label {
+  font-size: 13px;
+  color: #64748b;
+  margin-right: 6px;
+}
+.eval-score-value {
+  font-size: 28px;
+  font-weight: 700;
+  color: #4f46e5;
+  line-height: 1;
+}
+.eval-score-unit {
+  font-size: 14px;
+  color: #94a3b8;
+}
+.eval-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.eval-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #374151;
+}
+.eval-section-body {
+  font-size: 13px;
+  color: #4b5563;
+  line-height: 1.6;
+}
+.eval-standard-answer {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.eval-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.eval-list li {
+  font-size: 13px;
+  line-height: 1.5;
+}
+.eval-list-good li { color: #15803d; }
+.eval-list-warn li { color: #b45309; }
+.eval-list-bad  li { color: #b91c1c; }
+
 /* ── 结构化题目卡片 ── */
 .question-card {
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -2129,5 +2251,27 @@ onUnmounted(() => {
   padding-top: 16px;
   border-top: 1px solid rgba(255, 255, 255, 0.2);
 }
+
+/* 错误消息样式 */
+.msg-content.error {
+  background: linear-gradient(135deg, #fff5f5 0%, #ffe0e0 100%);
+  border-left: 4px solid #dc2626;
+  padding: 12px 14px;
+  border-radius: 8px;
+  color: #7f1d1d;
+}
+
+.msg-content.error :deep(strong) {
+  color: #dc2626;
+  font-weight: 700;
+}
+
+.msg-content.error :deep(code) {
+  background: rgba(220, 38, 38, 0.1);
+  color: #991b1b;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
 </style>
 

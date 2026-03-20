@@ -66,6 +66,7 @@ class TwoStageExtractor:
             base_url=settings.miner_local_base_url,
             temperature=0.3,
             timeout=settings.miner_local_timeout,
+            max_tokens=settings.miner_max_tokens,
         )
 
         # 注册工具（仅 Stage 1 需要）
@@ -91,8 +92,8 @@ class TwoStageExtractor:
             skills_auto_register=True,
             circuit_enabled=True,
             circuit_failure_threshold=3,
-            tool_output_max_lines=500,
-            tool_output_max_bytes=20480,
+            tool_output_max_lines=99999,
+            tool_output_max_bytes=10485760,
             tool_output_dir=f"{_data_dir}/tool-output",
             subagent_enabled=False,
             async_enabled=True,
@@ -162,8 +163,8 @@ class TwoStageExtractor:
 
             self._check_ocr_called()
 
-            # 检测 mark_unrelated 工具调用（LLM 可能只输出自然语言，不含 __UNRELATED__）
-            if UNRELATED_SIGNAL in rough_result or self._check_mark_unrelated_called():
+            # 检测 mark_unrelated 工具调用或 unrelated 对象输出
+            if UNRELATED_SIGNAL in rough_result or self._check_mark_unrelated_called() or self._is_unrelated_object(rough_result):
                 logger.info("[TwoStageExtractor] Stage 1 判定为无关帖子")
                 return UNRELATED_SIGNAL, self._ocr_called, True
 
@@ -365,7 +366,7 @@ class TwoStageExtractor:
 
             record = {
                 "ts": datetime.now().isoformat(),
-                "content_preview": content[:500] + ("..." if len(content) > 500 else ""),
+                "content_preview": content,
                 "title": post_title or "",
                 "source_url": source_url or "",
                 "stage1_output": stage1_output,
@@ -412,6 +413,50 @@ class TwoStageExtractor:
                                 continue
         except Exception:
             pass
+        return False
+
+    @staticmethod
+    def _is_unrelated_object(text: str) -> bool:
+        """检查是否输出了 unrelated 对象 {"status":"unrelated",...}"""
+        import re
+        
+        stripped = text.strip()
+        # 尝试直接解析
+        if stripped.startswith('{') and stripped.endswith('}'):
+            try:
+                obj = json.loads(stripped)
+                if isinstance(obj, dict) and obj.get('status') == 'unrelated':
+                    return True
+            except json.JSONDecodeError:
+                pass
+        
+        # 尝试从文本中提取 {...} 对象
+        for m in re.finditer(r'\{', stripped):
+            start = m.start()
+            depth, i, in_str, escape = 0, start, None, False
+            while i < len(stripped):
+                c = stripped[i]
+                if in_str:
+                    escape = not escape and c == '\\'
+                    if not escape and c == in_str:
+                        in_str = None
+                elif c in ('"', "'"):
+                    in_str = c
+                elif c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        candidate = stripped[start:i + 1]
+                        try:
+                            obj = json.loads(candidate)
+                            if isinstance(obj, dict) and obj.get('status') == 'unrelated':
+                                return True
+                        except json.JSONDecodeError:
+                            pass
+                        break
+                i += 1
+        
         return False
 
     def _check_ocr_called(self):

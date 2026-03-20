@@ -83,8 +83,8 @@ try:
 
     _loguru_logger.remove()
 
-    # 统一的日志格式：完整日期时间 | 级别（7字符宽） | 消息
-    _log_format = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <7}</level> | <level>{message}</level>"
+    # 统一的日志格式：完整日期时间 | 级别（7字符宽） | 文件:行号 | 消息
+    _log_format = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <7}</level> | <cyan>{name}</cyan>:<cyan>{line}</cyan> | <level>{message}</level>"
 
     # 多进程模式：只在主进程输出到终端，避免重复打印
     # uvicorn多进程模式下，worker进程会设置 UVICORN_WORKER_ID 环境变量
@@ -457,11 +457,16 @@ def _print_agent_llm_config():
 
     logger.info("  " + "─" * 56)
 
-    # Miner Agent
-
-    mm = s.llm_model_id  # Miner 使用全局模型
-
-    logger.info(f"  [Miner Agent] model={mm}, temperature={s.miner_temperature}, max_tokens={s.miner_max_tokens}, base={s.llm_base_url or '(同全局)'}")
+    # Miner Agent（two_stage 时 Stage1 用本地模型，Stage2 用专项配置）
+    if s.miner_mode == "two_stage":
+        mm_stage1 = s.miner_local_model or s.llm_local_model or "(未设置)"
+        mm_stage2 = s.miner_stage2_model or "(未设置)"
+        logger.info(f"  [Miner Agent] mode=two_stage")
+        logger.info(f"    Stage1(本地): model={mm_stage1}, base={s.miner_local_base_url or s.llm_local_base_url}")
+        logger.info(f"    Stage2(精加工): model={mm_stage2}, base={s.miner_stage2_base_url or '(未设置)'}")
+    else:
+        mm = s.miner_model or s.llm_model_id or "(未设置)"
+        logger.info(f"  [Miner Agent] mode={s.miner_mode}, model={mm}, temperature={s.miner_temperature}, max_tokens={s.miner_max_tokens}, base={s.miner_base_url or s.llm_base_url or '(同全局)'}")
 
     # Interviewer Agent
 
@@ -482,12 +487,25 @@ async def startup_event():
     """FastAPI 启动时启动后台调度器，并可选预热 LLM"""
     from backend.config.config import settings as _s
     from backend.services.crawler.question_extractor import _print_miner_config_once
+    from backend.services.storage import sqlite_service
+    from backend.services.stage2_processor import run_stage2_processor_now
 
     _print_miner_config_once()
     _print_agent_llm_config()
     crawl_scheduler.start()
     _src = getattr(_s, "crawler_source", "local")
     logger.info(f"爬虫调度器已启动 | 牛客抓取来源={_src}")
+
+    # Stage2 恢复补跑：后端重启后，优先处理上次遗留的 pending/in_progress
+    # （即使不足 batch_size，也会 lease 并按实际数量处理）
+    try:
+        if sqlite_service.get_stage2_queue_count() > 0:
+            logger.info("[Startup] Stage2 队列存在遗留任务，后台补跑 Stage2 ...")
+            # 强制恢复 in_progress：通常表示“上次后端已不存在”，应立即回到 pending 供处理
+            sqlite_service.recover_stale_stage2_pending(0)
+            asyncio.create_task(asyncio.to_thread(run_stage2_processor_now))
+    except Exception:
+        logger.warning("[Startup] Stage2 补跑失败（不影响主服务启动）", exc_info=True)
 
     # 同步预热 LLM，确保首次请求不因冷启动超时
     if _s.llm_warmup_enabled and _s.llm_base_url:
@@ -563,61 +581,212 @@ def _strip_internal_markers_for_display(content: str) -> str:
     return re.sub(r'【q_id:[^\】]+】', '', content).replace('  ', ' ').strip()
 
 
-@app.get("/api/user/{user_id}/chat/history")
 
-def get_chat_history(user_id: str):
-    """获取用户最近一次对话历史，用于前端打开时自动加载"""
-    from datetime import datetime
-    import time
+def _normalize_thinking_for_frontend(thinking_raw) -> list:
+    """
+    将 DB 存储的 thinking 数据规范化为前端期望的格式：
+      [{__step, thought, tools:[{name,args,result,observation,observationIsJson}]}]
+    兼容旧格式（带 🔧 前缀、用 observation 字段、缺少 result 等）
+    """
+    import json as _json
 
-    fixed_session_id = "sess_" + user_id
-    session = sqlite_service.get_session(fixed_session_id)
-    if not session or session.get("user_id") != user_id:
-        session = sqlite_service.get_latest_session_for_user(user_id)
-    if not session:
-        return {"session_id": None, "messages": []}
-    history = session.get("conversation_history") or []
-    
-    # 转为前端格式 [{role, content, timestamp}]
-    messages = []
-    base_time = time.time()
-    
-    for idx, m in enumerate(history):
-        if m.get("content"):
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            # 用户消息：只展示用户实际输入，不展示 [系统][Task][Output] 等后端格式；移除【q_id:xxx】等内部标记
-            if role == "user":
-                content = _extract_user_display_content(content)
-                content = _strip_internal_markers_for_display(content)
-            
-            timestamp = m.get("timestamp") or m.get("ts")
-            if not timestamp:
-                # 为历史消息生成近似时间戳，避免前端时间丢失
-                timestamp = datetime.fromtimestamp(base_time - (len(history) - idx) * 60).isoformat()
-            
-            msg = {
-                "role": role,
-                "content": content,
-                "timestamp": timestamp
-            }
-            if role == "assistant":
-                if m.get("thinking"):
-                    msg["thinking"] = m["thinking"]
-                if m.get("duration_ms") is not None:
-                    msg["duration_ms"] = m["duration_ms"]
-            messages.append(msg)
-    
-    return {"session_id": session["session_id"], "messages": messages}
+    def _is_json(s):
+        if not s or not isinstance(s, str):
+            return False
+        s = s.strip()
+        if not (s.startswith("{") or s.startswith("[")):
+            return False
+        try:
+            _json.loads(s)
+            return True
+        except Exception:
+            return False
+
+    if not isinstance(thinking_raw, list):
+        return []
+    result = []
+    for idx, step in enumerate(thinking_raw):
+        if not isinstance(step, dict):
+            continue
+        raw_tools = step.get("tools") or []
+        tools = []
+        for t in raw_tools:
+            if not isinstance(t, dict):
+                continue
+            name = t.get("name", "") or ""
+            # 去除 🔧 及各种 emoji 前缀
+            name = name.strip()
+            for prefix in ["🔧 ", "🔧", "\U0001f527 ", "\U0001f527"]:
+                if name.startswith(prefix):
+                    name = name[len(prefix):].strip()
+            obs = t.get("result") or t.get("observation") or ""
+            obs_str = str(obs) if obs else ""
+            tools.append({
+                "name": name,
+                "args": t.get("args") or {},
+                "result": obs_str,
+                "observation": obs_str,
+                "observationIsJson": _is_json(obs_str),
+            })
+        # 兼容旧格式：step.action + step.toolArgs + step.observation
+        if not tools and step.get("action"):
+            obs = step.get("observation") or step.get("result") or ""
+            obs_str = str(obs) if obs else ""
+            action_name = str(step.get("action", "")).replace("🔧", "").strip()
+            tools.append({
+                "name": action_name,
+                "args": step.get("toolArgs") or {},
+                "result": obs_str,
+                "observation": obs_str,
+                "observationIsJson": _is_json(obs_str),
+            })
+        # 兼容更旧/不完整格式：只有 step.thought + step.observation/result，但没有 tools/action
+        # 这种情况下前端只能展示推理，不会展示“工具调用”块；这里补一个占位工具让 UI 可展开显示。
+        if not tools:
+            obs = step.get("observation") or step.get("result") or ""
+            obs_str = str(obs) if obs else ""
+            if obs_str.strip():
+                tools.append({
+                    "name": "（占位）工具",
+                    "args": {},
+                    "result": obs_str,
+                    "observation": obs_str,
+                    "observationIsJson": _is_json(obs_str),
+                })
+        result.append({
+            "__step": step.get("__step", idx + 1),
+            "thought": step.get("thought", ""),
+            "tools": tools,
+        })
+    return result
 
 
-@app.post("/api/user/{user_id}/chat/clear")
-def clear_chat_session(user_id: str):
-    """清空用户 sess_{user_id} 的 conversation_history"""
-    fixed_session_id = "sess_" + user_id
-    sqlite_service.clear_conversation_history(fixed_session_id, user_id)
-    return {"ok": True, "session_id": fixed_session_id}
+def _parse_iso_dt(v):
+    from datetime import datetime as _dt
+    if not v or not isinstance(v, str):
+        return None
+    s = v.strip()
+    if not s:
+        return None
+    try:
+        d = _dt.fromisoformat(s.replace("Z", "+00:00"))
+        if d.tzinfo is not None:
+            d = d.astimezone().replace(tzinfo=None)
+        return d
+    except Exception:
+        return None
 
+
+def _load_tool_logs_for_user_session(user_id: str, session_id: str):
+    import json as _json
+    from pathlib import Path as _Path
+    root = _Path(__file__).resolve().parent / "interviewer_logs"
+    if not root.exists():
+        return []
+    items = []
+    for p in root.rglob("tools_*.jsonl"):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = _json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("user_id") != user_id or rec.get("session_id") != session_id:
+                        continue
+                    ts = _parse_iso_dt(rec.get("timestamp"))
+                    if ts is None:
+                        continue
+                    items.append({
+                        "ts": ts,
+                        "name": str(rec.get("tool_name") or "").strip() or "（占位）工具",
+                        "args": rec.get("tool_input") if isinstance(rec.get("tool_input"), dict) else {},
+                        "result": str(rec.get("tool_output") or ""),
+                    })
+        except Exception:
+            continue
+    items.sort(key=lambda x: x["ts"])
+    return items
+
+
+def _attach_placeholder_tools_from_logs(messages: list, user_id: str, session_id: str):
+    """
+    当 assistant 缺失 thinking 时，按时间窗口将 tools_*.jsonl 工具调用补成占位步骤。
+    仅用于历史展示，不回写数据库。
+    """
+    if not messages:
+        return
+    tool_logs = _load_tool_logs_for_user_session(user_id, session_id)
+    if not tool_logs:
+        return
+
+    used = set()
+    for i, m in enumerate(messages):
+        if m.get("role") != "assistant":
+            continue
+        if m.get("thinking"):
+            continue
+        asst_ts = _parse_iso_dt(m.get("timestamp"))
+        if asst_ts is None:
+            continue
+
+        prev_user_ts = None
+        for j in range(i - 1, -1, -1):
+            if messages[j].get("role") == "user":
+                prev_user_ts = _parse_iso_dt(messages[j].get("timestamp"))
+                break
+        next_user_ts = None
+        for j in range(i + 1, len(messages)):
+            if messages[j].get("role") == "user":
+                next_user_ts = _parse_iso_dt(messages[j].get("timestamp"))
+                break
+
+        picked_idx = []
+        for ti, t in enumerate(tool_logs):
+            if ti in used:
+                continue
+            tts = t["ts"]
+            if prev_user_ts and tts < prev_user_ts:
+                continue
+            if next_user_ts and tts >= next_user_ts:
+                continue
+            # 允许 assistant 时间后 90 秒内到达，覆盖异步刷库延迟
+            if tts > asst_ts:
+                delta = (tts - asst_ts).total_seconds()
+                if delta > 90:
+                    continue
+            picked_idx.append(ti)
+
+        if not picked_idx:
+            continue
+
+        tools = []
+        for ti in picked_idx:
+            t = tool_logs[ti]
+            obs = t["result"] or ""
+            obs_is_json = False
+            s = obs.strip()
+            if s.startswith("{") or s.startswith("["):
+                import json as _json
+                try:
+                    _json.loads(s)
+                    obs_is_json = True
+                except Exception:
+                    pass
+            tools.append({
+                "name": t["name"] or "（占位）工具",
+                "args": t["args"] or {},
+                "result": obs,
+                "observation": obs,
+                "observationIsJson": obs_is_json,
+            })
+            used.add(ti)
+
+        if tools:
+            m["thinking"] = [{"__step": 1, "thought": "", "tools": tools}]
 
 @app.get("/")
 
@@ -1090,7 +1259,7 @@ async def api_chat_stream(req: ChatRequest):
     if _session_id is None:
         _session_id = _settings.default_session_id
     _chat_logger = _logging.getLogger("chat")
-    _chat_logger.info(f"[Stream ←] user={_user_id} | {req.message[:120]}")
+    _chat_logger.info(f"[Stream ←] user={_user_id} | {req.message[:]}")
 
     async def generate():
         for attempt in range(3):
@@ -1155,13 +1324,14 @@ async def api_chat_stream(req: ChatRequest):
 _submit_answer_tasks: Dict[str, Dict[str, Any]] = {}
 
 
+
 @app.post("/api/submit_answer/stream")
 async def api_submit_answer_stream(req: SubmitAnswerRequest):
     """
-    答题提交接口（SSE 流式，Agent 先评分）：
-    将用户答案构造成对话消息，通过 chat_stream 让 Agent 完整执行：
-      submit_answer记录（工具自动评分）→ record_weakness记录薄弱点
-    前端监听 SSE 事件流，与 /api/chat/stream 完全相同的事件格式。
+    答题提交接口（SSE 流式，确定性评分）：
+    直接调用 InterviewerAgent.submit_answer() 确定性方法完成评估、入库、SM-2。
+    不走 ReAct LLM 循环，避免评分不一致和 DSML 泄漏问题。
+    返回两个 SSE 事件：evaluating（进行中）+ eval_result（最终结果）。
     """
     from backend.config.config import settings as _settings
     _uid = (req.user_id or "").strip() or _settings.default_user_id
@@ -1169,32 +1339,45 @@ async def api_submit_answer_stream(req: SubmitAnswerRequest):
     _question_id = (req.question_id or "").strip()
     _question_text = (req.question_text or "").strip()
     _user_answer = (req.user_answer or "").strip()
+    _question_tags = req.question_tags or []
 
-    # 构造包含题目 ID 标记的消息，Agent 会识别为 submit_answer 意图
-    # 格式：「我的答案：{user_answer}\n\n【q_id:{question_id}】」
-    # 这样 Agent 能提取 question_id，并把本轮消息作为 user_answer
-    if _question_id:
-        chat_message = f"{_user_answer}\n\n【q_id:{_question_id}】"
-    else:
-        chat_message = _user_answer
+    if not _question_id or not _user_answer:
+        async def _err_gen():
+            yield json.dumps({"error": "question_id 和 user_answer 不能为空"}, ensure_ascii=False).encode()
+        return StreamingResponse(_err_gen(), media_type="text/event-stream")
 
     async def generate():
+        # 1. 推送「评分中」状态，让前端立即显示 loading
+        yield ("data: " + json.dumps({"type": "evaluating", "message": "正在评分中..."}, ensure_ascii=False) + "\n\n").encode("utf-8")
         try:
-            async for sse_line in orchestrator.chat_stream(
+            # 2. 走确定性评分路径（不走 ReAct 循环）
+            result = await orchestrator.submit_answer(
                 user_id=_uid,
-                message=chat_message,
                 session_id=_session_id,
-            ):
-                if isinstance(sse_line, str):
-                    if not sse_line.endswith('\n\n'):
-                        sse_line += '\n\n'
-                    yield sse_line.encode('utf-8')
-                else:
-                    yield sse_line
+                question_id=_question_id,
+                question_text=_question_text,
+                user_answer=_user_answer,
+                question_tags=_question_tags,
+            )
+            # 3. 推送最终评分结果
+            payload = {
+                "type": "eval_result",
+                "score": result.get("score", 0),
+                "feedback": result.get("feedback", ""),
+                "strong_points": result.get("strong_points", []),
+                "missed_points": result.get("missed_points", []),
+                "error_points": result.get("error_points", []),
+                "shortcomings": result.get("shortcomings", []),
+                "standard_answer": result.get("standard_answer", ""),
+                "explanation": result.get("explanation", ""),
+                "tags": result.get("tags", []),
+            }
+            yield ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
+            logger.info(f"[submit_answer/stream] 确定性评分完成 q={_question_id} score={result.get('score')}")
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[submit_answer/stream] 异常: {err_str[:200]}")
-            yield f"data: {json.dumps({'error': f'⚠️ 评分失败：{err_str[:200]}'}, ensure_ascii=False)}\n\n".encode('utf-8')
+            logger.error(f"[submit_answer/stream] 评分失败: {err_str[:200]}")
+            yield ("data: " + json.dumps({"error": f"⚠️ 评分失败：{err_str[:200]}"}, ensure_ascii=False) + "\n\n").encode("utf-8")
 
     return StreamingResponse(
         generate(),
@@ -1375,6 +1558,28 @@ def get_practice_stats(user_id: str):
     return sqlite_service.get_practice_stats(user_id)
 
 
+@app.get("/api/user/{user_id}/tool-usage")
+def get_user_tool_usage(user_id: str, days: int = Query(365, ge=1, le=3650, description="统计最近 N 天的工具调用")):
+    """统计 Agent 工具调用（运行时实时统计，按 agent 聚合）"""
+    from backend.services.logging.interviewer_tool_usage import get_interviewer_tool_usage as _get_interviewer_tool_usage
+
+    return _get_interviewer_tool_usage(user_id=user_id, days=days)
+
+
+@app.get("/api/user/{user_id}/graph-rag")
+def get_user_graph_rag(
+    user_id: str,
+    max_bank_tags: int = Query(80, ge=20, le=200, description="题库图最多展示的标签节点数"),
+    max_record_questions: int = Query(80, ge=10, le=200, description="做题图最多展示的题目节点数"),
+):
+    """GraphRAG 可视化数据：题库知识图 + 用户做题记录图。"""
+    return sqlite_service.get_graph_rag_data(
+        user_id=user_id,
+        max_bank_tags=max_bank_tags,
+        max_record_questions=max_record_questions,
+    )
+
+
 @app.get("/api/user/{user_id}/questions/{question_id}/study-records")
 def get_question_study_records(
     user_id: str,
@@ -1383,6 +1588,70 @@ def get_question_study_records(
 ):
     """获取某用户对某题的历史作答记录（得分、回答、要点等）"""
     return sqlite_service.get_study_records_by_question(user_id, question_id, limit=limit)
+
+@app.get("/api/user/{user_id}/chat/history")
+def get_chat_history(user_id: str):
+    """获取用户对话历史：优先读取 .env 默认会话，不存在再回退到用户最近一次会话。"""
+    import re as _re
+    from datetime import datetime as _dt, timedelta as _td
+    from backend.config.config import settings as _settings
+    fixed_session_id = _settings.default_session_id
+    session = sqlite_service.get_session(fixed_session_id)
+    if not session or session.get("user_id") != user_id:
+        session = sqlite_service.get_latest_session_for_user(user_id)
+    if not session:
+        return {"messages": [], "session_id": None}
+
+    raw_history = session.get("conversation_history") or []
+    session_id = session.get("session_id")
+
+    messages = []
+    base_time = _dt.now()
+    for msg in raw_history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "") or ""
+        content = msg.get("content", "") or ""
+        if role == "user":
+            # 去掉【q_id:xxx】等内部标记
+            content = _re.sub(r"【q_id:[^】]*】", "", content).strip()
+            # 如果有 [用户消息] 格式，只保留用户部分
+            if "\n[用户消息]\n" in content:
+                content = content.split("\n[用户消息]\n", 1)[-1].strip()
+            elif content.startswith("[系统]"):
+                lines = content.split("\n")
+                content = "\n".join(
+                    l for l in lines
+                    if not l.startswith("[系统]") and not l.startswith("[Task]") and not l.startswith("[Output]")
+                ).strip()
+        if not content and role != "assistant":
+            continue
+        out = {
+            "role": role,
+            "content": content,
+            "timestamp": msg.get("timestamp") or msg.get("ts") or "",
+        }
+        if not out["timestamp"]:
+            out["timestamp"] = (base_time - _td(minutes=max(0, len(raw_history) - len(messages)))).isoformat()
+        if msg.get("thinking"):
+            # 🔧 规范化 thinking 数据，确保格式一致
+            out["thinking"] = _normalize_thinking_for_frontend(msg["thinking"])
+        if msg.get("duration_ms") is not None:
+            out["duration_ms"] = msg["duration_ms"]
+        messages.append(out)
+    # 历史兜底：若 assistant 没有 thinking，则按同时间段 tools 日志补占位工具调用
+    _attach_placeholder_tools_from_logs(messages, user_id=user_id, session_id=session_id or fixed_session_id)
+    return {"messages": messages, "session_id": session_id}
+
+
+@app.post("/api/user/{user_id}/chat/clear")
+def clear_chat_session(user_id: str):
+    """清空 .env 默认会话的 conversation_history"""
+    from backend.config.config import settings as _settings
+    fixed_session_id = _settings.default_session_id
+    sqlite_service.clear_conversation_history(fixed_session_id, user_id)
+    return {"ok": True, "session_id": fixed_session_id}
+
 
 
 # ══════════════════════════════════════════════════════
@@ -1834,7 +2103,7 @@ async def trigger_stage2_process():
     """手动触发 Stage2 批量处理（处理 stage2_pending 队列中剩余项，不足 batch_size 也会处理）"""
     from backend.services.stage2_processor import run_stage2_processor_now
     from backend.services.storage import sqlite_service
-    count = sqlite_service.get_stage2_pending_count()
+    count = sqlite_service.get_stage2_queue_count()
     if count == 0:
         return {"status": "ok", "message": "Stage2 队列为空", "processed": 0}
     await asyncio.to_thread(run_stage2_processor_now)
@@ -1868,10 +2137,11 @@ async def retry_error_posts(batch_size: int | None = Query(default=None, ge=1, l
             "reset": 0,
             "source_info": task_get_source_info(),
         }
-    logger.info(f"[API] 重试失败帖子 重置 {total} 条，启动后台线程")
+    run_mode = getattr(_cfg, "crawler_background_run_mode", "process")
+    logger.info(f"[API] 重试失败帖子 重置 {total} 条，后台模式={run_mode}")
     global _extraction_running, _extraction_initial_by_platform
 
-    def _bg():
+    def _bg_thread():
         global _extraction_running, _extraction_initial_by_platform
         try:
             _extraction_running = True
@@ -1884,10 +2154,26 @@ async def retry_error_posts(batch_size: int | None = Query(default=None, ge=1, l
             _extraction_running = False
             _extraction_initial_by_platform = {}
 
-    import threading
-    _t = threading.Thread(target=_bg, daemon=True)
-    _t.start()
-    logger.info(f"[后台线程] ▶ 启动 重试提取线程 tid={_t.ident} | 重置 {total} 条 | batch_size={batch_size}")
+    if run_mode == "process":
+        import threading
+        _extraction_running = True
+        _extraction_initial_by_platform = initial_by_platform
+        _p = _spawn_process_tasks_worker(batch_size=batch_size, reason="retry-errors")
+
+        def _watch():
+            global _extraction_running, _extraction_initial_by_platform
+            try:
+                _p.wait()
+            finally:
+                _extraction_running = False
+                _extraction_initial_by_platform = {}
+
+        threading.Thread(target=_watch, daemon=True).start()
+    else:
+        import threading
+        _t = threading.Thread(target=_bg_thread, daemon=True)
+        _t.start()
+        logger.info(f"[后台线程] ▶ 启动 重试提取线程 tid={_t.ident} | 重置 {total} 条 | batch_size={batch_size}")
     msg_parts = []
     if to_extract:
         msg_parts.append(f"{to_extract} 条待重新提取")
@@ -1917,14 +2203,15 @@ async def re_extract_all_posts(batch_size: int | None = Query(default=None, ge=1
             "reset": 0,
             "source_info": task_get_source_info(),
         }
-    logger.info(f"[API] 重新提取所有问题 重置 {reset_count} 条，删除 {deleted_questions} 道旧题目，启动后台提取")
+    run_mode = getattr(_cfg, "crawler_background_run_mode", "process")
+    logger.info(f"[API] 重新提取所有问题 重置 {reset_count} 条，删除 {deleted_questions} 道旧题目，后台模式={run_mode}")
     global _extraction_running, _extraction_initial_by_platform
     from backend.services.crawler import question_extractor
     _run_suffix = now_beijing_str("%Y%m%d_%H%M%S")
     question_extractor._llm_log_run_suffix = _run_suffix
     logger.info(f"[API] 重新提取 LLM 日志将写入: llm_prompt_log_{_run_suffix}.jsonl")
 
-    def _bg():
+    def _bg_thread():
         global _extraction_running, _extraction_initial_by_platform
         try:
             _extraction_running = True
@@ -1938,8 +2225,25 @@ async def re_extract_all_posts(batch_size: int | None = Query(default=None, ge=1
             _extraction_initial_by_platform = {}
             question_extractor._llm_log_run_suffix = None
 
-    import threading
-    threading.Thread(target=_bg, daemon=True).start()
+    if run_mode == "process":
+        import threading
+        _extraction_running = True
+        _extraction_initial_by_platform = initial_by_platform
+        _p = _spawn_process_tasks_worker(batch_size=batch_size, reason="re-extract-all")
+
+        def _watch():
+            global _extraction_running, _extraction_initial_by_platform
+            try:
+                _p.wait()
+            finally:
+                _extraction_running = False
+                _extraction_initial_by_platform = {}
+                question_extractor._llm_log_run_suffix = None
+
+        threading.Thread(target=_watch, daemon=True).start()
+    else:
+        import threading
+        threading.Thread(target=_bg_thread, daemon=True).start()
     return {
         "status": "ok",
         "message": f"已重置 {reset_count} 条帖子（删除 {deleted_questions} 道旧题），开始重新提取",
@@ -2191,6 +2495,35 @@ def _validate_batch_task_ids(task_ids: list) -> list:
     return valid_ids
 
 
+def _spawn_process_tasks_worker(batch_size: int, reason: str):
+    """启动 process_tasks 子进程，避免父进程退出导致后台线程中断。"""
+    import subprocess
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "backend.services.scheduling.process_tasks_worker",
+        "--batch-size",
+        str(batch_size),
+    ]
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(_PROJECT_ROOT),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=os.environ.copy(),
+        **kwargs,
+    )
+    logger.info(f"[后台子进程] ▶ 启动 process_tasks worker pid={proc.pid} reason={reason} batch_size={batch_size}")
+    return proc
+
+
 def _spawn_batch_extract_subprocess(cmd: list, log_path: Path, total_count: int) -> None:
     """启动批量提取子进程，日志全量写文件，控制台每 60 秒打印一次进度条"""
     import subprocess
@@ -2201,6 +2534,28 @@ def _spawn_batch_extract_subprocess(cmd: list, log_path: Path, total_count: int)
     completed = 0
     last_print_time = [0]  # 用 list 以便闭包内修改
     lock = threading.Lock()
+    color_enabled = bool(getattr(sys.stdout, "isatty", lambda: False)()) and os.environ.get("NO_COLOR", "").strip() == ""
+    C_RESET = "\033[0m"
+    C_INFO = "\033[36m"      # cyan
+    C_PROGRESS = "\033[96m"  # bright cyan
+    C_DONE = "\033[92m"      # bright green
+    C_WARN = "\033[93m"      # bright yellow
+    C_ERROR = "\033[91m"     # bright red
+
+    def _with_color(text: str, color: str) -> str:
+        if not color_enabled:
+            return text
+        return f"{color}{text}{C_RESET}"
+
+    def _colorize_log_line(text: str) -> str:
+        s = text.rstrip("\n")
+        if " ERROR " in s or "❌" in s or "失败" in s:
+            return _with_color(s, C_ERROR) + "\n"
+        if " WARNING " in s or "⚠️" in s or "警告" in s:
+            return _with_color(s, C_WARN) + "\n"
+        if "✅" in s or "完成" in s:
+            return _with_color(s, C_DONE) + "\n"
+        return _with_color(s, C_INFO) + "\n"
 
     def _print_progress():
         with lock:
@@ -2209,7 +2564,8 @@ def _spawn_batch_extract_subprocess(cmd: list, log_path: Path, total_count: int)
             filled = int(bar_len * completed / total_count) if total_count else 0
             bar = "█" * filled + "░" * (bar_len - filled)
             ts = now_beijing_str("%Y-%m-%d %H:%M:%S")
-            sys.stdout.write(f"\r{ts} | INFO    | [批量提取] {bar} {completed}/{total_count} ({pct}%)\n")
+            msg = f"\r{ts} | INFO    | [批量提取] {bar} {completed}/{total_count} ({pct}%)\n"
+            sys.stdout.write(_with_color(msg, C_PROGRESS))
             sys.stdout.flush()
 
     def read_and_tee(pipe):
@@ -2231,6 +2587,29 @@ def _spawn_batch_extract_subprocess(cmd: list, log_path: Path, total_count: int)
                 if "[BatchExtractWorker] 全部完成" in text:
                     with lock:
                         completed = total_count
+                # 主终端透传 Stage2 关键进度（队列触发/开始/单任务完成/失败/本轮汇总）
+                if "[Stage2Processor]" in text:
+                    if (
+                        "队列 " in text
+                        or "开始处理 " in text
+                        or "处理中 " in text
+                        or "完成 task_id=" in text
+                        or "处理失败 task_id=" in text
+                        or "本轮完成 " in text
+                    ):
+                        sys.stdout.write(_colorize_log_line(text if text.endswith("\n") else text + "\n"))
+                        sys.stdout.flush()
+                # 主终端透传 BatchExtractWorker 关键日志（开始/处理中/完成/异常）
+                if "[BatchExtractWorker]" in text:
+                    if (
+                        "开始批量提取" in text
+                        or "处理 " in text
+                        or "完成 task_id=" in text
+                        or "批量提取异常" in text
+                        or "全部完成" in text
+                    ):
+                        sys.stdout.write(_colorize_log_line(text if text.endswith("\n") else text + "\n"))
+                        sys.stdout.flush()
                 # 每 60 秒打印一次进度
                 now = time.time()
                 if now - last_print_time[0] >= 60:

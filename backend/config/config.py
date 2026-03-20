@@ -499,9 +499,24 @@ class _Settings:
         return _get_int("MINER_STAGE2_BATCH_SIZE", 10)
 
     @property
+    def miner_stage2_recovery_stale_seconds(self) -> int:
+        """
+        Stage2 恢复：当 stage2_pending.status='in_progress' 且 locked_at 距离现在超过该值时，
+        认为消费者崩溃/卡死，自动把它们置回 pending 供重试。
+        """
+        # 默认 10 分钟：Stage2 单条超时 180s/批量也可能更久，10min 足够覆盖重启后快速补跑
+        return _get_int("MINER_STAGE2_RECOVERY_STALE_SECONDS", 600)
+
+    @property
     def miner_stage2_async_enabled(self) -> bool:
         """是否启用 Stage1/Stage2 异步解耦（MQ 队列，达到 batch_size 触发），默认 True"""
         return _get("MINER_STAGE2_ASYNC_ENABLED", "true").lower() in ("1", "true", "yes")
+
+    @property
+    def miner_stage2_run_mode(self) -> str:
+        """Stage2 异步执行模式：thread(线程) / process(子进程)"""
+        mode = _get("MINER_STAGE2_RUN_MODE", "process").lower()
+        return mode if mode in ("thread", "process") else "process"
 
     @property
     def miner_stage2_models(self) -> List[Dict[str, Any]]:
@@ -792,6 +807,14 @@ class _Settings:
             return _resolve_data_path(p)
         return str(_PROJECT_ROOT / "微调" / "llm_logs" / "miner_two_stage_log.jsonl")
 
+    @property
+    def finetune_logs_dir(self) -> str:
+        """微调日志目录（导入日志页扫描目录）"""
+        p = _get("FINETUNE_LOGS_DIR", "").strip()
+        if p:
+            return _resolve_data_path(p)
+        return str(_PROJECT_ROOT / "微调" / "llm_logs")
+
     # ── 9. 爬虫 ──────────────────────────────────────────────────
     @property
     def nowcoder_cookie(self) -> str:
@@ -879,6 +902,12 @@ class _Settings:
     def crawler_process_batch_max(self) -> int:
         """API 可传入的 batch_size 上限"""
         return _get_int("CRAWLER_PROCESS_BATCH_MAX", 200)
+
+    @property
+    def crawler_background_run_mode(self) -> str:
+        """后台任务执行模式：process(子进程) / thread(线程)"""
+        mode = _get("CRAWLER_BACKGROUND_RUN_MODE", "process").lower()
+        return mode if mode in ("process", "thread") else "process"
 
     @property
     def crawler_recursive_retry_max(self) -> int:

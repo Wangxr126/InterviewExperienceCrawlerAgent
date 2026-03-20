@@ -5,16 +5,16 @@
     <!-- 操作栏 -->
     <div class="toolbar">
       <el-button type="primary" @click="showCreateDialog = true">
-        <el-icon><Plus /></el-icon> 新建任务
+        <Plus /> 新建任务
       </el-button>
       <el-button @click="loadJobs">
-        <el-icon><Refresh /></el-icon> 刷新
+        <Refresh /> 刷新
       </el-button>
       <div style="flex:1"></div>
       <el-select v-model="filterEnabled" placeholder="筛选状态" style="width:120px" @change="loadJobs">
-        <el-option label="全部任务" :value="null" />
-        <el-option label="仅启用" :value="true" />
-        <el-option label="仅禁用" :value="false" />
+        <el-option label="全部任务" value="" />
+        <el-option label="仅启用" value="enabled" />
+        <el-option label="仅禁用" value="disabled" />
       </el-select>
     </div>
 
@@ -230,7 +230,7 @@ import { api } from '../api.js'
 
 const jobs = ref([])
 const loading = ref(false)
-const filterEnabled = ref(null)
+const filterEnabled = ref('')
 const showCreateDialog = ref(false)
 const editingJob = ref(null)
 const saving = ref(false)
@@ -266,7 +266,7 @@ const xhsKeywords = ref('agent面经')
 const loadJobs = async () => {
   loading.value = true
   try {
-    const params = filterEnabled.value !== null ? `?enabled_only=${filterEnabled.value}` : ''
+    const params = filterEnabled.value === 'enabled' ? '?enabled_only=true' : filterEnabled.value === 'disabled' ? '?enabled_only=false' : ''
     const data = await api.getSchedulerJobs(params)
     jobs.value = data
   } catch (e) {

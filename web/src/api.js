@@ -49,6 +49,11 @@ export const api = {
     return r.json()
   },
 
+  async getQuestionDetail(questionId) {
+    const r = await fetch(`${BASE}/api/questions/${encodeURIComponent(questionId)}`)
+    return r.json()
+  },
+
   /** 智能练习：知识点不足 N 条 + 随机 M 条（多路召回+Reranker+遗忘曲线），每批条数由后端 .env 配置 */
   async getSmartPracticeQuestions(params = {}) {
     const p = new URLSearchParams()
@@ -135,6 +140,21 @@ export const api = {
 
   async getPracticeStats(userId) {
     const r = await fetch(`${BASE}/api/user/${userId}/practice-stats`)
+    return r.json()
+  },
+
+  // ── InterviewerAgent 工具使用统计 ─────────────────────────
+  async getToolUsage(userId, days = 365) {
+    const r = await fetch(`${BASE}/api/user/${userId}/tool-usage?days=${days}`)
+    return r.json()
+  },
+
+  async getGraphRag(userId, params = {}) {
+    const p = new URLSearchParams()
+    if (params.max_bank_tags != null) p.set('max_bank_tags', String(params.max_bank_tags))
+    if (params.max_record_questions != null) p.set('max_record_questions', String(params.max_record_questions))
+    const q = p.toString()
+    const r = await fetch(`${BASE}/api/user/${userId}/graph-rag${q ? '?' + q : ''}`)
     return r.json()
   },
 

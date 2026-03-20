@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]  # backend/services/finetune -> 项目根
 _FINETUNE_DIR = _PROJECT_ROOT / "微调"
+_FINETUNE_LOGS_DIR = Path(settings.finetune_logs_dir)
 _LABELED_PATH = _FINETUNE_DIR / "labeled_data.jsonl"
 _RUN_CONFIG_PATH = _FINETUNE_DIR / "finetune_run_config.json"
 
@@ -110,25 +111,53 @@ def _get_db_conn() -> sqlite3.Connection:
     return conn
 
 
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """兼容旧库：检测表字段是否存在。"""
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any((r[1] if isinstance(r, tuple) else r["name"]) == column for r in rows)
+    except Exception:
+        return False
+
+
 # ===========================================================
 # 导入：从 llm_logs 文件读取并写入 SQLite
 # ===========================================================
+
+def _classify_import_error(err_msg: str) -> str:
+    """把导入异常归类为更可读的失败原因。"""
+    msg = (err_msg or "").lower()
+    if "expecting value" in msg or "jsondecodeerror" in msg:
+        return "JSON 解析失败"
+    if "no such table" in msg:
+        return "数据库表不存在"
+    if "database is locked" in msg:
+        return "数据库被锁定"
+    if "integrityerror" in msg or "unique constraint failed" in msg:
+        return "数据库约束冲突"
+    if "unicode" in msg or "decode" in msg:
+        return "编码解析失败"
+    return "其他异常"
+
 
 def import_from_log_file(log_path: str, skip_existing: bool = True) -> Dict[str, int]:
     """
     从指定 JSONL 日志文件导入样本到 finetune_samples 表。
     支持 Miner 两阶段格式（stage1_output/stage2_output）和旧版 llm_logs 格式。
-    返回 {"imported": N, "skipped": N}
+    返回 {"imported": N, "skipped": N, "failed": N, "details": {...}}
     """
     p = Path(log_path)
     if not p.exists():
-        return {"imported": 0, "skipped": 0, "failed": 0, "error": "文件不存在"}
+        return {"imported": 0, "skipped": 0, "failed": 0, "error": "文件不存在", "details": {}}
 
     imported = skipped = failed = 0
     failed_samples = []
+    error_summary: Dict[str, int] = {}
     now_ts = now_beijing().isoformat(timespec="seconds")
+    import_log_id = f"import_{int(time.time() * 1000)}"  # 唯一导入ID
 
     with _get_db_conn() as conn:
+        has_import_log_id = _table_has_column(conn, "finetune_samples", "import_log_id")
         for line_num, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
             line = line.strip()
             if not line:
@@ -158,12 +187,20 @@ def import_from_log_file(log_path: str, skip_existing: bool = True) -> Dict[str,
                         if exists:
                             skipped += 1
                             continue
-                    conn.execute(
-                        """INSERT INTO finetune_samples
-                           (content, stage1_output, stage2_output, stage1_model, stage2_model, title, source_url, status, source, created_at)
-                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                        (content or "(无原文)", stage1, stage2, stage1_model, stage2_model, title, source_url, "pending", "miner_two_stage", ts)
-                    )
+                    if has_import_log_id:
+                        conn.execute(
+                            """INSERT INTO finetune_samples
+                               (content, stage1_output, stage2_output, stage1_model, stage2_model, title, source_url, status, source, created_at, import_log_id)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                            (content or "(无原文)", stage1, stage2, stage1_model, stage2_model, title, source_url, "pending", "miner_two_stage", ts, import_log_id)
+                        )
+                    else:
+                        conn.execute(
+                            """INSERT INTO finetune_samples
+                               (content, stage1_output, stage2_output, stage1_model, stage2_model, title, source_url, status, source, created_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                            (content or "(无原文)", stage1, stage2, stage1_model, stage2_model, title, source_url, "pending", "miner_two_stage", ts)
+                        )
                 else:
                     # 旧版 llm_logs 格式（兼容）
                     content = (rec.get("user_content", "") or rec.get("content", "")).strip()
@@ -181,30 +218,49 @@ def import_from_log_file(log_path: str, skip_existing: bool = True) -> Dict[str,
                         if exists:
                             skipped += 1
                             continue
-                    conn.execute(
-                        """INSERT INTO finetune_samples
-                           (content, stage1_output, stage2_output, title, source_url, status, source, created_at)
-                           VALUES (?,?,?,?,?,?,?,?)""",
-                        (content, "", stage2, title, source_url, "pending", "llm_logs", ts)
-                    )
+                    if has_import_log_id:
+                        conn.execute(
+                            """INSERT INTO finetune_samples
+                               (content, stage1_output, stage2_output, title, source_url, status, source, created_at, import_log_id)
+                               VALUES (?,?,?,?,?,?,?,?,?)""",
+                            (content, "", stage2, title, source_url, "pending", "llm_logs", ts, import_log_id)
+                        )
+                    else:
+                        conn.execute(
+                            """INSERT INTO finetune_samples
+                               (content, stage1_output, stage2_output, title, source_url, status, source, created_at)
+                               VALUES (?,?,?,?,?,?,?,?)""",
+                            (content, "", stage2, title, source_url, "pending", "llm_logs", ts)
+                        )
                 imported += 1
             except Exception as e:
                 failed += 1
-                failed_samples.append({"line": line_num, "error": str(e), "preview": line[:80]})
+                reason = _classify_import_error(str(e))
+                error_summary[reason] = error_summary.get(reason, 0) + 1
+                failed_samples.append({"line": line_num, "reason": reason, "error": str(e), "preview": line[:80]})
         conn.commit()
     
+    # 保存导入日志到数据库
+    _save_import_log(import_log_id, p.name, imported, skipped, failed, failed_samples)
+    
     # 统一输出结果
-    logger.info("导入完成: imported=%d skipped=%d failed=%d from %s", imported, skipped, failed, p.name)
+    logger.info("导入完成: imported=%d skipped=%d failed=%d from %s (log_id=%s)", 
+                imported, skipped, failed, p.name, import_log_id)
     
-    # 只有失败时才输出详细信息
-    if failed > 0:
-        logger.warning("导入失败详情 (%d条):", failed)
-        for sample in failed_samples[:5]:  # 最多显示前5条
-            logger.warning("  行%d: %s | %s", sample["line"], sample["error"], sample["preview"])
-        if failed > 5:
-            logger.warning("  ... 还有 %d 条失败记录未显示", failed - 5)
-    
-    return {"imported": imported, "skipped": skipped, "failed": failed}
+    return {
+        "imported": imported, 
+        "skipped": skipped, 
+        "duplicated": skipped,
+        "failed": failed,
+        "import_log_id": import_log_id,
+        "details": {
+            "file": p.name,
+            "total_lines": imported + skipped + failed,
+            "duplicate_count": skipped,
+            "error_summary": error_summary,
+            "failed_samples": failed_samples[:10]  # 前10条失败样本
+        }
+    }
 
 
 def fix_merged_stage2_samples(source_filter: str = "miner_two_stage") -> Dict[str, int]:
@@ -277,7 +333,7 @@ def import_all_logs() -> Dict[str, int]:
     已存在的记录自动跳过（content+created_at 去重）。
     返回汇总结果 {"imported": N, "skipped": N, "files": N}
     """
-    log_root = _FINETUNE_DIR / "llm_logs"
+    log_root = _FINETUNE_LOGS_DIR
     total_imported = total_skipped = file_count = 0
     if not log_root.exists():
         return {"imported": 0, "skipped": 0, "files": 0}
@@ -292,14 +348,19 @@ def import_all_logs() -> Dict[str, int]:
 
 def list_log_files() -> List[Dict]:
     """列出 微调/llm_logs/ 下所有 JSONL 文件，Miner 两阶段日志排最前"""
-    log_root = _FINETUNE_DIR / "llm_logs"
+    log_root = _FINETUNE_LOGS_DIR
     result = []
     if not log_root.exists():
         log_root.mkdir(parents=True, exist_ok=True)
     for f in sorted(log_root.rglob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True):
-        rel = f.relative_to(_FINETUNE_DIR)
+        rel = f.relative_to(log_root)
         parts = rel.parts
-        model = "Miner两阶段" if "miner_two_stage" in f.name else (parts[1] if len(parts) > 2 else "unknown")
+        if "miner_two_stage" in f.name:
+            model = "Miner两阶段"
+        elif len(parts) > 1:
+            model = parts[0]
+        else:
+            model = "默认目录"
         try:
             line_count = sum(1 for line in f.read_text(encoding="utf-8").splitlines() if line.strip())
         except Exception:
@@ -321,7 +382,7 @@ def list_log_files() -> List[Dict]:
 
 def delete_log_file(log_path: str) -> Dict:
     """删除指定日志文件，仅允许删除 微调/llm_logs/ 下的文件"""
-    log_root = _FINETUNE_DIR / "llm_logs"
+    log_root = _FINETUNE_LOGS_DIR
     p = Path(log_path).resolve()
     try:
         root_resolved = log_root.resolve()
@@ -358,27 +419,95 @@ def list_samples(status: str = None, page: int = 1, page_size: int = 20, order: 
             f"SELECT COUNT(*) FROM finetune_samples {where}", params_count
         ).fetchone()[0]
         rows = conn.execute(
-            f"""SELECT id, content as content_preview,
-                       status, is_modified, created_at, modified_at, labeled_at, source
+            f"""SELECT id, content,
+                       status, is_modified, created_at, modified_at, labeled_at, source,
+                       title, source_url
                 FROM finetune_samples {where}
                 {order_by} LIMIT ? OFFSET ?""",
             params_list
         ).fetchall()
+    
+    items = []
+    for r in rows:
+        item = dict(r)
+        
+        # 添加 content_preview 字段（前端需要）
+        item["content_preview"] = item.get("content") or ""
+        
+        # 如果没有 source_url，尝试根据内容从 crawl_tasks 表中查找
+        if not item.get("source_url") and item.get("content_preview"):
+            with _get_db_conn() as conn:
+                content_prefix = item["content_preview"][:500]
+                match_row = conn.execute(
+                    """
+                    SELECT source_url, post_title
+                    FROM crawl_tasks
+                    WHERE raw_content LIKE ? OR raw_content LIKE ?
+                    LIMIT 1
+                    """,
+                    (f"%{content_prefix[:100]}%", f"%{content_prefix[-100:]}%")
+                ).fetchone()
+                
+                if match_row:
+                    item["source_url"] = match_row["source_url"]
+                    if not item.get("title"):
+                        item["title"] = match_row["post_title"]
+        
+        items.append(item)
+    
     return {
         "total": total,
         "page": page,
         "page_size": page_size,
-        "items": [dict(r) for r in rows],
+        "items": items,
     }
 
 
 def get_sample(sample_id: int) -> Optional[Dict]:
     """获取单条样本完整内容"""
     with _get_db_conn() as conn:
+        # finetune_samples.content 来自 llm_logs 的 content_preview，可能被截断。
+        # 若该样本有 source_url，则尝试从 crawl_tasks.raw_content 读取完整原文。
         row = conn.execute(
-            "SELECT * FROM finetune_samples WHERE id=?", (sample_id,)
+            """
+            SELECT fs.*,
+                   ct.raw_content AS raw_content
+            FROM finetune_samples fs
+            LEFT JOIN crawl_tasks ct
+              ON ct.source_url = fs.source_url
+            WHERE fs.id=?
+            """,
+            (sample_id,),
         ).fetchone()
-    return dict(row) if row else None
+    
+    if not row:
+        return None
+    
+    result = dict(row)
+    
+    # 如果没有 source_url，尝试根据内容从 crawl_tasks 表中查找
+    if not result.get("source_url") and result.get("content"):
+        with _get_db_conn() as conn:
+            # 根据内容的前500字符模糊匹配查找相关的爬虫任务
+            content_prefix = result["content"][:500]
+            match_row = conn.execute(
+                """
+                SELECT source_url, raw_content, post_title
+                FROM crawl_tasks
+                WHERE raw_content LIKE ? OR raw_content LIKE ?
+                LIMIT 1
+                """,
+                (f"%{content_prefix[:100]}%", f"%{content_prefix[-100:]}%")
+            ).fetchone()
+            
+            if match_row:
+                result["source_url"] = match_row["source_url"]
+                if not result.get("raw_content"):
+                    result["raw_content"] = match_row["raw_content"]
+                if not result.get("title"):
+                    result["title"] = match_row["post_title"]
+    
+    return result
 
 
 # ===========================================================
@@ -499,28 +628,225 @@ def export_labeled(output_path: str = None, sample_ids: List[int] = None) -> Dic
 
 def get_stats() -> Dict:
     """微调数据统计"""
+    def _count_questions(output_text: str) -> int:
+        """统计单条输出中的题目数量，异常或非数组返回 0。"""
+        if not output_text:
+            return 0
+        try:
+            parsed = json.loads(output_text)
+        except Exception:
+            return 0
+        return len(parsed) if isinstance(parsed, list) else 0
+
     with _get_db_conn() as conn:
         total = conn.execute("SELECT COUNT(*) FROM finetune_samples").fetchone()[0]
         labeled = conn.execute("SELECT COUNT(*) FROM finetune_samples WHERE status='labeled'").fetchone()[0]
         modified = conn.execute("SELECT COUNT(*) FROM finetune_samples WHERE is_modified=1").fetchone()[0]
         pending = conn.execute("SELECT COUNT(*) FROM finetune_samples WHERE status='pending'").fetchone()[0]
+        rows = conn.execute(
+            """
+            SELECT final_output, assist_output, stage2_output, stage1_output
+            FROM finetune_samples
+            """
+        ).fetchall()
+
+    # 题目总数按“可用于微调的最终结果优先”统计：
+    # final_output > assist_output > stage2_output > stage1_output
+    question_total = 0
+    for row in rows:
+        best_output = (
+            row["final_output"]
+            or row["assist_output"]
+            or row["stage2_output"]
+            or row["stage1_output"]
+            or ""
+        )
+        question_total += _count_questions(best_output)
+
     return {
         "total": total,
         "pending": pending,
         "labeled": labeled,
         "modified": modified,
+        "question_total": question_total,
         "log_files": len(list_log_files()),
     }
+
+
+# ===========================================================
+# 导入日志管理（新增）
+# ===========================================================
+
+def _save_import_log(import_log_id: str, filename: str, imported: int, skipped: int, 
+                     failed: int, failed_samples: List[Dict]) -> None:
+    """
+    保存导入日志到数据库（finetune_import_logs 表）
+    用于追踪每次导入的详细信息
+    """
+    try:
+        with _get_db_conn() as conn:
+            # 检查表是否存在，不存在则创建
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS finetune_import_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    import_log_id TEXT UNIQUE NOT NULL,
+                    filename TEXT NOT NULL,
+                    imported INTEGER DEFAULT 0,
+                    skipped INTEGER DEFAULT 0,
+                    failed INTEGER DEFAULT 0,
+                    failed_samples TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            
+            now = now_beijing_str()
+            conn.execute("""
+                INSERT INTO finetune_import_logs 
+                (import_log_id, filename, imported, skipped, failed, failed_samples, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                import_log_id,
+                filename,
+                imported,
+                skipped,
+                failed,
+                json.dumps(failed_samples[:10], ensure_ascii=False),  # 只保存前10条
+                now,
+                now
+            ))
+            conn.commit()
+            logger.info("导入日志已保存: %s", import_log_id)
+    except Exception as e:
+        logger.warning("保存导入日志失败: %s", e)
+
+
+def get_import_logs(limit: int = 20) -> List[Dict]:
+    """
+    获取最近的导入日志列表
+    返回 [{"import_log_id": "...", "filename": "...", "imported": N, "skipped": N, "failed": N, "created_at": "...", ...}]
+    """
+    try:
+        with _get_db_conn() as conn:
+            rows = conn.execute("""
+                SELECT import_log_id, filename, imported, skipped, failed, failed_samples, created_at
+                FROM finetune_import_logs
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("获取导入日志失败: %s", e)
+        return []
+
+
+def get_import_log_detail(import_log_id: str) -> Optional[Dict]:
+    """
+    获取单条导入日志的详细信息
+    返回 {"import_log_id": "...", "filename": "...", "imported": N, "skipped": N, "failed": N, "failed_samples": [...], "created_at": "..."}
+    """
+    try:
+        with _get_db_conn() as conn:
+            row = conn.execute("""
+                SELECT import_log_id, filename, imported, skipped, failed, failed_samples, created_at
+                FROM finetune_import_logs
+                WHERE import_log_id = ?
+            """, (import_log_id,)).fetchone()
+            if row:
+                result = dict(row)
+                # 解析 failed_samples JSON
+                try:
+                    result["failed_samples"] = json.loads(result.get("failed_samples", "[]"))
+                except Exception:
+                    result["failed_samples"] = []
+                # 兼容前端展示：重复数=跳过数，并聚合失败原因统计
+                result["duplicate_count"] = result.get("skipped", 0)
+                summary: Dict[str, int] = {}
+                for s in result.get("failed_samples", []):
+                    reason = (s or {}).get("reason") or _classify_import_error((s or {}).get("error", ""))
+                    summary[reason] = summary.get(reason, 0) + 1
+                result["error_summary"] = summary
+                return result
+    except Exception as e:
+        logger.warning("获取导入日志详情失败: %s", e)
+    return None
+
+
+def get_samples_by_import_log(import_log_id: str, page: int = 1, page_size: int = 20) -> Dict:
+    """
+    获取某次导入的所有样本
+    返回 {"total": N, "items": [...], "import_log_id": "..."}
+    """
+    offset = (page - 1) * page_size
+    try:
+        with _get_db_conn() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM finetune_samples WHERE import_log_id = ?",
+                (import_log_id,)
+            ).fetchone()[0]
+            
+            rows = conn.execute("""
+                SELECT id, content as content_preview, status, is_modified, created_at, 
+                       modified_at, labeled_at, source, stage1_model, stage2_model
+                FROM finetune_samples
+                WHERE import_log_id = ?
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+            """, (import_log_id, page_size, offset)).fetchall()
+            
+            return {
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "import_log_id": import_log_id,
+                "items": [dict(r) for r in rows]
+            }
+    except Exception as e:
+        logger.warning("获取导入样本失败: %s", e)
+        return {"total": 0, "items": [], "import_log_id": import_log_id}
+
+
+def delete_import_log(import_log_id: str) -> Dict:
+    """
+    删除某次导入的所有样本和日志记录
+    返回 {"status": "ok", "deleted_samples": N}
+    """
+    try:
+        with _get_db_conn() as conn:
+            # 删除样本
+            cur = conn.execute(
+                "DELETE FROM finetune_samples WHERE import_log_id = ?",
+                (import_log_id,)
+            )
+            deleted_count = cur.rowcount
+            
+            # 删除日志
+            conn.execute(
+                "DELETE FROM finetune_import_logs WHERE import_log_id = ?",
+                (import_log_id,)
+            )
+            conn.commit()
+            
+            logger.info("已删除导入日志 %s，共删除 %d 条样本", import_log_id, deleted_count)
+            return {"status": "ok", "deleted_samples": deleted_count}
+    except Exception as e:
+        logger.warning("删除导入日志失败: %s", e)
+        return {"status": "error", "message": str(e)}
 
 
 def preview_log_file(log_path: str, limit: int = 10) -> Dict:
     """
     预览日志文件前N条记录，支持 Miner 两阶段格式和旧版 llm_logs 格式
-    返回 {"samples": [...], "total": N}
+    返回 {"samples": [...], "total": N, "showing": N}
+    
+    【重要】Stage2 豆包答案显示规则：
+    - 若 stage2_output 存在且有效 → 显示为 stage2_obj
+    - 若 stage2_output 不完整 → 用 stage1_output 补齐后显示
+    - 若都不存在 → 显示 None
     """
     p = Path(log_path)
     if not p.exists():
-        return {"error": "文件不存在", "samples": [], "total": 0}
+        return {"error": "文件不存在", "samples": [], "total": 0, "showing": 0}
     samples = []
     total = 0
     try:
@@ -532,51 +858,79 @@ def preview_log_file(log_path: str, limit: int = 10) -> Dict:
             if len(samples) < limit:
                 try:
                     rec = json.loads(line)
+                    
+                    def _parse_json(s):
+                        """安全解析 JSON，失败返回错误对象"""
+                        if not s:
+                            return None
+                        try:
+                            return json.loads(s)
+                        except Exception:
+                            return {"error": "无效JSON", "raw": str(s)[:200]}
+                    
                     # Miner 两阶段格式
                     if "stage1_output" in rec or "stage2_output" in rec:
-                        def _parse_json(s):
-                            if not s:
-                                return None
-                            try:
-                                return json.loads(s)
-                            except Exception:
-                                return {"error": "无效JSON", "raw": str(s)[:200]}
-                        stage1_obj = _parse_json(rec.get("stage1_output"))
-                        stage2_obj = _parse_json(rec.get("stage2_output"))
+                        content = rec.get("content_preview", "") or rec.get("content", "")
+                        title = rec.get("title", "")
+                        source_url = rec.get("source_url", "")
+                        stage1_raw = rec.get("stage1_output", "")
+                        stage2_raw = rec.get("stage2_output", "")
+                        stage1_model = rec.get("stage1_model", "")
+                        stage2_model = rec.get("stage2_model", "")
+                        ts = rec.get("ts", "")
+                        
+                        # 解析 Stage1
+                        stage1_obj = _parse_json(stage1_raw)
+                        
+                        # 解析 Stage2（关键：若不完整则补齐）
+                        stage2_obj = None
+                        if stage2_raw:
+                            if is_stage2_incomplete(stage2_raw, stage1_raw):
+                                # Stage2 不完整，用 Stage1 补齐
+                                stage2_merged = merge_stage2_with_stage1(stage2_raw, stage1_raw)
+                                stage2_obj = _parse_json(stage2_merged)
+                            else:
+                                # Stage2 完整，直接解析
+                                stage2_obj = _parse_json(stage2_raw)
+                        
                         samples.append({
-                            "content": rec.get("content_preview", "") or rec.get("content", ""),
-                            "title": "",
-                            "source_url": "",
-                            "llm_raw": rec.get("stage1_output", ""),
+                            "content": content,
+                            "title": title,
+                            "source_url": source_url,
+                            "llm_raw": stage1_raw,
                             "llm_raw_obj": stage1_obj,
-                            "stage2_output": rec.get("stage2_output", ""),
-                            "stage2_obj": stage2_obj,
-                            "stage1_model": rec.get("stage1_model", ""),
-                            "stage2_model": rec.get("stage2_model", ""),
-                            "ts": rec.get("ts", ""),
+                            "stage2_output": stage2_raw,
+                            "stage2_obj": stage2_obj,  # 【关键】已补齐的 Stage2 对象
+                            "stage1_model": stage1_model,
+                            "stage2_model": stage2_model,
+                            "ts": ts,
                         })
                     else:
-                        llm_raw_obj = None
-                        if rec.get("llm_raw") or rec.get("llm_response"):
-                            raw = rec.get("llm_raw") or rec.get("llm_response", "")
-                            try:
-                                llm_raw_obj = json.loads(raw)
-                            except Exception:
-                                llm_raw_obj = {"error": "无效JSON", "raw": raw[:200]}
+                        # 旧版 llm_logs 格式
+                        content = rec.get("content", "") or rec.get("user_content", "")
+                        title = rec.get("title", "")
+                        source_url = rec.get("source_url", "")
+                        llm_raw = rec.get("llm_raw", "") or rec.get("llm_response", "")
+                        ts = rec.get("ts", "")
+                        
+                        llm_raw_obj = _parse_json(llm_raw)
+                        
                         samples.append({
-                            "content": rec.get("content", "") or rec.get("user_content", ""),
-                            "title": rec.get("title", ""),
-                            "source_url": rec.get("source_url", ""),
-                            "llm_raw": rec.get("llm_raw", "") or rec.get("llm_response", ""),
-                            "llm_raw_obj": llm_raw_obj,
-                            "ts": rec.get("ts", ""),
+                            "content": content,
+                            "title": title,
+                            "source_url": source_url,
+                            # 旧版日志只有单阶段输出：为避免“看不到豆包答案”的误解，
+                            # 这里把 llm_logs 的输出映射到 Stage2 展示。
+                            "stage2_output": llm_raw,
+                            "stage2_obj": llm_raw_obj,
+                            "ts": ts,
                         })
                 except Exception as e:
                     logger.warning("解析日志行失败: %s", e)
                     continue
     except Exception as e:
         logger.error("读取日志文件失败: %s", e)
-        return {"error": str(e), "samples": [], "total": 0}
+        return {"error": str(e), "samples": [], "total": 0, "showing": 0}
     return {"samples": samples, "total": total, "showing": len(samples)}
 
 

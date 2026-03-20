@@ -1,59 +1,82 @@
-# 面经 Agent
+# wxr_agent：智能面经采集与处理系统
 
-> 基于 [hello-agents](https://github.com/datawhalechina/hello-agents) 框架构建的智能面试复习助手。
-> 自动爬取牛客/小红书面经、构建知识图谱、用 SM-2 算法跟踪掌握程度，并提供 AI 面试对话练习。
-
+> 基于双 Agent 协作的面经智能处理平台。自动采集牛客/小红书面经，通过结构化处理、知识图谱构建、SM-2 算法追踪，提供 AI 面试对话练习与个性化复习方案。
 
 ---
 
-## ⚙️ 运行环境
+## 📋 项目概述
 
-**Conda环境：** `NewCoderAgent`
+`wxr_agent` 是一个面向"内容采集 + 智能处理 + 结构化输出"的 Agent 系统，核心目标是将原始网页/文本数据转化为可复用的知识结果（结构化 JSON、训练日志、可追溯记录等）。
+
+项目围绕 **双 Agent 协作机制** 构建：
+
+- **Agent A（采集与预处理 Agent）**：负责内容抓取、平台识别、文本清洗、标准化输出
+- **Agent B（理解与生成 Agent）**：负责语义提炼、结构化生成、结果落盘、日志记录
+
+二者通过明确的任务边界和工具调用链路，实现"可扩展、可追踪、可调优"的自动化处理流程。
+
+---
+
+## ⚙️ 快速开始
+
+### 环境要求
+
+| 组件 | 版本 / 要求 |
+|------|------------|
+| Python | 3.12+ |
+| Conda 环境 | `NewCoderAgent` |
+| Docker Desktop | 需运行（用于本地 Neo4j） |
+| 操作系统 | Windows 10/11（已测试） |
+
+### 启动步骤
 
 ```bash
-# 激活环境
+# 1. 进入项目目录
+cd E:\Agent\AgentProject\wxr_agent
+
+# 2. 配置环境变量（复制示例并填入 API Key）
+copy .env.example .env
+
+# 3. 激活 Conda 环境
 conda activate NewCoderAgent
 
-# 启动后端
+# 4. 安装依赖
+pip install -r requirements.txt
+python -m spacy download zh_core_web_sm
+python -m spacy download en_core_web_sm
+
+# 5. 启动 Neo4j（本地 Docker）
+docker compose up -d
+
+# 6. 启动后端
 python run.py
 ```
 
-**注意：** 所有Python命令都需要先激活此环境！
----
-
-## 功能概览
-
-| 模块 | 功能 |
-|------|------|
-| **题库浏览** | 按公司、难度、标签、关键词筛选题目；随机抽题 |
-| **面试对话** | 与 AI 面试官实时对话，支持换个问法、举一反三 |
-| **答题评测** | 提交答案后获得评分（0-5）、强弱点分析、AI 解析 |
-| **掌握度追踪** | SM-2 算法计算复习周期，弱点标签自动识别 |
-| **知识推荐** | 针对薄弱点推荐学习资源和知识章节 |
-| **记忆系统** | hello-agents 四层记忆（工作/情节/语义）持久化对话上下文 |
-| **面经收录** | 输入牛客/小红书帖子 URL，自动爬取并入库 |
-| **笔记功能** | 对任意题目添加个人笔记 |
+启动成功后访问：
+- **后端 API**：http://localhost:8000
+- **API 文档**：http://localhost:8000/docs
+- **前端应用**：http://localhost:8000（构建后）
 
 ---
 
-## 技术架构
+## 🏗️ 系统架构
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                   前端 (Vue 3 + Vite + Element Plus)  │
-│                   web/ → backend/static/dist          │
+│                   前端 (Vue 3 + Vite)                │
+│                   web/ → backend/static/dist         │
 └──────────────────────┬──────────────────────────────┘
                        │ HTTP (localhost:8000)
 ┌──────────────────────▼──────────────────────────────┐
-│              FastAPI 后端 (backend/main.py)           │
+│              FastAPI 后端 (backend/main.py)          │
 │                                                     │
 │  ┌─────────────────────────────────────────────┐   │
-│  │          InterviewSystemOrchestrator        │   │
-│  │  ┌────────────┐  ┌──────────────────────┐  │   │
-│  │  │ Architect  │  │   InterviewerAgent   │  │   │
-│  │  │  (ReAct)   │  │     (ReAct)          │  │   │
-│  │  └────────────┘  └──────────────────────┘  │   │
-│  │       HunterPipeline（确定性爬虫流水线）      │   │
+│  │      InterviewSystemOrchestrator            │   │
+│  │  ┌──────────────┐  ┌──────────────────────┐ │   │
+│  │  │ Architect    │  │ InterviewerAgent     │ │   │
+│  │  │ Agent (ReAct)│  │ (ReAct)              │ │   │
+│  │  └──────────────┘  └──────────────────────┘ │   │
+│  │       HunterPipeline（采集流水线）           │   │
 │  └─────────────────────────────────────────────┘   │
 └──────────────────────┬──────────────────────────────┘
           ┌────────────┼────────────────┐
@@ -67,92 +90,171 @@ python run.py
 
 ---
 
-## 环境要求
+## 🤖 双 Agent 协作机制
 
-| 组件 | 版本 / 要求 |
-|------|------------|
-| Python | 3.12+ |
-| Conda 环境 | `NewCoderAgent` |
-| Docker Desktop | 需运行（用于本地 Neo4j） |
-| 操作系统 | Windows 10/11（已测试） |
+### Agent A：采集与预处理 Agent
+
+**职责：**
+- 接收任务输入（URL / 文本 / 批量项）
+- 调用抓取 Tool 获取原始内容
+- 平台识别（牛客 / 小红书 / 通用网页）
+- 文本清洗、降噪、字段标准化
+- 输出统一中间结构（供 Agent B 消费）
+
+**输出示例（中间态）：**
+```json
+{
+  "url": "https://www.nowcoder.com/discuss/...",
+  "title": "字节跳动 Java 面经",
+  "platform": "nowcoder",
+  "raw_content": "...",
+  "clean_content": "...",
+  "metadata": {
+    "company": "字节跳动",
+    "position": "Java 后端",
+    "difficulty": "hard"
+  }
+}
+```
+
+### Agent B：理解与生成 Agent
+
+**职责：**
+- 消费 Agent A 的标准化中间结果
+- 执行语义提炼、信息归类、标签化
+- 结构化生成（题目、知识点、答案等）
+- 组织最终输出（JSONL / 持久化存储 / 回传响应）
+- 写入处理日志（trace + prompt + result）
+
+**输出特征：**
+- 面向下游可直接消费
+- 保留来源和处理时间戳
+- 保证可追溯（任务 ID、阶段日志、异常上下文）
 
 ---
 
-## 快速开始
+## 🔄 处理流程逻辑
 
-### 第一步：克隆 / 进入项目
+### 主流程（端到端）
 
-```powershell
-cd E:\Agent\AgentProject\wxr_agent
+```mermaid
+flowchart TD
+    A["📥 输入任务<br/>URL/文本/批量"] --> B["🤖 Agent A 接收任务"]
+    B --> C["🔗 调用抓取 Tool"]
+    C --> D["🏷️ 平台识别 + 内容解析"]
+    D --> E["🧹 文本清洗与标准化"]
+    E --> F["📦 中间结构输出"]
+    F --> G["🤖 Agent B 消费中间结构"]
+    G --> H["💡 语义提炼/结构化生成"]
+    H --> I["💾 结果落盘 JSONL/DB"]
+    I --> J["✅ 返回最终响应"]
+    
+    style A fill:#e1f5ff
+    style B fill:#fff3e0
+    style G fill:#fff3e0
+    style J fill:#c8e6c9
 ```
 
-### 第二步：配置环境变量
+### 异常与回退流程
 
-```powershell
-# 复制示例配置并编辑（填入真实 API Key 等）
-copy .env.example .env
-# 编辑 .env，至少配置：EMBED_API_KEY、NEO4J_PASSWORD
+```mermaid
+flowchart TD
+    A["🔗 抓取请求"] --> B{"✓ 抓取成功?"}
+    B -->|否| C["📝 记录错误日志"]
+    C --> D["🔄 重试策略"]
+    D --> E{"✓ 重试成功?"}
+    E -->|否| F["⬇️ 降级输出 error item"]
+    E -->|是| G["继续解析"]
+    B -->|是| G["继续解析"]
+    G --> H{"✓ 解析成功?"}
+    H -->|否| I["⬇️ 回退到 generic parser"]
+    I --> J["✅ 输出可用结果"]
+    H -->|是| J["✅ 输出可用结果"]
+    
+    style A fill:#ffebee
+    style F fill:#ffcdd2
+    style J fill:#c8e6c9
 ```
 
-### 第三步：安装依赖
+### 数据流与日志流
 
-```powershell
-# 激活 conda 环境
-conda activate NewCoderAgent
+```mermaid
+sequenceDiagram
+    participant User as 调用方
+    participant A as Agent A
+    participant T as Fetch/Parse Tools
+    participant B as Agent B
+    participant L as Logs/Storage
 
-# 安装 Python 依赖
-pip install -r requirements.txt
-
-# 安装 spaCy 语言模型（仅首次）
-python -m spacy download zh_core_web_sm
-python -m spacy download en_core_web_sm
+    User->>A: 提交任务(url/text)
+    A->>T: 调用抓取与解析
+    T-->>A: 返回标准化内容
+    A->>B: 传递中间结构
+    B->>B: 提炼与结构化生成
+    B->>L: 写入结果与日志
+    B-->>User: 返回最终输出
 ```
-
-### 第四步：启动 Neo4j（本地 Docker）
-
-```powershell
-# 首次需拉取镜像（约 400MB，需 Docker Desktop 运行且网络正常）
-docker compose up -d
-
-# 验证 Neo4j 是否就绪（等待约 30 秒后执行）
-python check_neo4j.py
-```
-
-浏览器访问 http://localhost:7474 可打开 Neo4j 管理界面（用户名/密码见 `CREDENTIALS.md`）。
-
-### 第五步：启动后端
-
-```powershell
-python run.py
-```
-
-`run.py` 会自动切换到 `NewCoderAgent` conda 环境，无需手动 `conda activate`。
-
-启动成功后终端输出：
-```
-✅ Neo4j (localhost:7687) 连接正常
-╔══════════════════════════════════════════════════════╗
-║            面经 Agent 后端已启动                      ║
-╠══════════════════════════════════════════════════════╣
-║  Python 环境：NewCoderAgent                          ║
-║  API 地址  ：http://localhost:8000
-║  API 文档  ：http://localhost:8000/docs
-╚══════════════════════════════════════════════════════╝
-```
-
-### 第六步：构建并打开前端
-
-```powershell
-cd web
-npm install
-npm run build
-```
-
-构建完成后，访问 http://localhost:8000 即可使用。开发模式可运行 `npm run dev`，访问 http://localhost:5173。
 
 ---
 
-## 目录结构
+## 🛠️ Tool 实现设计
+
+项目采用"Tool 原子能力 + Agent 编排"的模式，核心 Tool 分为以下几类：
+
+### 内容获取类 Tool
+
+**`fetch_content(url)`**
+- 单链接抓取 + 解析
+- 统一请求超时（10s）
+- 统一 UA，减少站点拦截概率
+
+**`fetch_multiple_contents(urls)`**
+- 批量并行抓取（失败隔离）
+- 单条失败不影响整体
+- 返回成功/失败统计
+
+### 平台解析类 Tool
+
+**`detectPlatform(url)`**
+- 根据 URL 特征识别平台
+- 支持：牛客、小红书、通用网页
+
+**`parseNowcoder(html, url)`**
+- 牛客定制解析
+- 提取：标题、公司、岗位、难度、内容
+
+**`parseXiaohongshu(html, url)`**
+- 小红书定制解析
+- 提取：标题、话题、内容、互动数据
+
+**`parseGeneric(html, url)`**
+- 通用网页回退解析
+- 基于 DOM 结构和启发式规则
+
+**设计要点：**
+- 优先定制解析，失败时自动回退通用解析
+- 保持统一输出 schema，降低下游复杂度
+
+### 处理与输出类 Tool
+
+**`cleanText(raw_text)`**
+- 去噪、裁剪、空白规整
+- 移除 HTML 标签、特殊字符
+- 保留关键格式（换行、列表）
+
+**`structureOutput(parsed_data)`**
+- 结果封装为 JSON 文本块
+- 验证必填字段
+- 添加元数据（处理时间、版本等）
+
+**`logProcessing(task_id, stage, input, output, metadata)`**
+- 日志落盘（便于微调与故障复盘）
+- 记录：Prompt、Response、耗时、Token 消耗
+- 支持按任务 ID 追踪完整链路
+
+---
+
+## 📁 目录结构
 
 ```
 wxr_agent/
@@ -179,44 +281,101 @@ wxr_agent/
 │   │   ├── sqlite_service.py    # 本地数据服务
 │   │   └── hunter_pipeline.py   # 面经爬虫流水线
 │   └── tools/
-│       ├── hunter_tools.py      # 爬虫工具集
+│       ├── hunter_tools.py      # 采集工具集（fetch、parse、clean）
 │       ├── interviewer_tools.py # 面试工具集
 │       └── architect_tools.py   # 知识结构化工具集
+│
+├── 微调/
+│   ├── llm_logs/            # LLM 处理日志（按模型/日期组织）
+│   │   ├── unknown/
+│   │   │   ├── llm_prompt_log.jsonl
+│   │   │   ├── nowcoder_*.jsonl
+│   │   │   └── xiaohongshu_*.jsonl
+│   │   └── qwen3_4b/
+│   └── labeled_data.jsonl   # 标注数据集
 │
 └── web/                    # Vue 3 + Vite 前端工程（npm run build → backend/static/dist）
 ```
 
 ---
 
-## 主要 API 接口
+## 📊 数据流与日志
+
+### 日志类型
+
+| 日志类型 | 存储位置 | 用途 |
+|---------|---------|------|
+| **Task Log** | `微调/llm_logs/` | 任务生命周期（开始/结束/耗时） |
+| **Tool Log** | `微调/llm_logs/` | 每个 Tool 的输入输出摘要 |
+| **Error Log** | `微调/llm_logs/` | 异常堆栈 + 上下文 |
+| **LLM Log** | `微调/llm_logs/llm_prompt_log.jsonl` | Prompt/Response（脱敏后） |
+| **Platform Log** | `微调/llm_logs/nowcoder_*.jsonl` 等 | 按平台分类的处理结果 |
+
+### 日志示例
+
+```jsonl
+{"task_id": "task_001", "stage": "fetch", "url": "https://...", "status": "success", "duration_ms": 1234}
+{"task_id": "task_001", "stage": "parse", "platform": "nowcoder", "extracted_fields": 8, "status": "success"}
+{"task_id": "task_001", "stage": "llm_process", "prompt_tokens": 512, "response_tokens": 256, "status": "success"}
+```
+
+---
+
+## 🔌 主要 API 接口
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `GET` | `/api/questions` | 列出/筛选题目（company/tag/difficulty/keyword/random/limit） |
+| `GET` | `/api/questions` | 列出/筛选题目（company/tag/difficulty/keyword） |
 | `GET` | `/api/questions/random` | 随机取一道题 |
-| `GET` | `/api/questions/meta` | 获取所有公司、标签、岗位（用于前端筛选器） |
+| `GET` | `/api/questions/meta` | 获取所有公司、标签、岗位 |
 | `POST` | `/api/chat` | 与面试官 Agent 对话 |
-| `POST` | `/api/submit_answer` | 提交答案（结构化评分 + SM-2 更新 + 记忆写入） |
-| `POST` | `/api/ingest` | 收录面经（输入 URL，触发爬虫流水线） |
+| `POST` | `/api/submit_answer` | 提交答案（评分 + SM-2 更新） |
+| `POST` | `/api/ingest` | 收录面经（输入 URL，触发采集流水线） |
 | `GET` | `/api/user/{id}/mastery` | 获取用户掌握度报告 |
 | `GET` | `/api/user/{id}/reviews` | 获取今日应复习题目（SM-2） |
-| `GET` | `/api/resources` | 获取知识资源推荐（按标签） |
+| `GET` | `/api/resources` | 获取知识资源推荐 |
 | `POST` | `/api/notes` | 添加笔记 |
-| `POST` | `/api/session/end` | 结束会话（触发本轮评估） |
 
 完整接口文档：http://localhost:8000/docs（后端启动后访问）
 
 ---
 
-## 常见问题
+## 🚀 可扩展性
+
+### 新平台支持
+
+1. 在 `backend/tools/hunter_tools.py` 新增 `parseXXX()` 函数
+2. 在 `detectPlatform()` 中注册 URL 检测规则
+3. 定义统一输出 schema
+
+### 新处理策略
+
+在 Agent B 中新增策略节点，无需修改 Agent A 或 Tool 层。
+
+### 新输出目标
+
+追加写库/消息队列/向量库适配层，保持 Tool 接口不变。
+
+---
+
+## 📈 稳定性建议
+
+- **批处理并发限流**：避免被站点封禁
+- **超时 + 重试 + 熔断**：提升容错能力
+- **结果 schema 校验**：避免脏数据进入下游
+- **全链路日志**：便于故障复盘与数据沉淀
+
+---
+
+## ❓ 常见问题
 
 ### Q: 如何配置默认用户和 Agent 步数？
 在 `.env` 中添加：
-- `DEFAULT_USER_ID=user_001`：前端默认用户 ID（未填写时使用）
-- `INTERVIEWER_MAX_STEPS=8`：Interviewer Agent 最大思考步数（默认 8）
+- `DEFAULT_USER_ID=user_001`
+- `INTERVIEWER_MAX_STEPS=8`
 
 ### Q: `MemoryTool 初始化失败`
-`.env` 文件没有被 `hello_agents` 读取。确认项目根目录存在 `.env` 文件，且 `backend/main.py` 开头有 `load_dotenv(override=True)`。
+确认项目根目录存在 `.env` 文件，且 `backend/main.py` 开头有 `load_dotenv(override=True)`。
 
 ### Q: Neo4j DNS 解析失败（云端）
 改用本地 Docker：`docker compose up -d`，并修改 `backend/config/config.py` 中 `neo4j_uri` 为 `bolt://localhost:7687`。
@@ -225,35 +384,36 @@ wxr_agent/
 检查 Windows IE 代理注册表：
 ```powershell
 Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" | Select ProxyEnable, ProxyServer
-# ProxyEnable 应为 0
 Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -Name ProxyEnable -Value 0
 ```
-然后重启 Docker Desktop。
 
 ### Q: `SetLimitExceeded (429)` LLM 限流
 进入火山引擎控制台 → 模型推理 → 在线推理 → 关闭「安全体验模式」或提升推理配额。
 
 ### Q: 开发模式（代码改动自动重启）
-```powershell
+```bash
 python run.py --reload
 ```
 
 ---
 
-## 数据说明
+## 📚 功能概览
 
-| 数据 | 存储位置 | 说明 |
-|------|----------|------|
-| 面试题目、知识图谱 | Neo4j（本地 Docker） | 通过「收录面经」功能入库 |
-| 用户记录、SM-2 参数 | SQLite (`local_data.db`) | 自动创建 |
-| 四层记忆（对话上下文） | Qdrant Cloud + Neo4j | hello-agents 框架管理 |
-| 学习资源 | SQLite | 首次启动自动预置 |
+| 模块 | 功能 |
+|------|------|
+| **题库浏览** | 按公司、难度、标签、关键词筛选题目；随机抽题 |
+| **面试对话** | 与 AI 面试官实时对话，支持换个问法、举一反三 |
+| **答题评测** | 提交答案后获得评分（0-5）、强弱点分析、AI 解析 |
+| **掌握度追踪** | SM-2 算法计算复习周期，弱点标签自动识别 |
+| **知识推荐** | 针对薄弱点推荐学习资源和知识章节 |
+| **记忆系统** | hello-agents 四层记忆持久化对话上下文 |
+| **面经收录** | 输入牛客/小红书帖子 URL，自动采集并入库 |
+| **笔记功能** | 对任意题目添加个人笔记 |
 
 ---
 
-## 致谢
+## 🙏 致谢
 
 - [hello-agents](https://github.com/datawhalechina/hello-agents)：Agent 框架
 - [DataWhale](https://datawhale.club)：开源社区
 - 火山引擎 Doubao / 阿里云 DashScope：LLM & Embedding 服务
-

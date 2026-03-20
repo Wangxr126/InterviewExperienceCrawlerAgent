@@ -1,0 +1,62 @@
+{
+  "total_unique": 7,
+  "total_calls": 176,
+  "tools": [
+    {
+      "name": "submit_answer",
+      "count": 71,
+      "success": 71,
+      "failed": 0,
+      "success_rate": 100.0,
+      "last_ts": "2026-03-18T09:08:25.266560"
+    },
+    {
+      "name": "get_question_detail",
+      "count": 45,
+      "success": 45,
+      "failed": 0,
+      "success_rate": 100.0,
+      "last_ts": "2026-03-18T09:07:56.976009"
+    },
+    {
+      "name": "recognize_intent",
+      "count": 39,
+      "success": 39,
+      "failed": 0,
+      "success_rate": 100.0,
+      "last_ts": "2026-03-17T08:56:56.104337"
+    },
+    {
+      "name": "record_weakness",
+      "count": 14,
+      "success": 14,
+      "failed": 0,
+      "success_rate": 100.0,
+      "last_ts": "2026-03-17T14:05:32.451710"
+    },
+    {
+      "name": "filter_questions",
+      "count": 3,
+      "success": 3,
+      "failed": 0,
+      "success_rate": 100.0,
+      "last_ts": "2026-03-18T08:27:20.350353"
+    },
+    {
+      "name": "get_recommended_question",
+      "count": 3,
+      "success": 3,
+      "failed": 0,
+      "success_rate": 100.0,
+      "last_ts": "2026-03-18T08:27:13.179056"
+    },
+    {
+      "name": "get_mastery_report",
+      "count": 1,
+      "success": 1,
+      "failed": 0,
+      "success_rate": 100.0,
+      "last_ts": "2026-03-17T11:00:06.285576"
+    }
+  ]
+}

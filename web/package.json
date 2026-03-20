@@ -18,9 +18,12 @@
     "@element-plus/icons-vue": "^2.3.2",
     "@vitejs/plugin-vue": "^6.0.4",
     "codemirror": "^6.0.2",
+    "cytoscape": "^3.33.1",
     "element-plus": "^2.13.5",
     "highlight.js": "^11.11.1",
+    "katex": "^0.16.40",
     "marked": "^17.0.3",
+    "marked-katex-extension": "^5.1.7",
     "pinia": "^3.0.4",
     "vue-codemirror6": "^1.4.3",
     "vue-json-pretty": "^2.6.0"

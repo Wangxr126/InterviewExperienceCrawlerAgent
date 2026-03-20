@@ -45,9 +45,14 @@
       <el-button @click="autoImportAll" :loading="autoImporting" type="primary" size="large">
         {{ autoImporting ? '同步中...' : '🔄 同步日志' }}
       </el-button>
-      <el-button @click="fixMergedSamples" :loading="fixMergedLoading" size="large" title="对 stage2 不完整的样本，用 stage1 补齐缺失字段">
-        {{ fixMergedLoading ? '修复中...' : '🔧 修复 Stage2 合并' }}
-      </el-button>
+      <el-tooltip
+        content="修复 stage2 不完整样本：用 stage1 自动补齐缺失字段"
+        placement="top"
+      >
+        <el-button @click="fixMergedSamples" :loading="fixMergedLoading" size="large">
+          {{ fixMergedLoading ? '修复中...' : '🔧 修复 Stage2 合并' }}
+        </el-button>
+      </el-tooltip>
       <el-button type="success" @click="exportLabeled" :loading="exporting" size="large">
         导出标注数据
       </el-button>
@@ -82,29 +87,36 @@
             @row-click="onSampleClick"
             @selection-change="onSampleSelectionChange"
           >
-            <el-table-column type="selection" width="50" align="center" :selectable="row => row.status === 'labeled'" reserve-selection />
-            <el-table-column label="ID" prop="id" width="80" align="center" />
-            <el-table-column label="面经内容">
+            <el-table-column type="selection" width="40" align="center" :selectable="row => row.status === 'labeled'" reserve-selection />
+            <el-table-column label="ID" prop="id" width="50" align="center" />
+            <el-table-column label="标题" width="240">
               <template #default="{ row }">
-                <div class="content-cell">{{ row.content_preview }}</div>
+                <div class="title-cell" :title="row.title || row.post_title || ''">
+                  {{ row.title || row.post_title || '—' }}
+                </div>
               </template>
             </el-table-column>
-            <el-table-column label="状态" width="120" align="center">
+            <el-table-column label="面经内容">
+              <template #default="{ row }">
+                <div class="content-cell">{{ getBodyPreview(row.content_preview) }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="状态" width="90" align="center">
               <template #default="{ row }">
                 <el-tag :type="row.status === 'labeled' ? 'success' : 'warning'" size="large">
                   {{ row.status === 'labeled' ? '已标注' : '待标注' }}
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="手动修改" width="120" align="center">
+            <el-table-column label="手动修改" width="96" align="center">
               <template #default="{ row }">
                 <el-tag v-if="row.is_modified" type="danger" size="large">已修改</el-tag>
                 <span v-else class="text-muted">—</span>
               </template>
             </el-table-column>
-            <el-table-column label="创建时间" prop="created_at" width="160" />
-            <el-table-column label="修改时间" prop="modified_at" width="160" />
-            <el-table-column label="操作" width="100" align="center" fixed="right">
+            <el-table-column label="创建时间" prop="created_at" width="146" class-name="time-col" />
+            <el-table-column label="修改时间" prop="modified_at" width="146" class-name="time-col" />
+            <el-table-column label="操作" width="72" align="center" fixed="right">
               <template #default="{ row }">
                 <el-button type="danger" link size="small" @click.stop="deleteSample(row)">
                   删除
@@ -129,7 +141,7 @@
       <el-tab-pane label="✏️ 标注编辑" name="editor">
         <div class="editor-container" v-if="currentSample">
           <!-- 编辑器头部 -->
-          <div class="editor-header">
+          <div class="editor-header" ref="editorHeaderRef">
             <div class="header-left">
               <span class="sample-id">样本 #{{ currentSample.id }}</span>
               <el-tag :type="currentSample.status === 'labeled' ? 'success' : 'warning'" size="large">
@@ -145,18 +157,23 @@
           </div>
 
           <!-- 帖子信息 -->
-          <div class="post-info" v-if="currentSample.title || currentSample.source_url">
-            <div class="post-info-title" v-if="currentSample.title">
-              📝 {{ currentSample.title }}
+          <div class="post-info" v-if="currentSample.title || currentSample.post_title || currentSample.source_url || currentSample.url" ref="postInfoRef">
+            <div class="post-info-title" v-if="currentSample.title || currentSample.post_title">
+              <span class="post-info-label">标题</span>
+              <span class="post-info-text" :title="currentSample.title || currentSample.post_title">
+                {{ currentSample.title || currentSample.post_title }}
+              </span>
             </div>
-            <a 
-              v-if="currentSample.source_url" 
-              :href="currentSample.source_url" 
-              target="_blank" 
-              class="post-info-link"
-            >
-              🔗 查看原帖
-            </a>
+            <div class="post-info-url" v-if="currentSample.source_url || currentSample.url">
+              <a
+                :href="currentSample.source_url || currentSample.url"
+                target="_blank"
+                class="post-info-link"
+                :title="currentSample.source_url || currentSample.url"
+              >
+                🔗 原帖 URL
+              </a>
+            </div>
           </div>
 
           <!-- 导航按钮（移到顶部） -->
@@ -175,31 +192,15 @@
             <!-- 左栏：原始面经 -->
             <div class="editor-panel">
               <div class="panel-header">
-                <span class="panel-title">① 原始面经正文</span>
-                <a
-                  v-if="currentSample.source_url"
-                  :href="currentSample.source_url"
-                  target="_blank"
-                  class="post-link-inline"
-                  :title="currentSample.source_url"
-                >
-                  🔗 原帖
-                </a>
+                <span class="panel-title">① 原始面经原文</span>
               </div>
               
-              <!-- 标题 -->
-              <div class="post-meta" v-if="currentSample.title">
-                <div class="post-title">
-                  {{ currentSample.title }}
-                </div>
-              </div>
-              
-              <div class="panel-content">
+              <div class="panel-content content-auto-height">
                 <el-input 
                   type="textarea" 
-                  :model-value="currentSample.content"
+                  :model-value="currentSample.raw_content || currentSample.content || ''"
                   readonly 
-                  :rows="28" 
+                  :autosize="{ minRows: 20, maxRows: 50 }"
                   class="content-textarea"
                 />
               </div>
@@ -232,6 +233,7 @@
                     :type="currentSample?.final_output ? 'warning' : 'info'"
                     size="small"
                   >{{ currentSample?.final_output ? '已修改内容' : (currentSample?.stage2_output ? 'Stage2 豆包生成' : 'Stage1 本地生成') }}</el-tag>
+                  <span class="panel-subtitle">（{{ editQuestionCount }} 道题）</span>
                 </span>
                 <el-button 
                   type="primary" 
@@ -251,30 +253,32 @@
                 <el-button type="info" @click="confirmNoChange" :loading="labeling" size="large">
                   ✔️ 无需修改
                 </el-button>
-                <el-button @click="formatEditOutput" size="large">格式化 JSON</el-button>
               </div>
 
               <!-- 查找/替换工具栏（Ctrl+F 也可打开编辑器内置搜索） -->
               <div class="find-replace-bar">
-                <el-input
-                  v-model="findText"
-                  placeholder="查找"
-                  size="small"
-                  clearable
-                  style="width: 140px"
-                  @keyup.enter="doReplace"
-                />
-                <el-input
-                  v-model="replaceText"
-                  placeholder="替换为"
-                  size="small"
-                  clearable
-                  style="width: 140px"
-                  @keyup.enter="doReplace"
-                />
-                <el-button size="small" @click="doReplace">替换</el-button>
-                <el-button size="small" @click="doReplaceAll">全部替换</el-button>
-                <span class="find-tip">Ctrl+F 查找</span>
+                <div class="find-replace-row">
+                  <label class="find-replace-label">查找：</label>
+                  <el-input
+                    v-model="findText"
+                    placeholder="输入要查找的内容"
+                    size="small"
+                    clearable
+                    @keyup.enter="doReplace"
+                  />
+                </div>
+                <div class="find-replace-row">
+                  <label class="find-replace-label">替换：</label>
+                  <el-input
+                    v-model="replaceText"
+                    placeholder="输入替换内容"
+                    size="small"
+                    clearable
+                    @keyup.enter="doReplace"
+                  />
+                  <el-button size="small" @click="doReplace">替换</el-button>
+                  <el-button size="small" @click="doReplaceAll">全部替换</el-button>
+                </div>
               </div>
               <!-- 可编辑的 JSON 编辑器（语法高亮 + 查找替换） -->
               <div class="panel-content json-editor-wrap">
@@ -302,21 +306,61 @@
       <!-- Tab 3: 日志文件 -->
       <el-tab-pane label="📂 导入日志" name="logs">
         <div class="logs-container">
-          <div class="section-title">两阶段对比数据导入（同一题目的 Stage1 Qwen3 vs Stage2 豆包）</div>
-          <el-table :data="logFiles" class="logs-table">
-            <el-table-column label="模型" prop="model" width="180" />
-            <el-table-column label="文件名" prop="filename" />
-            <el-table-column label="条数" prop="line_count" width="100" align="center" />
-            <el-table-column label="修改时间" prop="mtime" width="200" />
-            <el-table-column label="操作" width="260" align="center">
-              <template #default="{ row }">
-                <el-button size="large" @click.stop="previewLog(row)">查看</el-button>
-                <el-button size="large" type="primary" @click.stop="importLog(row)">导入</el-button>
-                <el-button size="large" type="danger" link @click.stop="deleteLogFile(row)">删除</el-button>
-              </template>
-            </el-table-column>
-          </el-table>
-          <div class="tip-text">💡 对比数据存在 <code>微调/llm_logs/miner_two_stage_log.jsonl</code>，每次 Miner 两阶段提取成功时自动追加。点击「同步日志」批量导入，或对 miner_two_stage_log 点「导入」；重复记录自动跳过</div>
+          <!-- 日志文件列表 -->
+          <div class="logs-section">
+            <div class="section-title">📋 日志文件列表</div>
+            <div class="section-subtitle">两阶段对比数据导入（同一题目的 Stage1 Qwen3 vs Stage2 豆包）</div>
+            <el-table :data="logFiles" class="logs-table">
+              <el-table-column label="模型" prop="model" width="180" />
+              <el-table-column label="文件名" prop="filename" />
+              <el-table-column label="条数" prop="line_count" width="100" align="center" />
+              <el-table-column label="修改时间" prop="mtime" width="200" />
+              <el-table-column label="操作" width="260" align="center">
+                <template #default="{ row }">
+                  <el-button size="large" @click.stop="previewLog(row)">查看</el-button>
+                  <el-button size="large" type="primary" @click.stop="importLog(row)">导入</el-button>
+                  <el-button size="large" type="danger" link @click.stop="deleteLogFile(row)">删除</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+            <div class="tip-text">
+              💡 预览（「查看」）直接读取 <code>微调/llm_logs/</code> 的 JSONL 文件，不写入数据库；<br />
+              导入（「导入」/「导入全部」）会把样本写入 SQLite 表 <code>finetune_samples</code>，并把本次统计写入 <code>finetune_import_logs</code>；重复记录自动跳过
+            </div>
+          </div>
+
+          <!-- 导入历史 -->
+          <div class="logs-section" style="margin-top: 32px;">
+            <div class="section-title">📊 导入历史</div>
+            <div class="section-subtitle">追踪每次导入的详细信息和失败样本</div>
+            <el-table :data="importLogs" class="import-logs-table" max-height="400">
+              <el-table-column label="导入ID" prop="import_log_id" width="140" show-overflow-tooltip />
+              <el-table-column label="文件名" prop="filename" width="180" show-overflow-tooltip />
+              <el-table-column label="成功" prop="imported" width="80" align="center">
+                <template #default="{ row }">
+                  <el-tag type="success">{{ row.imported }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="跳过" prop="skipped" width="80" align="center">
+                <template #default="{ row }">
+                  <el-tag type="info">{{ row.skipped }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="失败" prop="failed" width="80" align="center">
+                <template #default="{ row }">
+                  <el-tag v-if="row.failed > 0" type="danger">{{ row.failed }}</el-tag>
+                  <span v-else class="text-muted">—</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="导入时间" prop="created_at" width="180" />
+              <el-table-column label="操作" width="200" align="center">
+                <template #default="{ row }">
+                  <el-button size="small" @click.stop="viewImportLogDetail(row)">详情</el-button>
+                  <el-button size="small" type="danger" link @click.stop="deleteImportLog(row)">删除</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
         </div>
       </el-tab-pane>
 
@@ -339,7 +383,7 @@
             accept=".csv,.json,.jsonl,.txt"
             drag
           >
-            <el-icon class="el-icon--upload"><upload-filled /></el-icon>
+            <UploadFilled class="el-icon--upload" />
             <div class="el-upload__text">将文件拖到此处，或<em>点击上传</em></div>
             <template #tip>
               <div class="el-upload__tip">支持 .csv, .json, .jsonl, .txt</div>
@@ -381,13 +425,13 @@
             <el-divider content-position="left">基础配置</el-divider>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">基座模型<el-tooltip content="Ollama 本地模型名或 HuggingFace 模型 ID。训练时 Unsloth 会使用 unsloth/Qwen3-4B 作为基座，与 Ollama 的 qwen3:4b 架构一致。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">基座模型<el-tooltip content="Ollama 本地模型名或 HuggingFace 模型 ID。训练时 Unsloth 会使用 unsloth/Qwen3-4B 作为基座，与 Ollama 的 qwen3:4b 架构一致。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-input v-model="runConfig.base_model" placeholder="qwen3:4b" />
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">微调方式<el-tooltip content="LoRA 使用 16bit 精度，效果更好但显存约 10GB；QLoRA 使用 4bit 量化，省显存但略慢。Qwen3 推荐 LoRA。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">微调方式<el-tooltip content="LoRA 使用 16bit 精度，效果更好但显存约 10GB；QLoRA 使用 4bit 量化，省显存但略慢。Qwen3 推荐 LoRA。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-radio-group v-model="runConfig.method">
                 <el-radio value="lora">LoRA（16bit，更准，显存约 10GB）</el-radio>
@@ -396,7 +440,7 @@
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">输出名称<el-tooltip content="训练完成后 LoRA 适配器的保存目录名，将保存在 微调/lora_output/ 下。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">输出名称<el-tooltip content="训练完成后 LoRA 适配器的保存目录名，将保存在 微调/lora_output/ 下。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-input v-model="runConfig.output_name" placeholder="qwen3-4b-miner-lora" />
             </el-form-item>
@@ -404,19 +448,19 @@
             <el-divider content-position="left">LoRA 参数</el-divider>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">LoRA Rank (r)<el-tooltip content="低秩矩阵的秩。越大表达能力越强但显存越高、训练越慢。推荐 8 或 16。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">LoRA Rank (r)<el-tooltip content="低秩矩阵的秩。越大表达能力越强但显存越高、训练越慢。推荐 8 或 16。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-input-number v-model="runConfig.lora_r" :min="4" :max="128" :step="4" />
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">LoRA Alpha<el-tooltip content="LoRA 更新的缩放因子。建议设为 rank 的 2 倍，如 r=16 则 alpha=32。影响学习强度。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">LoRA Alpha<el-tooltip content="LoRA 更新的缩放因子。建议设为 rank 的 2 倍，如 r=16 则 alpha=32。影响学习强度。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-input-number v-model="runConfig.lora_alpha" :min="4" :max="256" :step="4" />
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">LoRA Dropout<el-tooltip content="训练时随机丢弃 LoRA 激活的比例，用于防止过拟合。0 可加速训练，0.05 可提升泛化。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">LoRA Dropout<el-tooltip content="训练时随机丢弃 LoRA 激活的比例，用于防止过拟合。0 可加速训练，0.05 可提升泛化。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-input-number v-model="runConfig.lora_dropout" :min="0" :max="0.5" :step="0.01" />
             </el-form-item>
@@ -449,7 +493,7 @@
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">rsLoRA<el-tooltip content="Rank-Stabilized LoRA，使用 alpha/sqrt(r) 缩放，可提升高 rank 时的稳定性。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">rsLoRA<el-tooltip content="Rank-Stabilized LoRA，使用 alpha/sqrt(r) 缩放，可提升高 rank 时的稳定性。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-switch v-model="runConfig.use_rslora" />
               <span class="form-tip-inline">启用可提升稳定性</span>
@@ -458,49 +502,49 @@
             <el-divider content-position="left">训练参数</el-divider>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">学习率<el-tooltip content="梯度更新步长。LoRA 推荐 2e-4，DPO/RL 等推荐 5e-6。过大易发散，过小收敛慢。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">学习率<el-tooltip content="梯度更新步长。LoRA 推荐 2e-4，DPO/RL 等推荐 5e-6。过大易发散，过小收敛慢。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-input v-model="runConfig.learning_rate" placeholder="2e-4" />
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">训练轮数<el-tooltip content="完整遍历数据集的次数。1-3 轮通常足够，过多易过拟合、记忆训练集。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">训练轮数<el-tooltip content="完整遍历数据集的次数。1-3 轮通常足够，过多易过拟合、记忆训练集。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-input-number v-model="runConfig.num_epochs" :min="1" :max="10" />
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">Batch Size<el-tooltip content="每步处理的样本数。越大显存越高，通常设为 1-4。配合梯度累积达到有效 batch size。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">Batch Size<el-tooltip content="每步处理的样本数。越大显存越高，通常设为 1-4。配合梯度累积达到有效 batch size。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-input-number v-model="runConfig.per_device_train_batch_size" :min="1" :max="16" />
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">梯度累积步数<el-tooltip content="累积多少步再更新权重。有效 batch = batch_size × 梯度累积。推荐 8-16 达到稳定训练。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">梯度累积步数<el-tooltip content="累积多少步再更新权重。有效 batch = batch_size × 梯度累积。推荐 8-16 达到稳定训练。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-input-number v-model="runConfig.gradient_accumulation_steps" :min="1" :max="64" />
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">最大序列长度<el-tooltip content="单条样本的最大 token 数。越长显存越高。面经提取 2048 通常足够。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">最大序列长度<el-tooltip content="单条样本的最大 token 数。越长显存越高。面经提取 2048 通常足够。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-input-number v-model="runConfig.max_seq_length" :min="256" :max="8192" :step="256" />
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">Warmup 比例<el-tooltip content="训练初期学习率从 0 线性升到目标值的步数占比。0.1 表示前 10% 步数 warmup。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">Warmup 比例<el-tooltip content="训练初期学习率从 0 线性升到目标值的步数占比。0.1 表示前 10% 步数 warmup。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-input-number v-model="runConfig.warmup_ratio" :min="0" :max="0.5" :step="0.05" />
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">Weight Decay<el-tooltip content="L2 正则化系数，防止权重过大。0.01 为常用值。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">Weight Decay<el-tooltip content="L2 正则化系数，防止权重过大。0.01 为常用值。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-input-number v-model="runConfig.weight_decay" :min="0" :max="0.2" :step="0.01" />
             </el-form-item>
             <el-form-item>
               <template #label>
-                <span class="label-with-help">训练精度<el-tooltip content="BF16：BFloat16，省约 50% 显存，推荐。FP16：半精度，兼容性好。4bit：仅 QLoRA 时可用，最省显存。FP32：全精度，显存最高、最慢。" placement="top"><el-icon class="param-help"><QuestionFilled /></el-icon></el-tooltip></span>
+                <span class="label-with-help">训练精度<el-tooltip content="BF16：BFloat16，省约 50% 显存，推荐。FP16：半精度，兼容性好。4bit：仅 QLoRA 时可用，最省显存。FP32：全精度，显存最高、最慢。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
               <el-select v-model="runConfig.precision" placeholder="选择训练精度" style="width:200px">
                 <el-option label="BF16（推荐，省显存）" value="bf16" />
@@ -512,11 +556,11 @@
           </el-form>
 
           <div class="oneclick-data-tip" v-if="selectedSampleIds.length > 0">
-            <el-icon><InfoFilled /></el-icon>
+            <InfoFilled />
             已从样本列表选择 <strong>{{ selectedSampleIds.length }}</strong> 条用于本次训练
           </div>
           <div class="oneclick-data-tip muted" v-else>
-            <el-icon><InfoFilled /></el-icon>
+            <InfoFilled />
             未选择样本时，将使用「导出标注数据」生成的全部数据。可在样本列表中勾选已标注样本以指定训练数据。
           </div>
           <div class="oneclick-actions">
@@ -551,7 +595,7 @@
           <!-- 训练状态/进度 -->
           <div v-if="generateResult" class="train-status-card">
             <div class="train-status-header">
-              <el-icon class="status-icon"><CircleCheckFilled /></el-icon>
+              <CircleCheckFilled class="status-icon" />
               <span>训练脚本已生成</span>
             </div>
             <el-steps direction="vertical" :active="2" finish-status="success">
@@ -583,7 +627,7 @@
       top="5vh"
     >
       <div v-if="previewLoading" class="preview-loading">
-        <el-icon class="is-loading"><Loading /></el-icon>
+        <Loading class="is-loading" />
         <span>加载中...</span>
       </div>
       <div v-else-if="previewData.samples && previewData.samples.length > 0" class="preview-container">
@@ -659,7 +703,7 @@
 <script setup>
 import { ref, computed, watch, nextTick, onMounted, onActivated } from 'vue'
 import { Refresh, Loading, UploadFilled, QuestionFilled, CircleCheckFilled, InfoFilled } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import VueJsonPretty from 'vue-json-pretty'
 import 'vue-json-pretty/lib/styles.css'
 import CodeMirror from 'vue-codemirror6'
@@ -774,11 +818,79 @@ const fixMergedSamples = async () => {
 // 日志文件
 const logFiles = ref([])
 const loadLogFiles = async () => { logFiles.value = await api.get(`${BASE}/log-files`) }
+
+// 导入历史
+const importLogs = ref([])
+const loadImportLogs = async () => { 
+  try {
+    importLogs.value = await api.get(`${BASE}/import-logs`)
+  } catch (e) {
+    console.warn('加载导入历史失败', e)
+    importLogs.value = []
+  }
+}
+
+const viewImportLogDetail = async (row) => {
+  try {
+    const detail = await api.get(`${BASE}/import-log/${row.import_log_id}`)
+    const duplicateCount = detail.duplicate_count ?? detail.duplicated ?? detail.skipped ?? 0
+    const reasonSummary = detail.error_summary || {}
+    const reasonText = Object.keys(reasonSummary).length
+      ? `失败原因统计: ${Object.entries(reasonSummary).map(([k, v]) => `${k}(${v})`).join('；')}`
+      : ''
+    ElMessage.info(`
+导入ID: ${detail.import_log_id}
+文件: ${detail.filename}
+成功: ${detail.imported} | 重复(跳过): ${duplicateCount} | 失败: ${detail.failed}
+时间: ${detail.created_at}
+${reasonText}
+${detail.failed_samples?.length ? '失败样本: ' + detail.failed_samples.map(s => `行${s.line}: ${s.reason || '异常'} - ${s.error}`).join('; ') : ''}
+    `.trim())
+  } catch (e) {
+    ElMessage.error('获取详情失败: ' + e.message)
+  }
+}
+
+const deleteImportLog = async (row) => {
+  if (!confirm(`确定删除导入记录「${row.import_log_id}」及其 ${row.imported + row.skipped + row.failed} 条样本？此操作不可恢复。`)) return
+  try {
+    const res = await fetch(`${BASE}/import-log/${row.import_log_id}`, { method: 'DELETE' })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.detail || data.message || '删除失败')
+    ElMessage.success(`已删除 ${data.deleted_samples} 条样本`)
+    await loadImportLogs()
+    await loadStats()
+  } catch (e) {
+    ElMessage.error('删除失败: ' + (e.message || e))
+  }
+}
+
 const importLog = async (row) => {
   const res = await api.post(`${BASE}/import`, { log_path: row.path })
-  ElMessage.success(`导入完成：新增 ${res.imported} 条，跳过 ${res.skipped} 条`)
+  const duplicateCount = res.duplicated ?? res.skipped ?? 0
+  const reasonSummary = res.details?.error_summary || {}
+  const reasonText = Object.keys(reasonSummary).length
+    ? Object.entries(reasonSummary).map(([k, v]) => `${k}(${v})`).join('；')
+    : ''
+  ElMessage.success(`导入完成：新增 ${res.imported} 条，重复(跳过) ${duplicateCount} 条${res.failed ? '，失败 ' + res.failed + ' 条' : ''}`)
+  if (res.failed > 0) {
+    const failedLinesText = res.details?.failed_samples?.length
+      ? res.details.failed_samples.map(s => `行${s.line}: ${s.reason || '异常'} - ${s.error}`).join('\n')
+      : '无失败样本详情'
+    await ElMessageBox.alert(
+      `文件：${res.details?.file || row.filename || ''}\n` +
+      `新增：${res.imported} 条\n` +
+      `重复(跳过)：${duplicateCount} 条\n` +
+      `失败：${res.failed} 条\n` +
+      `${reasonText ? `失败原因统计：${reasonText}\n` : ''}` +
+      `失败样本（最多10条）：\n${failedLinesText}`,
+      '导入结果（含失败原因）',
+      { confirmButtonText: '我知道了' }
+    )
+  }
   await loadStats()
   await loadSamples(1)
+  await loadImportLogs()  // 刷新导入历史
   activeTab.value = 'list'
 }
 
@@ -858,6 +970,63 @@ const pagerTotal = ref(0)
 const activeTab = ref('list')
 const sampleTableRef = ref(null)
 const selectedSampleIds = ref([])
+const editorHeaderRef = ref(null)
+const postInfoRef = ref(null)
+
+const isScrollable = (el) => {
+  if (!el) return false
+  const style = window.getComputedStyle(el)
+  const overflowY = style.overflowY
+  return (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') && el.scrollHeight > el.clientHeight
+}
+
+const getScrollableAncestors = (el) => {
+  const ancestors = []
+  let node = el?.parentElement
+  while (node) {
+    if (isScrollable(node)) ancestors.push(node)
+    node = node.parentElement
+  }
+  return ancestors
+}
+
+// 预留页面顶部空间，确保“标题 + 上/下一题”都能完整露出
+const EDITOR_TOP_OFFSET = 72
+
+const getAbsoluteTop = (el) => {
+  let top = 0
+  let node = el
+  while (node) {
+    top += node.offsetTop || 0
+    node = node.offsetParent
+  }
+  return top
+}
+
+const scrollToEditorAnchor = () => {
+  const anchorEl = postInfoRef.value || editorHeaderRef.value
+  if (!anchorEl) return
+  // 先把每个可滚动父容器滚到锚点绝对位置（相对该容器内容区）
+  const scrollParents = getScrollableAncestors(anchorEl)
+  scrollParents.forEach((parent) => {
+    const targetTop =
+      anchorEl.getBoundingClientRect().top -
+      parent.getBoundingClientRect().top +
+      parent.scrollTop -
+      EDITOR_TOP_OFFSET
+    parent.scrollTo({
+      top: Math.max(0, targetTop),
+      behavior: 'auto',
+    })
+  })
+
+  // 再兜底滚动 window/document
+  const top = getAbsoluteTop(anchorEl) - EDITOR_TOP_OFFSET
+  window.scrollTo({
+    top: Math.max(0, top),
+    behavior: 'auto',
+  })
+}
 
 const onSampleSelectionChange = (selection) => {
   const idsOnPage = samples.value.map(r => r.id)
@@ -888,12 +1057,41 @@ const loadSamples = async (page = currentPage.value) => {
   })
   if (filterStatus.value) params.set('status', filterStatus.value)
   const res = await api.get(`${BASE}/samples?${params}`)
-  samples.value = res.items || []
+  samples.value = (res.items || []).map(item => ({
+    ...item,
+    // 确保 content_preview 是完整的 content（不截断）
+    content_preview: item.content || ''
+  }))
   pagerTotal.value = res.total || 0
   nextTick(() => {
     const toSelect = samples.value.filter(r => selectedSampleIds.value.includes(r.id))
     toSelect.forEach(row => sampleTableRef.value?.toggleRowSelection(row, true))
   })
+}
+
+const getBodyPreview = (text) => {
+  const raw = (text || '').trim()
+  if (!raw) return ''
+
+  // 统一换行，便于跨行正则
+  const normalized = raw.replace(/\r\n?/g, '\n')
+
+  // 1) 优先从“正文标记”后截取：支持 [正文] / 【正文】 / 正文:
+  const bodyMarker = normalized.match(/(?:\[\s*正文\s*\]|【\s*正文\s*】|^\s*正文\s*[：:])\s*([\s\S]*)$/m)
+  if (bodyMarker?.[1]) return bodyMarker[1].trim()
+
+  // 2) 没有正文标记时，先删除“标题段”：支持 [标题] / 【标题】 / 标题:
+  let stripped = normalized
+    .replace(/(?:\[\s*标题\s*\]|【\s*标题\s*】|^\s*标题\s*[：:])\s*[^\n]*\n?/gm, '')
+    .trim()
+
+  // 3) 删除残留的单独标记行（有些数据会把标签单独占一行）
+  stripped = stripped
+    .replace(/^\s*(?:\[\s*标题\s*\]|【\s*标题\s*】|\[\s*正文\s*\]|【\s*正文\s*】)\s*$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+
+  return stripped
 }
 
 const onSampleClick = async (row, column, event) => {
@@ -904,6 +1102,7 @@ const onSampleClick = async (row, column, event) => {
   const prefill = detail.final_output || detail.assist_output || detail.stage2_output || ''
   editOutput.value = prefill ? formatJson(prefill) : ''
   activeTab.value = 'editor'
+  nextTick(() => scrollToEditorAnchor())
 }
 
 // 导航功能
@@ -915,16 +1114,25 @@ const currentSampleIndex = computed(() => {
 const hasPrevSample = computed(() => currentSampleIndex.value > 0)
 const hasNextSample = computed(() => currentSampleIndex.value >= 0 && currentSampleIndex.value < samples.value.length - 1)
 
-const gotoPrevSample = async () => {
-  if (hasPrevSample.value) {
-    await onSampleClick(samples.value[currentSampleIndex.value - 1])
+const gotoNextSample = async () => {
+  if (hasNextSample.value) {
+    clearFindReplace()
+    await onSampleClick(samples.value[currentSampleIndex.value + 1])
+    nextTick(() => scrollToEditorAnchor())
   }
 }
 
-const gotoNextSample = async () => {
-  if (hasNextSample.value) {
-    await onSampleClick(samples.value[currentSampleIndex.value + 1])
+const gotoPrevSample = async () => {
+  if (hasPrevSample.value) {
+    clearFindReplace()
+    await onSampleClick(samples.value[currentSampleIndex.value - 1])
+    nextTick(() => scrollToEditorAnchor())
   }
+}
+
+const clearFindReplace = () => {
+  findText.value = ''
+  replaceText.value = ''
 }
 
 // 标注编辑器
@@ -936,12 +1144,47 @@ const exporting = ref(false)
 const findText = ref('')
 const replaceText = ref('')
 
+// 自动格式化防抖计时器
+let autoFormatTimer = null
+
+// 智能自动格式化：检测到完整 JSON 时自动格式化
+const autoFormatJson = () => {
+  if (autoFormatTimer) clearTimeout(autoFormatTimer)
+  
+  autoFormatTimer = setTimeout(() => {
+    const text = editOutput.value.trim()
+    if (!text) return
+    
+    // 只在看起来像完整 JSON 时才尝试格式化
+    // 检查：以 { 或 [ 开头，以 } 或 ] 结尾
+    if ((text.startsWith('{') && text.endsWith('}')) || 
+        (text.startsWith('[') && text.endsWith(']'))) {
+      try {
+        const parsed = JSON.parse(text)
+        const formatted = JSON.stringify(parsed, null, 2)
+        // 只在格式确实改变时才更新（避免不必要的重排）
+        if (formatted !== text) {
+          editOutput.value = formatted
+        }
+      } catch (e) {
+        // JSON 无效，不格式化，保持原样
+      }
+    }
+  }, 800) // 800ms 防抖延迟，用户停止输入后才格式化
+}
+
+// 监听 editOutput 变化，触发自动格式化
+watch(editOutput, () => {
+  autoFormatJson()
+})
+
 const doReplace = () => {
   if (!findText.value) { ElMessage.warning('请输入查找内容'); return }
   const idx = editOutput.value.indexOf(findText.value)
   if (idx === -1) { ElMessage.info('未找到匹配内容'); return }
   editOutput.value = editOutput.value.replace(findText.value, replaceText.value)
   ElMessage.success('已替换 1 处')
+  scrollToEditorAnchor()
 }
 
 const doReplaceAll = () => {
@@ -951,6 +1194,7 @@ const doReplaceAll = () => {
   if (count === 0) { ElMessage.info('未找到匹配内容'); return }
   editOutput.value = parts.join(replaceText.value)
   ElMessage.success(`已全部替换 ${count} 处`)
+  scrollToEditorAnchor()
 }
 
 const isModified = computed(() => {
@@ -968,12 +1212,37 @@ const parseJson = (str) => {
   try { return JSON.parse(str) } catch { return { error: '无效JSON', raw: str } }
 }
 
+// 将后端输出的 JSON 字符串格式化为可读的缩进文本。
+// 若不是合法 JSON，则保持原样，避免点击/跳转时直接报错。
+const formatJson = (str) => {
+  if (str === null || str === undefined) return ''
+  if (typeof str !== 'string') {
+    try { return JSON.stringify(str, null, 2) } catch { return String(str) }
+  }
+  const s = str.trim()
+  if (!s) return ''
+  try {
+    return JSON.stringify(JSON.parse(s), null, 2)
+  } catch {
+    return str
+  }
+}
+
 // Stage1 题目数量
 const stage1QuestionCount = computed(() => {
   const raw = currentSample.value?.stage1_output
   if (!raw) return 0
   try {
     const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.length : 0
+  } catch { return 0 }
+})
+
+// 编辑区题目数量（当前编辑的JSON中的题目数）
+const editQuestionCount = computed(() => {
+  if (!editOutput.value) return 0
+  try {
+    const parsed = JSON.parse(editOutput.value)
     return Array.isArray(parsed) ? parsed.length : 0
   } catch { return 0 }
 })
@@ -997,14 +1266,7 @@ const onEditOutputChange = (newData) => {
   editOutput.value = JSON.stringify(newData, null, 2)
 }
 
-const formatJson = (str) => {
-  if (!str) return ''
-  try { return JSON.stringify(JSON.parse(str), null, 2) } catch { return str }
-}
 
-const formatEditOutput = () => {
-  editOutput.value = formatJson(editOutput.value)
-}
 
 const callAssist = async () => {
   if (!currentSample.value) return
@@ -1015,6 +1277,7 @@ const callAssist = async () => {
     if (res.error) { ElMessage.error('大模型调用失败：' + res.error); return }
     editOutput.value = formatJson(res.output)
     ElMessage.success(`大模型（${res.model}）生成完成`)
+    nextTick(() => scrollToEditorAnchor())
   } finally {
     assisting.value = false
   }
@@ -1034,6 +1297,7 @@ const confirmLabel = async () => {
       currentSample.value.status = 'labeled'
       currentSample.value.labeled_at = res.labeled_at
       loadStats()
+      scrollToEditorAnchor()
       // 自动跳转到下一题
       if (hasNextSample.value) {
         setTimeout(() => gotoNextSample(), 500)
@@ -1066,6 +1330,7 @@ const confirmNoChange = async () => {
       currentSample.value.status = 'labeled'
       currentSample.value.labeled_at = res.labeled_at
       loadStats()
+      scrollToEditorAnchor()
       // 自动跳转到下一题
       if (hasNextSample.value) {
         setTimeout(() => gotoNextSample(), 500)
@@ -1372,9 +1637,29 @@ onActivated(async () => {
 }
 
 .content-cell {
-  font-size: 15px;
-  line-height: 1.6;
+  font-size: 14px;
+  line-height: 1.55;
   color: #374151;
+  white-space: pre-line;
+  word-break: break-word;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+
+.title-cell {
+  font-size: 14px;
+  color: #374151;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sample-table :deep(.time-col .cell) {
+  font-size: 12px;
+  color: #6b7280;
 }
 
 .text-muted {
@@ -1431,7 +1716,7 @@ onActivated(async () => {
 }
 
 .time-info {
-  font-size: 14px;
+  font-size: 12px;
   color: #6b7280;
 }
 
@@ -1469,42 +1754,85 @@ onActivated(async () => {
 }
 
 .post-info {
-  padding: 16px 20px;
-  background: #fffbeb;
-  border-radius: 8px;
+  padding: 12px 14px;
+  background: linear-gradient(180deg, #fffef5 0%, #fffdf0 100%);
+  border-radius: 10px;
   margin-bottom: 16px;
-  border-left: 4px solid #f59e0b;
+  border: 1px solid #fde68a;
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 16px;
+  gap: 14px;
 }
 
 .post-info-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: #92400e;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   flex: 1;
-  line-height: 1.5;
+}
+
+.post-info-url {
+  flex-shrink: 0;
+}
+
+.post-info-label {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  flex-shrink: 0;
+}
+
+.post-info-text {
+  font-size: 14px;
+  color: #1f2937;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .post-info-link {
-  display: inline-block;
-  font-size: 14px;
-  color: #f59e0b;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  font-size: 13px;
+  color: #1d4ed8;
   text-decoration: none;
-  padding: 6px 16px;
-  border-radius: 6px;
-  background: white;
-  border: 1px solid #fbbf24;
+  padding: 0 12px;
+  border-radius: 999px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
   transition: all 0.2s;
+  font-weight: 600;
   white-space: nowrap;
 }
 
 .post-info-link:hover {
-  background: #fef3c7;
-  color: #d97706;
-  border-color: #f59e0b;
+  background: #dbeafe;
+  color: #1e40af;
+  border-color: #93c5fd;
+  transform: translateY(-1px);
+}
+
+@media (max-width: 900px) {
+  .post-info {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .post-info-url {
+    align-self: flex-start;
+  }
 }
 
 .post-meta {
@@ -1563,6 +1891,51 @@ onActivated(async () => {
   border-color: #93c5fd;
 }
 
+/* 原始面经URL链接 */
+.source-url-link {
+  display: block;
+  font-size: 13px;
+  color: #3b82f6;
+  text-decoration: none;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  margin-top: 8px;
+  word-break: break-all;
+  transition: all 0.2s;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+.source-url-link:hover {
+  background: #dbeafe;
+  color: #2563eb;
+  border-color: #93c5fd;
+  box-shadow: 0 2px 8px rgba(59, 130, 246, 0.2);
+}
+
+/* 自适应高度的内容区 */
+.content-auto-height {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.content-auto-height .el-textarea {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.content-auto-height :deep(.el-textarea__inner) {
+  flex: 1;
+  resize: vertical;
+  min-height: 300px;
+}
+
 .panel-title {
   font-size: 16px;
   font-weight: 600;
@@ -1597,20 +1970,59 @@ onActivated(async () => {
 
 .find-replace-bar {
   display: flex;
-  align-items: center;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 10px;
-  padding: 10px 14px;
+  padding: 12px 14px;
   background: #f8fafc;
   border-radius: 8px;
   margin-bottom: 12px;
   border: 1px solid #e2e8f0;
 }
 
+.find-replace-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.find-replace-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #475569;
+  white-space: nowrap;
+  min-width: 50px;
+}
+
+.find-replace-row .el-input {
+  flex: 1;
+  min-width: 200px;
+}
+
+.find-replace-row .el-button {
+  white-space: nowrap;
+}
+
 .find-replace-bar .find-tip {
   font-size: 12px;
   color: #94a3b8;
-  margin-left: 4px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.auto-format-tip {
+  font-size: 12px;
+  color: #10b981;
+  margin-left: auto;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  background: #f0fdf4;
+  border-radius: 6px;
+  border: 1px solid #bbf7d0;
+  white-space: nowrap;
 }
 
 .json-editor-wrap {
@@ -2043,6 +2455,8 @@ onActivated(async () => {
   cursor: help;
   font-size: 14px;
   vertical-align: middle;
+  display: inline-flex;
+  align-items: center;
 }
 .label-with-help .param-help:hover { color: #3b82f6; }
 .oneclick-actions {
@@ -2066,7 +2480,7 @@ onActivated(async () => {
   color: #166534;
   margin-bottom: 20px;
 }
-.train-status-header .status-icon { font-size: 24px; }
+.train-status-header .status-icon { font-size: 24px; width: 24px; height: 24px; }
 .step-desc { margin-bottom: 8px; color: #374151; }
 .train-cmd {
   padding: 12px 16px;
@@ -2088,5 +2502,47 @@ onActivated(async () => {
 .selected-tip strong { color: #15803d; }
 .oneclick-data-tip { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; padding: 12px; background: #f0fdf4; border-radius: 8px; font-size: 13px; color: #166534; }
 .oneclick-data-tip.muted { background: #f8fafc; color: #64748b; }
-.oneclick-data-tip .el-icon { font-size: 18px; flex-shrink: 0; }
+.oneclick-data-tip svg { font-size: 18px; flex-shrink: 0; width: 18px; height: 18px; }
+
+/* 原文链接徽章 */
+.source-url-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+  color: white;
+  text-decoration: none;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+  transition: all 0.3s ease;
+  box-shadow: 0 2px 8px rgba(59, 130, 246, 0.3);
+  white-space: nowrap;
+}
+
+.source-url-badge:hover {
+  background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+  transform: translateY(-2px);
+}
+
+.source-url-empty {
+  display: inline-block;
+  padding: 6px 12px;
+  background: #f3f4f6;
+  color: #9ca3af;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+@keyframes rotating {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
 </style>

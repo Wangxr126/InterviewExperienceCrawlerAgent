@@ -266,6 +266,11 @@ class SqliteService:
                 trace_session_id TEXT,
                 agent_used_tool INTEGER DEFAULT 0,
                 ocr_called      INTEGER DEFAULT 0,
+                status          TEXT DEFAULT 'pending',
+                worker_id       TEXT DEFAULT '',
+                locked_at       DATETIME,
+                attempts        INTEGER DEFAULT 0,
+                last_error      TEXT DEFAULT '',
                 created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """,
@@ -364,10 +369,27 @@ class SqliteService:
                         trace_session_id TEXT,
                         agent_used_tool INTEGER DEFAULT 0,
                         ocr_called      INTEGER DEFAULT 0,
+                        status          TEXT DEFAULT 'pending',
+                        worker_id       TEXT DEFAULT '',
+                        locked_at       DATETIME,
+                        attempts        INTEGER DEFAULT 0,
+                        last_error      TEXT DEFAULT '',
                         created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
                 logger.info("stage2_pending 表已创建")
+            # 迁移：为 stage2_pending 增加“恢复字段”（旧库升级用）
+            stage2_cols = [r[1] for r in conn.execute("PRAGMA table_info(stage2_pending)").fetchall()]
+            if "status" not in stage2_cols:
+                conn.execute("ALTER TABLE stage2_pending ADD COLUMN status TEXT DEFAULT 'pending'")
+            if "worker_id" not in stage2_cols:
+                conn.execute("ALTER TABLE stage2_pending ADD COLUMN worker_id TEXT DEFAULT ''")
+            if "locked_at" not in stage2_cols:
+                conn.execute("ALTER TABLE stage2_pending ADD COLUMN locked_at DATETIME")
+            if "attempts" not in stage2_cols:
+                conn.execute("ALTER TABLE stage2_pending ADD COLUMN attempts INTEGER DEFAULT 0")
+            if "last_error" not in stage2_cols:
+                conn.execute("ALTER TABLE stage2_pending ADD COLUMN last_error TEXT DEFAULT ''")
             conn.commit()
         logger.info("✅ SQLite 所有表初始化完成")
         self._seed_knowledge_resources()
@@ -925,6 +947,136 @@ class SqliteService:
                     pass
         return rows
 
+    def get_graph_rag_data(
+        self,
+        user_id: str,
+        max_bank_tags: int = 80,
+        max_record_questions: int = 80,
+    ) -> Dict[str, Any]:
+        """
+        返回 GraphRAG 页面所需图谱数据：
+        - question_bank_graph: 题库知识图（Tag 共现）
+        - practice_record_graph: 做题记录图（Question-Tag + Tag 共现）
+        """
+        with self._get_conn() as conn:
+            question_rows = conn.execute(
+                "SELECT q_id, topic_tags FROM questions ORDER BY created_at DESC LIMIT 3000"
+            ).fetchall()
+            record_rows = conn.execute(
+                """
+                SELECT sr.question_id, sr.score, sr.studied_at, q.topic_tags, q.question_text
+                FROM study_records sr
+                LEFT JOIN questions q ON sr.question_id = q.q_id
+                WHERE sr.user_id = ?
+                ORDER BY sr.studied_at DESC
+                LIMIT 1000
+                """,
+                (user_id,),
+            ).fetchall()
+
+        def _parse_tags(raw: Any) -> List[str]:
+            if not raw:
+                return []
+            try:
+                arr = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                return []
+            if not isinstance(arr, list):
+                return []
+            out = []
+            for item in arr:
+                s = str(item or "").strip()
+                if s:
+                    out.append(s)
+            return out
+
+        # 1) 题库图：Tag 节点 + Tag 共现边
+        tag_freq: Dict[str, int] = {}
+        co_freq: Dict[tuple, int] = {}
+        for row in question_rows:
+            tags = list(dict.fromkeys(_parse_tags(row["topic_tags"])))
+            for t in tags:
+                tag_freq[t] = tag_freq.get(t, 0) + 1
+            for i in range(len(tags)):
+                for j in range(i + 1, len(tags)):
+                    a, b = sorted((tags[i], tags[j]))
+                    co_freq[(a, b)] = co_freq.get((a, b), 0) + 1
+
+        top_tags = sorted(tag_freq.items(), key=lambda x: x[1], reverse=True)[:max_bank_tags]
+        top_tag_set = {t for t, _ in top_tags}
+        bank_nodes = [
+            {"id": f"tag:{tag}", "label": tag, "type": "tag", "weight": freq}
+            for tag, freq in top_tags
+        ]
+        bank_edges = []
+        for (a, b), w in sorted(co_freq.items(), key=lambda x: x[1], reverse=True):
+            if a in top_tag_set and b in top_tag_set:
+                bank_edges.append({"source": f"tag:{a}", "target": f"tag:{b}", "weight": w, "type": "cooccur"})
+            if len(bank_edges) >= 200:
+                break
+
+        # 2) 做题图：Question + Tag + 边
+        latest_by_question: Dict[str, Dict[str, Any]] = {}
+        for row in record_rows:
+            qid = row["question_id"]
+            if qid and qid not in latest_by_question:
+                latest_by_question[qid] = dict(row)
+            if len(latest_by_question) >= max_record_questions:
+                break
+
+        practice_nodes: List[Dict[str, Any]] = []
+        practice_edges: List[Dict[str, Any]] = []
+        practice_tag_freq: Dict[str, int] = {}
+        question_tags: Dict[str, List[str]] = {}
+
+        for qid, row in latest_by_question.items():
+            tags = list(dict.fromkeys(_parse_tags(row.get("topic_tags"))))
+            question_tags[qid] = tags
+            short_text = (row.get("question_text") or qid or "")[:28]
+            practice_nodes.append(
+                {
+                    "id": f"q:{qid}",
+                    "label": short_text if short_text else str(qid),
+                    "type": "question",
+                    "score": row.get("score"),
+                    "studied_at": row.get("studied_at"),
+                }
+            )
+            for t in tags:
+                practice_tag_freq[t] = practice_tag_freq.get(t, 0) + 1
+
+        for tag, freq in sorted(practice_tag_freq.items(), key=lambda x: x[1], reverse=True):
+            practice_nodes.append({"id": f"tag:{tag}", "label": tag, "type": "tag", "weight": freq})
+
+        for qid, tags in question_tags.items():
+            for tag in tags:
+                practice_edges.append(
+                    {"source": f"q:{qid}", "target": f"tag:{tag}", "weight": 1, "type": "contains_tag"}
+                )
+
+        tag_pair_freq: Dict[tuple, int] = {}
+        for _, tags in question_tags.items():
+            for i in range(len(tags)):
+                for j in range(i + 1, len(tags)):
+                    a, b = sorted((tags[i], tags[j]))
+                    tag_pair_freq[(a, b)] = tag_pair_freq.get((a, b), 0) + 1
+        for (a, b), w in sorted(tag_pair_freq.items(), key=lambda x: x[1], reverse=True)[:120]:
+            practice_edges.append(
+                {"source": f"tag:{a}", "target": f"tag:{b}", "weight": w, "type": "cooccur_in_practice"}
+            )
+
+        return {
+            "user_id": user_id,
+            "question_bank_graph": {
+                "nodes": bank_nodes,
+                "edges": bank_edges,
+            },
+            "practice_record_graph": {
+                "nodes": practice_nodes,
+                "edges": practice_edges,
+            },
+        }
+
     # ===========================================================
     # interview_sessions 表操作
     # ===========================================================
@@ -1077,7 +1229,25 @@ class SqliteService:
                 if history[i].get("role") == "assistant":
                     # ⚠️ 只在当前内容为占位符或为空时才更新，避免覆盖已有的完整内容
                     current_content = history[i].get("content", "").strip()
-                    if current_content in ("（生成中...）", "", "（无文本回答，仅有推理过程）"):
+                    # 允许覆盖的条件：
+                    # 1. 是已知占位符
+                    # 2. 内容为空
+                    # 3. 内容极短（≤10字符）—— DeepSeek reasoner 流式时 delta.content
+                    #    可能先吐出空白/换行等噪声字符，导致中间保存写入了垃圾内容，
+                    #    后续真实内容（reasoning/全文）因不满足占位符检查而被跳过。
+                    #    10字符阈值足以过滤噪声，真实答案不会短于此。
+                    _PLACEHOLDERS = ("（生成中...）", "", "（无文本回答，仅有推理过程）")
+                    _is_placeholder = (
+                        current_content in _PLACEHOLDERS
+                        or len(current_content) <= 10
+                    )
+                    # 额外保护：如果新内容比现有内容短很多（短于现有的50%），
+                    # 且现有内容已有实质内容（>50字符），则不覆盖。
+                    _existing_is_real = len(current_content) > 50
+                    _new_is_shorter = len(full_content.strip()) < len(current_content) * 0.5
+                    if _existing_is_real and _new_is_shorter:
+                        _is_placeholder = False  # 保护现有完整内容
+                    if _is_placeholder:
                         history[i]["content"] = full_content
                         ts = now_beijing().isoformat()
                         history[i]["ts"] = ts
@@ -1596,23 +1766,169 @@ class SqliteService:
         try:
             with self._get_conn() as conn:
                 conn.execute("""
-                    INSERT OR IGNORE INTO stage2_pending
+                    INSERT INTO stage2_pending
                     (task_id, content, stage1_output, rough_questions, enrich_input,
-                     company, position, source_url, post_title, trace_session_id, agent_used_tool, ocr_called)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (task_id, content or "", stage1_output, rough_questions, enrich_input,
-                      company, position, source_url, post_title, trace_session_id, agent_used_tool, ocr_called))
+                     company, position, source_url, post_title, trace_session_id,
+                     agent_used_tool, ocr_called,
+                     status, attempts, worker_id, locked_at, last_error)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, NULL, ?)
+                    ON CONFLICT(task_id) DO UPDATE SET
+                        content=excluded.content,
+                        stage1_output=excluded.stage1_output,
+                        rough_questions=excluded.rough_questions,
+                        enrich_input=excluded.enrich_input,
+                        company=excluded.company,
+                        position=excluded.position,
+                        source_url=excluded.source_url,
+                        post_title=excluded.post_title,
+                        trace_session_id=excluded.trace_session_id,
+                        agent_used_tool=excluded.agent_used_tool,
+                        ocr_called=excluded.ocr_called,
+                        status='pending',
+                        worker_id='',
+                        locked_at=NULL,
+                        attempts=0,
+                        last_error=''
+                """, (
+                    task_id, content or "", stage1_output, rough_questions, enrich_input,
+                    company, position, source_url, post_title, trace_session_id,
+                    agent_used_tool, ocr_called,
+                    "pending", 0, "", ""
+                ))
                 conn.commit()
-                return conn.total_changes > 0
+                # 这里的“成功入队”以“成功写入/更新队列项”为准
+                return True
         except Exception as e:
             logger.warning("add_stage2_pending 失败: %s", e)
             return False
 
     def get_stage2_pending_count(self) -> int:
-        """当前队列长度"""
+        """当前待处理队列长度（仅 pending）"""
         with self._get_conn() as conn:
-            row = conn.execute("SELECT COUNT(*) as c FROM stage2_pending").fetchone()
+            row = conn.execute(
+                "SELECT COUNT(*) as c FROM stage2_pending WHERE status='pending' OR status IS NULL"
+            ).fetchone()
             return row["c"] if row else 0
+
+    def get_stage2_queue_count(self) -> int:
+        """
+        队列总量（不含 done）：pending + in_progress。
+        用于启动/手动补跑时判断是否需要触发 Stage2。
+        """
+        with self._get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) as c
+                FROM stage2_pending
+                WHERE status IS NULL OR status IN ('pending','in_progress')
+                """
+            ).fetchone()
+            return row["c"] if row else 0
+
+    def recover_stale_stage2_pending(self, stale_seconds: int) -> int:
+        """
+        超时回收：把 in_progress 并且 locked_at 太老的项重新置回 pending。
+        返回恢复的条数。
+        """
+        stale_seconds = int(stale_seconds or 0)
+        with self._get_conn() as conn:
+            # 对旧库（status 可能为 NULL）做一次兜底
+            conn.execute("UPDATE stage2_pending SET status='pending' WHERE status IS NULL")
+            if stale_seconds <= 0:
+                # 0/负数：强制恢复所有 in_progress（通常用于“重启后补跑”）
+                cur = conn.execute("""
+                    UPDATE stage2_pending
+                    SET status='pending',
+                        worker_id='',
+                        locked_at=NULL,
+                        last_error=''
+                    WHERE status='in_progress'
+                """)
+            else:
+                modifier = f"-{stale_seconds} seconds"
+                cur = conn.execute("""
+                    UPDATE stage2_pending
+                    SET status='pending',
+                        worker_id='',
+                        locked_at=NULL,
+                        last_error=''
+                    WHERE status='in_progress'
+                      AND locked_at IS NOT NULL
+                      AND locked_at <= datetime('now', ?)
+                """, (modifier,))
+            conn.commit()
+            return cur.rowcount if cur else 0
+
+    def lease_stage2_pending_batch(self, limit: int, worker_id: str) -> List[Dict]:
+        """
+        Lease 消费：只取 status='pending' 的项，并把它们置为 in_progress。
+        返回被 lease 到的一批 items。
+        """
+        limit = int(limit or 0)
+        if limit <= 0:
+            return []
+        worker_id = worker_id or ""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM stage2_pending
+                WHERE status='pending' OR status IS NULL
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            items = [dict(r) for r in rows]
+            if not items:
+                return []
+            task_ids = [r["task_id"] for r in rows]
+            placeholders = ",".join("?" * len(task_ids))
+            conn.execute(
+                f"""
+                UPDATE stage2_pending
+                SET status='in_progress',
+                    worker_id=?,
+                    locked_at=CURRENT_TIMESTAMP,
+                    attempts=attempts+1,
+                    last_error=''
+                WHERE task_id IN ({placeholders})
+                """,
+                [worker_id] + task_ids,
+            )
+            conn.commit()
+            return items
+
+    def mark_stage2_pending_done(self, task_id: str):
+        """标记某个 Stage2 队列项处理完成（用于恢复系统幂等/可观测）"""
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE stage2_pending
+                SET status='done',
+                    worker_id='',
+                    locked_at=NULL
+                WHERE task_id=?
+                """,
+                (task_id,),
+            )
+            conn.commit()
+
+    def mark_stage2_pending_error(self, task_id: str, error_msg: str):
+        """标记某个 Stage2 队列项处理失败"""
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE stage2_pending
+                SET status='error',
+                    worker_id='',
+                    locked_at=NULL,
+                    last_error=?
+                WHERE task_id=?
+                """,
+                (error_msg or "", task_id),
+            )
+            conn.commit()
 
     def pop_stage2_pending_batch(self, limit: int) -> List[Dict]:
         """取出并删除一批待处理（FIFO），用于 Stage2 批量处理"""
@@ -1708,7 +2024,9 @@ class SqliteService:
             """).fetchall()
             result["fetched_by_platform"] = {r["source_platform"]: r["cnt"] for r in by_platform}
             # Stage2 待处理队列长度（两阶段异步）
-            row = conn.execute("SELECT COUNT(*) as c FROM stage2_pending").fetchone()
+            row = conn.execute(
+                "SELECT COUNT(*) as c FROM stage2_pending WHERE status='pending' OR status IS NULL"
+            ).fetchone()
             result["stage2_pending_count"] = row["c"] if row else 0
             return result
 

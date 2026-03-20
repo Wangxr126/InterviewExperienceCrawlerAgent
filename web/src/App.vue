@@ -43,6 +43,12 @@
         <ReportView   v-show="currentView === 'report'"   :user-id="userId"
                       :is-active="currentView === 'report'" />
         <FinetuneView v-show="currentView === 'finetune'" />
+        <ToolUsageView v-show="currentView === 'tool_usage'"
+                        :user-id="userId"
+                        :is-active="currentView === 'tool_usage'" />
+        <GraphRagView v-show="currentView === 'graph_rag'"
+                      :user-id="userId"
+                      :is-active="currentView === 'graph_rag'" />
       </main>
     </div>
 
@@ -65,12 +71,14 @@ import CollectView  from './views/CollectView.vue'
 import SchedulerView from './views/SchedulerView.vue'
 import ReportView   from './views/ReportView.vue'
 import FinetuneView from './views/FinetuneView.vue'
+import ToolUsageView from './views/ToolUsageView.vue'
+import GraphRagView from './views/GraphRagView.vue'
 import MasteryDialog from './components/MasteryDialog.vue'
 
 const chatStore   = useChatStore()
 const userId      = ref('')
-// 从 localStorage 恢复上次的视图，默认为 'browse'
-const currentView = ref(localStorage.getItem('currentView') || 'browse')
+// 从 localStorage 恢复上次的视图，默认为 'chat'
+const currentView = ref(localStorage.getItem('currentView') || 'chat')
 const showMastery = ref(false)
 const chatViewRef = ref(null)
 const meta        = ref({ total: 0, companies: [], tags: [], positions: [], difficulties: [] })
@@ -91,6 +99,8 @@ const navItems = [
   { key: 'scheduler', icon: '⏰', label: '定时任务' },
   { key: 'report',   icon: '📊', label: '学习报告' },
   { key: 'finetune', icon: '🧪', label: '微调标注' },
+  { key: 'tool_usage', icon: '🧰', label: '工具统计' },
+  { key: 'graph_rag', icon: '🕸️', label: 'GraphRAG' },
 ]
 
 const loadMeta = async () => {
@@ -111,42 +121,18 @@ const loadConfig = async () => {
   if (!userId.value) userId.value = 'Wangxr'
 }
 
-// 提交作答：跳转到 Chat，延续固定 session，由 Agent 调用 submit_answer 工具完成评分
-const onSubmitComplete = ({ question, userAnswer }) => {
-  const metaParts = []
-  if (question?.company) metaParts.push(`公司：${question.company}`)
-  if (question?.difficulty) metaParts.push(`难度：${question.difficulty === 'easy' ? '简单' : question.difficulty === 'hard' ? '困难' : '中等'}`)
-
-  // API 消息：带 q_id 和作答，让 Agent 调用 submit_answer 工具评分
-  const lines = []
-  // lines.push(`我已作答以下题目，请调用 submit_answer 工具为我评分。`)
-  lines.push(`题目：${question?.question_text || ''}【q_id:${question?.q_id || ''}】`)
-  if (metaParts.length) lines.push(`【题目信息】${metaParts.join(' | ')}`)
-  lines.push(`我的作答：${userAnswer || ''}`)
-  const apiMsg = lines.join('\n')
-
-  // 屏幕展示：题目全文 + 我的作答，清晰直观
-  const displayLines = []
-  displayLines.push(`题目：${question?.question_text || ''}`)
-  displayLines.push(`我的作答：${userAnswer || ''}`)
-  const displayMsg = displayLines.join('\n')
-
-  // 使用 chatStore 中的固定 session，保持对话连续
-  if (!chatStore.sessionId) {
-    chatStore.sessionId = `sess_${userId.value || Date.now()}`
-  }
-
-  currentView.value = 'chat'
-  nextTick(() => {
-    setTimeout(() => {
-      if (!chatViewRef.value) return
-      chatViewRef.value.prefillAndSend({ display: displayMsg, api: apiMsg })
-    }, 200)
-  })
+// 提交作答：SmartPracticeDialog 已直接调 submitAnswerStream 完成评分并回填 evalResult
+// 此处只处理父级逻辑（翻页、统计刷新等），不再跳转 Chat
+const onSubmitComplete = ({ question, userAnswer, result }) => {
+  // BrowseView/SmartPracticeDialog 已自行处理评分展示，这里无需额外操作
+  // 如需全局统计刷新，可在此处触发
 }
 
-// 发送到对话：切换视图并预填消息。屏幕只展示题目，q_id 等内部信息不展示给用户
-const onSendToChat = ({ question }) => {
+// 发送到对话：切换视图并预填消息。
+// 支持两种来源：
+// - 没有 prefill：只带题目让用户再输入
+// - 有 prefill：由调用方直接传入（通常包含用户回答，让 Agent 在 chat 里完成评分）
+const onSendToChat = ({ question, prefill } = {}) => {
   if (!question) {
     ElMessage.error('题目数据为空')
     return
@@ -155,8 +141,20 @@ const onSendToChat = ({ question }) => {
     ElMessage.error('题目内容缺失')
     return
   }
-  const displayMsg = `我想练习这道题：${question.question_text}`
-  const apiMsg = `我想练习这道题【q_id:${question.q_id}】：${question.question_text}`
+
+  const hasPrefill = prefill?.display != null && prefill?.api != null
+  if (!hasPrefill && !question.q_id) {
+    ElMessage.error('题目 ID 缺失，无法生成 chat 指令')
+    return
+  }
+
+  const displayMsg = hasPrefill
+    ? prefill.display
+    : `我想练习这道题：${question.question_text}`
+
+  const apiMsg = hasPrefill
+    ? prefill.api
+    : `我想练习这道题【q_id:${question.q_id}】：${question.question_text}`
   currentView.value = 'chat'
   nextTick(() => {
     setTimeout(() => {
@@ -240,7 +238,7 @@ body {
 
 /* 侧边导航 */
 .sidebar {
-  width: 140px; flex-shrink: 0;
+  width: 160px; flex-shrink: 0;
   background: var(--card-bg);
   border-right: 1px solid var(--border);
   padding: 10px 0;

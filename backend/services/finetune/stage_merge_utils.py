@@ -5,6 +5,7 @@ Stage1/Stage2 合并工具
 """
 import json
 import logging
+import re
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,42 @@ def _get_qt(item: Dict) -> str:
     return (qt or "").strip()
 
 
+def _parse_stage2_list_relaxed(text: str) -> Optional[List[Dict[str, Any]]]:
+    """
+    宽松解析 Stage2 输出：
+    1) 先走标准 JSON（strict=False，允许控制字符）；
+    2) 失败后，按 question_text/answer_text 模式兜底提取（保留 Markdown 原文）。
+    """
+    if not text or not text.strip():
+        return []
+
+    try:
+        data = json.loads(text, strict=False)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+
+    # 兜底：从数组文本中按对象模式提取，兼容 answer_text 中出现未转义双引号的情况。
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    body = text[start : end + 1]
+
+    pattern = re.compile(
+        r'\{\s*"question_text"\s*:\s*"(?P<qt>.*?)"\s*,\s*"answer_text"\s*:\s*"(?P<ans>.*?)"\s*\}(?=\s*,|\s*\])',
+        re.DOTALL,
+    )
+    out: List[Dict[str, Any]] = []
+    for m in pattern.finditer(body):
+        out.append({
+            "question_text": (m.group("qt") or "").strip(),
+            "answer_text": (m.group("ans") or "").strip(),
+        })
+    return out if out else None
+
+
 def merge_stage2_with_stage1(stage2_output: str, stage1_output: str) -> str:
     """
     将 Stage2 输出与 Stage1 合并：Stage2 缺失的字段从 Stage1 补齐。
@@ -81,13 +118,13 @@ def merge_stage2_with_stage1(stage2_output: str, stage1_output: str) -> str:
     if not stage2_output or not stage2_output.strip():
         return json.dumps(s1_normalized, ensure_ascii=False)
 
-    try:
-        s2_list = json.loads(stage2_output)
-    except json.JSONDecodeError:
-        return stage2_output
+    s2_list = _parse_stage2_list_relaxed(stage2_output)
+    if s2_list is None:
+        logger.warning("Stage2 输出无法解析，降级使用 Stage1 数据")
+        return json.dumps(s1_normalized, ensure_ascii=False)
 
     if not isinstance(s2_list, list):
-        return stage2_output
+        return json.dumps(s1_normalized, ensure_ascii=False)
 
     merged = []
     for i, item in enumerate(s2_list):
@@ -139,9 +176,11 @@ def is_stage2_incomplete(stage2_output: str, stage1_output: str) -> bool:
     if not stage2_output or not stage1_output:
         return False
     try:
-        s2_list = json.loads(stage2_output)
+        s2_list = _parse_stage2_list_relaxed(stage2_output)
         s1_list = json.loads(stage1_output)
-    except json.JSONDecodeError:
+    except Exception:
+        return False
+    if s2_list is None:
         return False
     if not isinstance(s2_list, list) or not isinstance(s1_list, list) or len(s2_list) == 0:
         return False

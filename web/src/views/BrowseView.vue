@@ -31,7 +31,7 @@
       <div class="action-row">
         <el-button type="primary" @click="onSearch" :loading="loading">🔍 搜索</el-button>
         <el-button class="btn-smart-practice" @click="loadSmartPractice">
-          <el-icon><Aim /></el-icon>
+          <Aim />
           <span>智能练习</span>
         </el-button>
         <el-button @click="resetFilters">重置</el-button>
@@ -89,7 +89,7 @@
           </div>
           <div class="q-meta">
             <span v-if="q.last_score != null" class="score-chip" :class="q.last_score >= 3 ? 'score-ok' : 'score-low'">
-              {{ q.last_score }}/5
+              {{ typeof q.last_score === 'number' ? q.last_score.toFixed(1) : q.last_score }}/5
             </span>
             <span v-if="q.company" class="meta-chip">🏢 {{ q.company }}</span>
             <span v-if="q.position" class="meta-chip">💼 {{ q.position }}</span>
@@ -103,7 +103,7 @@
         <div>暂无题目，先去「收录面经」或「数据采集」添加内容吧</div>
       </div>
       <div v-if="loading" class="loading-center">
-        <el-icon class="is-loading" style="font-size:32px;color:var(--primary)"><Loading /></el-icon>
+        <Loading class="is-loading" style="font-size:32px;color:var(--primary)" />
       </div>
 
       <!-- 分页控件 -->
@@ -505,8 +505,7 @@ watch(() => props.isActive, (newVal, oldVal) => {
   border-radius: 0 2px 2px 0;
 }
 .q-card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
-.q-text { font-size: 13px; line-height: 1.45; flex: 1; min-width: 0; display: -webkit-box;
-          -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.q-text { font-size: 13px; line-height: 1.45; flex: 1; min-width: 0; word-wrap: break-word; white-space: normal; }
 .q-card-badges { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
 .type-badge { font-size: 10px; padding: 2px 6px; border-radius: 8px; white-space: nowrap; font-weight: 600; }
 .type-tech    { background: #dbeafe; color: #1d4ed8; }

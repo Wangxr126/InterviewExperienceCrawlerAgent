@@ -8,7 +8,7 @@
     </div>
 
     <div v-if="loading" style="text-align:center;padding:40px">
-      <el-icon class="is-loading" style="font-size:32px;color:var(--primary)"><Loading /></el-icon>
+      <Loading class="is-loading" style="font-size:32px;color:var(--primary)" />
     </div>
 
     <template v-if="data && !loading">

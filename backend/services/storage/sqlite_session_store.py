@@ -102,21 +102,23 @@ class SqliteSessionStore:
         # 转为 conversation_history 格式
         history_data = [_message_to_storage(m) for m in history]
 
-        # 合并已有推理过程：save_session 会覆盖整段 history，仅对「已存在的」assistant 保留 thinking
-        # 重要：只当 ki < len(old_assistant_indices) 时才复制，避免把上一轮的 thinking 复制到本轮新消息（前后不一致）
+        # 合并已有推理过程：save_session 会覆盖整段 history，仅对「已存在的」assistant 保留 thinking。
+        # 这里必须“从尾部对齐”而不是从头对齐：history 可能被裁剪为最近 N 轮，若从头对齐会把旧前缀错配到新历史，
+        # 导致最近消息上的 thinking 被覆盖丢失。
         try:
             session = self._sqlite.get_session(session_id)
             old_history = session.get("conversation_history") or []
             assistant_indices = [i for i, m in enumerate(history_data) if m.get("role") == "assistant"]
             old_assistant_indices = [i for i, m in enumerate(old_history) if (m or {}).get("role") == "assistant"]
-            for ki, idx in enumerate(assistant_indices):
-                if ki < len(old_assistant_indices):
-                    old_idx = old_assistant_indices[ki]
-                    old_msg = old_history[old_idx] if isinstance(old_history[old_idx], dict) else {}
-                    if old_msg.get("thinking") and not history_data[idx].get("thinking"):
-                        history_data[idx]["thinking"] = old_msg["thinking"]
-                    if old_msg.get("duration_ms") is not None and history_data[idx].get("duration_ms") is None:
-                        history_data[idx]["duration_ms"] = old_msg["duration_ms"]
+            pair_count = min(len(assistant_indices), len(old_assistant_indices))
+            for offset in range(1, pair_count + 1):
+                idx = assistant_indices[-offset]
+                old_idx = old_assistant_indices[-offset]
+                old_msg = old_history[old_idx] if isinstance(old_history[old_idx], dict) else {}
+                if old_msg.get("thinking") and not history_data[idx].get("thinking"):
+                    history_data[idx]["thinking"] = old_msg["thinking"]
+                if old_msg.get("duration_ms") is not None and history_data[idx].get("duration_ms") is None:
+                    history_data[idx]["duration_ms"] = old_msg["duration_ms"]
         except Exception as e:
             logger.debug(f"[SqliteSessionStore] 合并 thinking 时忽略: {e}")
 

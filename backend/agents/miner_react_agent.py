@@ -4,6 +4,7 @@ MinerReActAgent：在 ReActAgent 基础上增加 mark_unrelated 终止逻辑。
 """
 from hello_agents import ReActAgent
 from hello_agents.tools.registry import ToolRegistry
+from backend.services.logging.agent_tool_runtime_stats import agent_tool_runtime_stats
 
 
 # 终止工具：调用后立即结束，不再继续
@@ -43,8 +44,10 @@ class MinerReActAgent(ReActAgent):
     def _run_impl(self, input_text: str, session_start_time, **kwargs) -> str:
         """与 ReActAgent 相同，但在用户工具执行后检查是否为终止工具"""
         import json
+        import time
         from datetime import datetime
         from hello_agents.core.message import Message
+        from backend.agents.context import get_current_user_id
 
         messages = self._build_messages(input_text)
         tool_schemas = self._build_tool_schemas()
@@ -141,11 +144,27 @@ class MinerReActAgent(ReActAgent):
                         )
 
                     if tool_name in self._builtin_tools:
+                        _t0 = time.time()
                         result = self._handle_builtin_tool(tool_name, arguments)
                         result_content = result.get("content", str(result))
+                        agent_tool_runtime_stats.record(
+                            agent_name=self.name,
+                            tool_name=tool_name,
+                            success=not str(result_content).startswith("❌"),
+                            execution_time_ms=(time.time() - _t0) * 1000.0,
+                            user_id=get_current_user_id(),
+                        )
                         print(f"🔧 {tool_name}: {result_content}")
                     else:
+                        _t0 = time.time()
                         result_content = self._execute_tool_call(tool_name, arguments)
+                        agent_tool_runtime_stats.record(
+                            agent_name=self.name,
+                            tool_name=tool_name,
+                            success=not str(result_content).startswith("❌"),
+                            execution_time_ms=(time.time() - _t0) * 1000.0,
+                            user_id=get_current_user_id(),
+                        )
                         if not result_content.startswith("❌"):
                             print(f"👀 观察: {result_content}")
 
@@ -237,8 +256,16 @@ class MinerReActAgent(ReActAgent):
                     )
 
                 if tool_name in self._builtin_tools:
+                    _t0 = time.time()
                     result = self._handle_builtin_tool(tool_name, arguments)
                     print(f"🔧 {tool_name}: {result['content']}")
+                    agent_tool_runtime_stats.record(
+                        agent_name=self.name,
+                        tool_name=tool_name,
+                        success=not str(result.get("content", "")).startswith("❌"),
+                        execution_time_ms=(time.time() - _t0) * 1000.0,
+                        user_id=get_current_user_id(),
+                    )
 
                     if self.trace_logger:
                         self.trace_logger.log_event(
@@ -282,7 +309,15 @@ class MinerReActAgent(ReActAgent):
                 else:
                     print(f"🎬 调用工具: {tool_name}({arguments})")
 
+                    _t0 = time.time()
                     result = self._execute_tool_call(tool_name, arguments)
+                    agent_tool_runtime_stats.record(
+                        agent_name=self.name,
+                        tool_name=tool_name,
+                        success=not str(result).startswith("❌"),
+                        execution_time_ms=(time.time() - _t0) * 1000.0,
+                        user_id=get_current_user_id(),
+                    )
 
                     if self.trace_logger:
                         self.trace_logger.log_event(

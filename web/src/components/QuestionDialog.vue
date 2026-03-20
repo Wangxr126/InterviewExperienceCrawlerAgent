@@ -1,5 +1,5 @@
 <template>
-  <el-dialog v-model="visible" :title="question?.question_text?.slice(0,30) + '…'" width="780px"
+  <el-dialog v-model="visible" :title="question?.question_text || '题目详情'" width="780px"
              align-center destroy-on-close>
     <template v-if="question">
       <div class="dialog-body-with-nav">
@@ -130,6 +130,7 @@
 import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { formatAnswerToHtml } from '../utils/formatAnswer.js'
+import { api } from '../api.js'
 
 const props  = defineProps({
   modelValue: Boolean,
@@ -243,15 +244,20 @@ const submit = async () => {
   if (!myAnswer.value.trim()) { ElMessage.warning('请先输入你的答案'); return }
   if (!props.question?.q_id) { ElMessage.warning('题目 ID 缺失，无法记录'); return }
 
-  // 仅通过事件把题目+作答交给上层视图，由 ChatView 统一走 /api/chat/stream →
-  // InterviewerAgent + submit_answer 工具完成评分，避免在这里额外创建临时 session_id
+  const userAnswer = myAnswer.value.trim()
+  if (submitting.value) return
   submitting.value = true
-  try {
-    const userAnswer = myAnswer.value.trim()
-    emit('submit-complete', { question: props.question, userAnswer, result: null })
-  } finally {
-    submitting.value = false
-  }
+
+  // 关闭弹窗并跳转到 chat：由 Agent（/api/chat/stream + submit_answer tool）在对话中完成评分
+  visible.value = false
+
+  const displayMsg = `我想练习这道题：${props.question.question_text}\n\n我的回答：${userAnswer}`
+  const apiMsg = `我想练习这道题【q_id:${props.question.q_id}】：${props.question.question_text}\n\n我的回答：${userAnswer}\n\n请给我评分并详细讲解。`
+
+  setTimeout(() => {
+    emit('send-to-chat', { question: props.question, prefill: { display: displayMsg, api: apiMsg } })
+    setTimeout(() => { submitting.value = false }, 500)
+  }, 100)
 }
 
 const openSourceUrl = () => {
@@ -311,6 +317,7 @@ const handleSendToChat = () => {
 .ref-answer :deep(strong) { font-weight: 600; color: var(--text-sub); }
 .ref-answer :deep(ul), .ref-answer :deep(ol) { margin: 8px 0; padding-left: 1.5em; }
 .ref-answer :deep(li) { margin-bottom: 4px; }
+.ref-answer :deep(.katex-display) { margin: 8px 0; overflow-x: auto; overflow-y: hidden; }
 .eval-result { margin-top: 14px; padding: 14px; border-radius: 10px; }
 .eval-result.good { background: #f0fdf4; border: 1px solid #86efac; }
 .eval-result.bad  { background: #fef2f2; border: 1px solid #fca5a5; }

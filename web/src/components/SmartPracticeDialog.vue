@@ -23,143 +23,147 @@
     </template>
 
     <template v-if="question">
-      <div class="sp-body">
-        <div class="sp-question-section">
-          <div class="q-full-text">{{ question.question_text }}</div>
-          <div class="meta-row">
-            <el-tag
-              v-if="question.difficulty"
-              size="small"
-              :type="{ easy: 'success', medium: 'warning', hard: 'danger' }[question.difficulty]"
-              class="meta-tag"
-            >
-              {{ { easy: '简单', medium: '中等', hard: '困难' }[question.difficulty] }}
-            </el-tag>
-            <el-tag
-              v-if="question.smart_type"
-              size="small"
-              :type="question.smart_type === 'recommend' ? 'success' : 'info'"
-              class="meta-tag"
-            >
-              {{ question.smart_type === 'recommend' ? '推荐题目' : '随机题目' }}
-            </el-tag>
-            <el-tag v-if="question.company" size="small" class="meta-tag">
-              {{ question.company }}
-            </el-tag>
-            <el-tag v-if="question.position" size="small" class="meta-tag">
-              {{ question.position }}
-            </el-tag>
-            <el-tag
-              v-for="t in (question.topic_tags || [])"
-              :key="t"
-              size="small"
-              class="meta-tag"
-            >
-              {{ t }}
-            </el-tag>
+      <div class="sp-wrapper">
+        <!-- 可滚动内容区 -->
+        <div class="sp-body">
+          <div class="sp-question-section">
+            <div class="q-full-text">{{ question.question_text }}</div>
+            <div class="meta-row">
+              <el-tag
+                v-if="question.difficulty"
+                size="small"
+                :type="{ easy: 'success', medium: 'warning', hard: 'danger' }[question.difficulty]"
+                class="meta-tag"
+              >
+                {{ { easy: '简单', medium: '中等', hard: '困难' }[question.difficulty] }}
+              </el-tag>
+              <el-tag
+                v-if="question.smart_type"
+                size="small"
+                :type="question.smart_type === 'recommend' ? 'success' : 'info'"
+                class="meta-tag"
+              >
+                {{ question.smart_type === 'recommend' ? '推荐题目' : '随机题目' }}
+              </el-tag>
+              <el-tag v-if="question.company" size="small" class="meta-tag">
+                {{ question.company }}
+              </el-tag>
+              <el-tag v-if="question.position" size="small" class="meta-tag">
+                {{ question.position }}
+              </el-tag>
+              <el-tag
+                v-for="t in (question.topic_tags || [])"
+                :key="t"
+                size="small"
+                class="meta-tag"
+              >
+                {{ t }}
+              </el-tag>
+            </div>
           </div>
-        </div>
 
-        <div v-if="showAnswer && standardAnswer" class="sp-answer-section">
-          <div class="section-title">标准答案</div>
-          <div class="ref-answer" v-html="formattedAnswerHtml"></div>
-        </div>
+          <div v-if="showAnswer && standardAnswer" class="sp-answer-section">
+            <div class="section-title">标准答案</div>
+            <div class="ref-answer" v-html="formattedAnswerHtml"></div>
+          </div>
 
-        <div class="sp-input-section">
-          <div class="section-title">我的作答</div>
-          <el-input
-            v-model="myAnswer"
-            type="textarea"
-            :rows="4"
-            :autosize="{ minRows: 4, maxRows: 8 }"
-            placeholder="输入你的回答..."
-            class="answer-input"
-          />
-        </div>
+          <div class="sp-input-section">
+            <div class="section-title">我的作答</div>
+            <el-input
+              v-model="myAnswer"
+              type="textarea"
+              :rows="4"
+              :autosize="{ minRows: 4, maxRows: 8 }"
+              placeholder="输入你的回答..."
+              class="answer-input"
+            />
+          </div>
 
-        <div class="sp-score-card" :class="scoreClass">
-          <span class="score-label">得分</span>
-          <span class="score-value">{{ displayScore }}/5</span>
-          <span v-if="displayScore !== '—'" class="score-emoji">{{ displayScoreEmoji }}</span>
-        </div>
+          <div class="sp-score-card" :class="scoreClass">
+            <span class="score-label">得分</span>
+            <span class="score-value">{{ typeof displayScore === 'number' ? displayScore.toFixed(1) : displayScore }}/5</span>
+            <span v-if="displayScore !== '—'" class="score-emoji">{{ displayScoreEmoji }}</span>
+          </div>
 
-        <div
-          v-if="evalResult"
-          class="eval-result"
-          :class="evalResult.score >= 3 ? 'good' : 'bad'"
-        >
-          <div class="eval-feedback" v-html="formattedFeedbackHtml"></div>
           <div
-            v-if="(evalResult.missed_points || evalResult.missing_points)?.length"
-            class="eval-missing"
+            v-if="evalResult"
+            class="eval-result"
+            :class="evalResult.score >= 3 ? 'good' : 'bad'"
           >
-            <strong>遗漏点：</strong>{{
-              (evalResult.missed_points ||
-                evalResult.missing_points ||
-                []
-              ).join('、')
-            }}
+            <div class="eval-feedback" v-html="formattedFeedbackHtml"></div>
+            <div
+              v-if="(evalResult.missed_points || evalResult.missing_points)?.length"
+              class="eval-missing"
+            >
+              <strong>遗漏点：</strong>{{
+                (evalResult.missed_points ||
+                  evalResult.missing_points ||
+                  []
+                ).join('、')
+              }}
+            </div>
           </div>
         </div>
-      </div>
-    </template>
 
-    <template #footer>
-      <div class="footer-row">
-        <div class="footer-nav">
-          <button
-            type="button"
-            class="btn-nav btn-prev"
-            :disabled="!hasPrev"
-            @click="handlePrevClick"
-            title="上一题"
-          >
-            ‹
-          </button>
-          <span
-            v-if="practiceProgress && practiceProgress.total > 0"
-            class="footer-progress"
-          >
-            {{ practiceProgress.current }}/{{ practiceProgress.total }}
-          </span>
-          <button
-            type="button"
-            class="btn-nav btn-next"
-            :disabled="!hasNext"
-            @click="handleNextClick"
-            title="下一题"
-          >
-            ›
-          </button>
-        </div>
-        <div class="footer-buttons">
-          <el-tooltip
-            :content="standardAnswer ? '' : '该题暂无标准答案'"
-            placement="top"
-          >
-            <el-button
-              class="btn-answer"
-              :disabled="!standardAnswer"
-              @click="showAnswer = !showAnswer"
-            >
-              {{ showAnswer ? '隐藏答案' : '标准答案' }}
-            </el-button>
-          </el-tooltip>
-          <el-button
-            v-if="question?.source_url"
-            class="btn-source"
-            @click="openSourceUrl"
-          >
-            查看原帖
-          </el-button>
-          <el-button class="btn-chat" @click.stop="handleSendToChat">去对话练习</el-button>
-          <el-button
-            class="btn-submit"
-            :loading="submitting"
-            @click="submit"
-          >
-            提交作答
-          </el-button>
+        <!-- 固定底部按钮栏 -->
+        <div class="sp-footer-fixed">
+          <div class="footer-row">
+            <div class="footer-nav">
+              <button
+                type="button"
+                class="btn-nav btn-prev"
+                :disabled="!hasPrev"
+                @click="handlePrevClick"
+                title="上一题"
+              >
+                ‹
+              </button>
+              <span
+                v-if="practiceProgress && practiceProgress.total > 0"
+                class="footer-progress"
+              >
+                {{ practiceProgress.current }}/{{ practiceProgress.total }}
+              </span>
+              <button
+                type="button"
+                class="btn-nav btn-next"
+                :disabled="!hasNext"
+                @click="handleNextClick"
+                title="下一题"
+              >
+                ›
+              </button>
+            </div>
+            <div class="footer-buttons">
+              <el-tooltip
+                :content="standardAnswer ? '' : '该题暂无标准答案'"
+                placement="top"
+              >
+                <el-button
+                  class="btn-answer"
+                  :disabled="!standardAnswer"
+                  @click="showAnswer = !showAnswer"
+                >
+                  {{ showAnswer ? '隐藏答案' : '标准答案' }}
+                </el-button>
+              </el-tooltip>
+              <el-button
+                v-if="question?.source_url"
+                class="btn-source"
+                @click="openSourceUrl"
+              >
+                查看原帖
+              </el-button>
+              <el-button class="btn-chat" @click.stop="handleSendToChat">去对话练习</el-button>
+              <el-button
+                class="btn-submit"
+                :loading="submitting"
+                @click="submit"
+              >
+                提交作答
+              </el-button>
+            </div>
+          </div>
         </div>
       </div>
     </template>
@@ -170,6 +174,7 @@
 import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { formatAnswerToHtml } from '../utils/formatAnswer.js'
+import { api } from '../api.js'
 
 const props = defineProps({
   modelValue: Boolean,
@@ -179,7 +184,7 @@ const props = defineProps({
   practiceProgress: { type: Object, default: null },
 })
 
-const emit = defineEmits(['update:modelValue', 'send-to-chat', 'submit-complete'])
+const emit = defineEmits(['update:modelValue', 'send-to-chat', 'submit-complete', 'prev-question', 'next-question'])
 
 const visible = computed({
   get: () => props.modelValue,
@@ -240,17 +245,26 @@ const hasNext = computed(() => {
   return (props.practiceProgress.current || 0) < props.practiceProgress.total
 })
 
-watch(visible, (v) => {
-  if (v) {
+// 切换题目时重置状态
+watch(
+  () => props.question?.q_id,
+  () => {
+    myAnswer.value = ''
+    evalResult.value = null
     showAnswer.value = false
-  } else {
+  }
+)
+
+watch(visible, (v) => {
+  if (!v) {
+    // 关闭弹窗时重置
     myAnswer.value = ''
     evalResult.value = null
     showAnswer.value = false
   }
 })
 
-const submit = () => {
+const submit = async () => {
   if (!myAnswer.value.trim()) {
     ElMessage.warning('请先输入你的答案')
     return
@@ -262,12 +276,11 @@ const submit = () => {
 
   const userAnswer = myAnswer.value.trim()
 
-  // 直接通知父组件跳转到 Chat，由 Agent 交互后调用 submit_answer 工具完成评分
-  emit('submit-complete', {
-    question: props.question,
-    userAnswer,
-    result: null,
-  })
+  // 关闭弹窗，跳转到 Chat，让 Agent 来评分
+  visible.value = false
+  const displayMsg = `我想练习这道题：${props.question.question_text}\n\n我的回答：${userAnswer}`
+  const apiMsg = `我想练习这道题【q_id:${props.question.q_id}】：${props.question.question_text}\n\n我的回答：${userAnswer}\n\n请给我评分并详细讲解。`
+  emit('send-to-chat', { question: props.question, prefill: { display: displayMsg, api: apiMsg } })
 }
 
 const openSourceUrl = () => {
@@ -304,6 +317,8 @@ const handleNextClick = () => {
   border-radius: 16px;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .smart-practice-dialog :deep(.el-overlay) {
@@ -312,18 +327,45 @@ const handleNextClick = () => {
 
 .smart-practice-dialog :deep(.el-dialog__header) {
   padding: 0;
-  border-bottom: none;
+  border-bottom: 1px solid #e5e7eb;
+  flex-shrink: 0;
 }
 
 .smart-practice-dialog :deep(.el-dialog__body) {
   padding: 0;
-  max-height: 70vh;
-  overflow-y: auto;
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .smart-practice-dialog :deep(.el-dialog__footer) {
   padding: 0;
   border-top: none;
+  display: none;
+}
+
+.sp-wrapper {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  max-height: 70vh;
+}
+
+.sp-body {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px 24px;
+}
+
+.sp-footer-fixed {
+  flex-shrink: 0;
+  border-top: 1px solid #e5e7eb;
+  background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%);
+  padding: 14px 24px;
 }
 
 .sp-header-bar {
@@ -332,7 +374,6 @@ const handleNextClick = () => {
   justify-content: space-between;
   padding: 24px 28px;
   background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
-  border-bottom: 1px solid #e5e7eb;
 }
 
 .sp-header-title {
@@ -380,13 +421,6 @@ const handleNextClick = () => {
 .sp-close-btn:hover {
   color: #ef4444;
   background: #fee2e2;
-}
-
-.sp-body {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  padding: 20px 24px;
 }
 
 .sp-question-section {
@@ -452,6 +486,12 @@ const handleNextClick = () => {
 
 .ref-answer :deep(p:last-child) {
   margin-bottom: 0;
+}
+
+.ref-answer :deep(.katex-display) {
+  margin: 8px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .sp-input-section {
@@ -590,9 +630,6 @@ const handleNextClick = () => {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 14px 24px;
-  background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%);
-  border-top: 1px solid #e5e7eb;
 }
 
 .footer-nav {
@@ -722,20 +759,20 @@ const handleNextClick = () => {
   box-shadow: 0 8px 25px rgba(79, 70, 229, 0.4);
 }
 
-.smart-practice-dialog :deep(.el-dialog__body)::-webkit-scrollbar {
+.sp-body::-webkit-scrollbar {
   width: 6px;
 }
 
-.smart-practice-dialog :deep(.el-dialog__body)::-webkit-scrollbar-track {
+.sp-body::-webkit-scrollbar-track {
   background: transparent;
 }
 
-.smart-practice-dialog :deep(.el-dialog__body)::-webkit-scrollbar-thumb {
+.sp-body::-webkit-scrollbar-thumb {
   background: #d1d5db;
   border-radius: 3px;
 }
 
-.smart-practice-dialog :deep(.el-dialog__body)::-webkit-scrollbar-thumb:hover {
+.sp-body::-webkit-scrollbar-thumb:hover {
   background: #9ca3af;
 }
 
@@ -749,8 +786,11 @@ const handleNextClick = () => {
     gap: 12px;
   }
 
-  .footer-row {
+  .sp-footer-fixed {
     padding: 12px 16px;
+  }
+
+  .footer-row {
     flex-direction: row;
     align-items: center;
     gap: 8px;

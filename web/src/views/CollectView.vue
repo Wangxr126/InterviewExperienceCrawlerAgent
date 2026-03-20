@@ -202,7 +202,7 @@
                 <div><strong>失败</strong>：抓取正文或 LLM 提取时出错</div>
               </div>
             </template>
-            <el-icon class="status-help-icon"><QuestionFilled /></el-icon>
+            <QuestionFilled class="status-help-icon" />
           </el-tooltip>
           <el-select v-model="taskPlatform" placeholder="平台" clearable size="small" style="width:90px">
             <el-option label="牛客" value="nowcoder" />
@@ -258,7 +258,7 @@
         <el-table-column label="公司" prop="company" width="70" show-overflow-tooltip sortable="custom" />
         <el-table-column label="正文" prop="content_len" width="65" align="center" sortable="custom">
           <template #default="{ row }">
-            <el-link v-if="(row.content_len ?? 0) > 0" type="primary" :underline="false" style="font-size:12px"
+            <el-link v-if="(row.content_len ?? 0) > 0" type="primary" underline="never" style="font-size:12px"
                      @click="openContentDialog(row)">
               {{ row.content_len }}字
             </el-link>
@@ -297,7 +297,7 @@
           <template #default="{ row }">
             <el-tooltip v-if="row.trace_session_id" content="查看推理过程" placement="top">
               <el-link :href="`/api/crawler/trace/${row.trace_session_id}`" target="_blank" :underline="false">
-                <el-icon :size="18"><Document /></el-icon>
+                <Document style="width: 18px; height: 18px;" />
               </el-link>
             </el-tooltip>
             <span v-else style="color:#c0c4cc">—</span>
@@ -379,7 +379,7 @@
       <template #header>
         <div class="clear-all-header">
           <div class="clear-all-icon-wrap">
-            <el-icon class="warn-icon"><WarningFilled /></el-icon>
+            <WarningFilled class="warn-icon" />
           </div>
           <h3 class="clear-all-title">重新提取所有题目</h3>
         </div>
@@ -409,7 +409,7 @@
       <template #header>
         <div class="clear-all-header">
           <div class="clear-all-icon-wrap">
-            <el-icon class="warn-icon"><WarningFilled /></el-icon>
+            <WarningFilled class="warn-icon" />
           </div>
           <h3 class="clear-all-title">清除所有数据</h3>
         </div>
@@ -873,7 +873,7 @@ const extractPending = async () => {
       extractLoading.value = false
       return
     }
-    const d = await api.extractPending(30)
+    const d = await api.extractPending()
     extractMsg.value = { ok: true, text: `✅ ${d.message}` }
     extractPolling.value = true
     await loadTasks()
@@ -943,7 +943,7 @@ const retryErrors = async () => {
   extractPolling.value = false
   try {
     await loadStats()
-    const d = await api.retryErrors(30)
+    const d = await api.retryErrors()
     extractMsg.value = { ok: true, text: `🔄 ${d.message}` }
     if ((d.reset ?? 0) > 0) {
       extractPolling.value = true  // 后台处理中，轮询刷新帖子列表
@@ -1563,7 +1563,24 @@ watch(crawlPolling, (polling) => {
 .table-section { padding: 24px 28px; }
 .table-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .table-toolbar .el-button { padding: 5px 10px; }
-.status-help-icon { font-size: 16px; color: var(--text-sub); cursor: help; margin-left: -4px; }
+.status-help-icon {
+  font-size: 10px !important;
+  width: 10px !important;
+  height: 10px !important;
+  min-width: 10px;
+  min-height: 10px;
+  max-width: 10px;
+  max-height: 10px;
+  display: inline-block;
+  flex: 0 0 10px;
+  color: var(--text-sub);
+  cursor: help;
+  margin-left: -4px;
+}
+.table-toolbar :deep(.el-tooltip__trigger.status-help-icon) {
+  width: 10px !important;
+  height: 10px !important;
+}
 .status-help-icon:hover { color: var(--primary); }
 .status-help { font-size: 12px; line-height: 1.8; }
 .status-help div { margin-bottom: 4px; }

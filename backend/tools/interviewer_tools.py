@@ -153,11 +153,10 @@ class GetRecommendedQuestionTool(Tool):
         super().__init__(
             name="get_recommended_question",
             description=(
-                "【调用时机】用户说「来道题」「下一题」「字节的MySQL题」「出一道Redis题」时。"
-                "【功能】从题库推荐多道题（默认5道）：① 遗忘曲线到期 ② 薄弱标签 ③ 按 topic/company 随机。"
-                "【填槽】topic、company、difficulty。若说「某公司的题」未指定公司，先询问补全。"
-                "【返回】题目列表（题目ID、题目、难度、标签、公司、推荐理由）、总数、筛选条件；无符合题目时返回失败原因。"
-                "【严禁】用户说「我想练习这道题【q_id:xxx】」时严禁调用，直接输出题目即可。"
+                "【意图】用户说“来道题/下一题/出题”，且未明确指定目标 q_id（不是“我想练习这道题【q_id:xxx】”）。"
+                "【功能】从题库按：遗忘曲线到期、薄弱标签优先，并结合 topic/company/difficulty 做随机推荐（默认推荐多道，模型只展示其中一道）。"
+                "【填槽】topic/company/difficulty 均为可选；若用户只说“某公司”但未给公司名，请先追问补全。"
+                "【返回】JSON：{总数, 筛选条件, 题目列表[]}；每个题目包含 q_id、题目、难度、标签、公司、推荐理由。"
             ),
         )
 
@@ -517,11 +516,10 @@ class FilterQuestionsTool(Tool):
         super().__init__(
             name="filter_questions",
             description=(
-                "【调用时机】用户说「列出字节的题」「这周收录的题」「Redis中等难度」时。"
-                "【功能】按 company/tags/difficulty/keyword/日期 筛选，返回题目列表（默认最多10条，最多30条）。"
-                "【填槽】company、tags、difficulty、keyword、date_from、date_to（YYYY-MM-DD）、limit。"
-                "【返回】题目列表（q_id、题目、难度、标签、公司、来源）、符合条件的总数、本次返回条数；失败时返回原因。"
-                "【严禁】用户说「我想练习这道题」时严禁调用。"
+                "【意图】用户想“列出题目/筛选题库”：例如“列出字节的题”“这周的题”“Redis 中等难度”“按关键词找题”“按日期范围找题”。"
+                "【功能】根据 company/tags/difficulty/question_type/keyword/date_from/date_to/limit 筛选题目（SQLite）。"
+                "【填槽】tags 可传数组或 JSON 字符串；date_from/date_to 仅当用户明确说日期时才传 YYYY-MM-DD。"
+                "【返回】JSON：{total, returned, questions[]}；questions 含 q_id、question_text、difficulty、topic_tags、company、source_platform。"
             ),
         )
 
@@ -598,10 +596,10 @@ class GetQuestionDetailTool(Tool):
         super().__init__(
             name="get_question_detail",
             description=(
-                "【调用时机】用户想查看题目详情、参考答案时；你评估用户作答前可先调用取标准答案。"
-                "【功能】根据题目ID获取题目全文、参考答案、标签、难度。"
-                "【填槽】question_id（必填）。"
-                "【返回】question_id、question_text、answer_text、topic_tags、difficulty；未找到题目时返回失败原因。"
+                "【意图】用户要“看题目/查看详情/要参考答案/拿标准答案”。"
+                "【功能】根据 question_id（q_id）读取：题目全文、参考答案、topic_tags、difficulty。"
+                "【填槽】question_id 必填。"
+                "【返回】JSON：{question_id, question_text, answer_text, topic_tags, difficulty}；找不到返回错误。"
             ),
         )
 
@@ -643,10 +641,11 @@ class SubmitAnswerTool(Tool):
         super().__init__(
             name="submit_answer",
             description=(
-                "【调用时机】用户提交答案后，由你先根据题目与标准答案自行评估，再调用此工具**记录**你的评估结果。"
-                "【功能】仅将你给出的 score、feedback、strong_points、missed_points、error_points 写入数据库（学习记录、SM-2、会话历史），工具内部不评分、不调用任何 LLM。"
-                "【填槽】question_id、user_answer、score、feedback 必填；strong_points、missed_points、error_points 选填（数组）。"
-                "【返回】记录成功：score、feedback、standard_answer、sm2（含下次复习时间）、message_id；记录失败：返回失败原因（如未传 score、题目未找到、user_answer 为空等）。"
+                "【意图】用户完成作答后，用于“记录+归档评分结果”。"
+                "【功能】不做评估、不调用任何 LLM；只写入：study_records / SM-2（next_review_at）/ 会话历史 / 标签掌握度。"
+                "【填槽】question_id、user_answer、score、feedback 必填；strong_points/missed_points/error_points 可选。"
+                "【薄弱点写入】record_weakness_notes=true（默认）则把 missed_points/error_points 写入本地薄弱点 note；false 时交给 record_weakness。"
+                "【返回】JSON：{score, feedback, missed_points, error_points, strong_points, tags, standard_answer, sm2, message_id, message}。"
             ),
         )
 
@@ -656,6 +655,9 @@ class SubmitAnswerTool(Tool):
             ToolParameter("user_answer", "string", "用户作答内容，可不传（系统自动取本轮用户消息）", required=False),
             ToolParameter("score", "number", "你给出的分数，取值 0/0.5/1.0/.../5.0，必填", required=True),
             ToolParameter("feedback", "string", "你对作答的总体点评，必填", required=True),
+            ToolParameter("record_weakness_notes", "string",
+                          "是否写入薄弱点 note：true/false（或 1/0），默认 true；当 false 时由 record_weakness 工具负责写入。",
+                          required=False),
             ToolParameter("strong_points", "array", "答对的要点列表，如 [\"要点1\", \"要点2\"]", required=False),
             ToolParameter("missed_points", "array", "遗漏的要点列表", required=False),
             ToolParameter("error_points", "array", "混淆/错误列表，每项为 {wrong:\"错误表述\", correct:\"正确表述\"}", required=False),
@@ -711,6 +713,17 @@ class SubmitAnswerTool(Tool):
                     error_points.append(json.loads(ep))
                 except Exception:
                     error_points.append({"wrong": ep, "correct": ""})
+
+        # 是否把 missed_points/error_points 写入本地薄弱点 note。
+        # 说明：默认 true，保证即使 prompt 没显式拆分也不会丢失薄弱点。
+        record_weakness_notes = True
+        raw_flag = parameters.get("record_weakness_notes")
+        if raw_flag is not None:
+            if isinstance(raw_flag, bool):
+                record_weakness_notes = raw_flag
+            else:
+                s = str(raw_flag).strip().lower()
+                record_weakness_notes = s not in ("false", "0", "no", "off")
 
         # ── 从题库获取题目信息（仅用于校验与返回 standard_answer）──────────────────────
         question_text = ""
@@ -787,10 +800,9 @@ class SubmitAnswerTool(Tool):
                 except Exception as ex:
                     logger.debug("Neo4j 同步复习时间失败（不影响主流程）: %s", ex)
 
-            # ✅ 直接内联记录薄弱点（不依赖 Agent 再调 record_weakness）
-            # 原因：Agent 在高负载/步数限制下可能跳过 record_weakness 调用
+            # 薄弱点写入：可选地由 submit_answer 内联完成（默认），或交给 record_weakness 负责（record_weakness_notes=false）
             note_count_log = len(missed_points) + len(error_points)
-            if note_count_log:
+            if record_weakness_notes and note_count_log:
                 logger.info(
                     "[submit_answer] 内联记录 %d 条遗漏/混淆点到 episodic_log + user_notes",
                     note_count_log,
@@ -843,7 +855,7 @@ class SubmitAnswerTool(Tool):
                 sqlite_service.update_session_history(
                     session_id=session_id,
                     role="assistant",
-                    content=f"✅ 评分完成：{score_display}/5\n\n{feedback}",
+                    content=f"✅ 评分完成：{score_display:.1f}/5\n\n{feedback}",
                     message_id=message_id,
                     metadata={
                         "type": "answer_evaluation",
@@ -854,11 +866,16 @@ class SubmitAnswerTool(Tool):
                 )
 
             note_count = len(missed_points) + len(error_points)
+            if record_weakness_notes:
+                weak_msg = (f" 已自动记录 {note_count} 条遗漏/混淆点。" if note_count else "")
+            else:
+                weak_msg = (f" 薄弱点（遗漏/混淆）将由 record_weakness 工具记录（预计 {note_count} 条）。"
+                            if note_count else " 薄弱点（遗漏/混淆）由 record_weakness 工具记录。")
             result = {
                 "score": score_display,
                 "feedback": feedback,
                 "shortcomings": [],
-                "strong_points": [],
+                "strong_points": strong_points,
                 "missed_points": missed_points,
                 "error_points": error_points,
                 "tags": merged_tags,
@@ -866,9 +883,9 @@ class SubmitAnswerTool(Tool):
                 "sm2": sm2,
                 "message_id": message_id,
                 "message": (
-                    f"评分完成：{score_display}/5。"
+                    f"评分完成：{score_display:.1f}/5。"
                     + ("下次复习：" + sm2["next_review_at"] if sm2 else "")
-                    + (f" 已自动记录 {note_count} 条遗漏/混淆点。" if note_count else "")
+                    + weak_msg
                 ),
             }
             return ToolResponse.success(
@@ -883,10 +900,10 @@ class RecordWeaknessTool(Tool):
         super().__init__(
             name="record_weakness",
             description=(
-                "【调用时机】用户说「我搞混了X和Y」「我漏了Z」「分不清A和B」时；或 submit_answer 返回遗漏/混淆点后由你主动调用记录。"
-                "【功能】将混淆点、遗漏点写入情节记忆与用户笔记，供学习报告/薄弱点页面展示。"
-                "【填槽】confusion_points、missed_points、tags；至少提供 confusion_points 或 missed_points 其一。"
-                "【返回】记录成功：已记录 N 条薄弱点、count；记录失败：返回失败原因（如未提供 confusion_points 或 missed_points）。"
+                "【意图】把“遗漏点/混淆点”写入本地薄弱点 note（episodic_log + user_notes），用于学习报告展示。"
+                "【功能】不打分、不评估；只做持久化。"
+                "【填槽】confusion_points 与 missed_points 至少提供一个；tags 可选。"
+                "【返回】{success, reason, message, count}；失败也返回结构化原因。"
             ),
         )
 
@@ -923,58 +940,90 @@ class RecordWeaknessTool(Tool):
                 tags = [tags] if tags else []
 
         if not confusion and not missed:
-            return ToolResponse.error(code="INVALID_PARAM", message="请提供 confusion_points 或 missed_points")
+            return ToolResponse.success(
+                text=json.dumps(
+                    {
+                        "success": False,
+                        "reason": "参数不足：请提供 confusion_points 或 missed_points",
+                        "message": "未记录任何薄弱点",
+                        "count": 0,
+                    },
+                    ensure_ascii=False,
+                )
+            )
 
-        count = 0
-        for c in confusion:
-            if c and str(c).strip():
-                content = f"混淆点：{c}"
-                if tags:
-                    content += f" | 标签：{', '.join(str(t) for t in tags[:5])}"
-                sqlite_service.add_episodic_log(
-                    user_id=user_id,
-                    content=content,
-                    importance=0.85,
-                    event_type="user_confusion",
-                    session_id=session_id or "",
-                )
-                # 同步写入 user_notes，供「我记录的薄弱点」页面展示
-                try:
-                    sqlite_service.add_note(
+        try:
+            count = 0
+            for c in confusion:
+                if c and str(c).strip():
+                    content = f"混淆点：{c}"
+                    if tags:
+                        content += f" | 标签：{', '.join(str(t) for t in tags[:5])}"
+                    sqlite_service.add_episodic_log(
                         user_id=user_id,
                         content=content,
-                        note_type="confusion",
-                        tags=["混淆点"] + [str(t) for t in tags[:3]],
+                        importance=0.85,
+                        event_type="user_confusion",
+                        session_id=session_id or "",
                     )
-                except Exception as _ex:
-                    logger.debug("RecordWeaknessTool add_note(混淆) 忽略: %s", _ex)
-                count += 1
-        for m in missed:
-            if m and str(m).strip():
-                content = f"遗漏点：{m}"
-                if tags:
-                    content += f" | 标签：{', '.join(str(t) for t in tags[:5])}"
-                sqlite_service.add_episodic_log(
-                    user_id=user_id,
-                    content=content,
-                    importance=0.85,
-                    event_type="user_missed",
-                    session_id=session_id or "",
-                )
-                # 同步写入 user_notes，供「我记录的薄弱点」页面展示
-                try:
-                    sqlite_service.add_note(
+                    # 同步写入 user_notes，供「我记录的薄弱点」页面展示
+                    try:
+                        sqlite_service.add_note(
+                            user_id=user_id,
+                            content=content,
+                            note_type="confusion",
+                            tags=["混淆点"] + [str(t) for t in tags[:3]],
+                        )
+                    except Exception as _ex:
+                        logger.debug("RecordWeaknessTool add_note(混淆) 忽略: %s", _ex)
+                    count += 1
+            for m in missed:
+                if m and str(m).strip():
+                    content = f"遗漏点：{m}"
+                    if tags:
+                        content += f" | 标签：{', '.join(str(t) for t in tags[:5])}"
+                    sqlite_service.add_episodic_log(
                         user_id=user_id,
                         content=content,
-                        note_type="weakness",
-                        tags=["遗漏点"] + [str(t) for t in tags[:3]],
+                        importance=0.85,
+                        event_type="user_missed",
+                        session_id=session_id or "",
                     )
-                except Exception as _ex:
-                    logger.debug("RecordWeaknessTool add_note(遗漏) 忽略: %s", _ex)
-                count += 1
-        return ToolResponse.success(
-            text=json.dumps({"message": f"已记录 {count} 条薄弱点", "count": count}, ensure_ascii=False)
-        )
+                    # 同步写入 user_notes，供「我记录的薄弱点」页面展示
+                    try:
+                        sqlite_service.add_note(
+                            user_id=user_id,
+                            content=content,
+                            note_type="weakness",
+                            tags=["遗漏点"] + [str(t) for t in tags[:3]],
+                        )
+                    except Exception as _ex:
+                        logger.debug("RecordWeaknessTool add_note(遗漏) 忽略: %s", _ex)
+                    count += 1
+            return ToolResponse.success(
+                text=json.dumps(
+                    {
+                        "success": True,
+                        "reason": "记录成功",
+                        "message": f"已记录 {count} 条薄弱点",
+                        "count": count,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        except Exception as e:
+            logger.exception("record_weakness failed")
+            return ToolResponse.success(
+                text=json.dumps(
+                    {
+                        "success": False,
+                        "reason": f"记录失败: {str(e)[:200]}",
+                        "message": "写入薄弱点时出现异常",
+                        "count": 0,
+                    },
+                    ensure_ascii=False,
+                )
+            )
 
 
 class ManageNoteTool(Tool):
@@ -1145,11 +1194,10 @@ class GetMasteryReportTool(Tool):
         super().__init__(
             name="get_mastery_report",
             description=(
-                "【调用时机】用户说「复习」「薄弱点」「错题总结」「总结薄弱点」「这周的错题」「今天的遗漏」时。"
-                "【功能】汇总历史答题统计、按掌握度分档的标签、薄弱题样例、用户记录的遗漏/混淆点、遗忘曲线待复习题、文字建议。"
-                "【填槽】用户未指定时间时不传 date_from/date_to（表示全部）；用户明确说「今天」「近三天」「近7天」等时填对应日期。"
-                "【返回】总练题数、整体正确率、各档掌握度（mastery_by_level）、薄弱标签、薄弱题样例、薄弱点笔记、待复习题列表、advice 文案；失败时返回原因。"
-                "【严禁】用户说「我想练习这道题」时严禁调用。"
+                "【意图】用户要“复习/薄弱点/错题总结/总结薄弱点/今天的遗漏/这周的错题”。"
+                "【功能】汇总历史掌握度与薄弱标签，返回薄弱题样例、用户记录的遗漏/混淆点（note）、以及遗忘曲线待复习题 + 建议文案。"
+                "【填槽】date_from/date_to 可选：仅当用户明确说时间时才传（今天/近三天/近7天/或 YYYY-MM-DD）。"
+                "【返回】JSON：{total_questions_practiced, overall_avg_score, correct_rate_pct, mastery_by_level, weak_tags, weak_questions, weakness_notes, review_questions, advice}。"
             ),
         )
 
