@@ -1237,10 +1237,14 @@ class SqliteService:
                     #    后续真实内容（reasoning/全文）因不满足占位符检查而被跳过。
                     #    10字符阈值足以过滤噪声，真实答案不会短于此。
                     _PLACEHOLDERS = ("（生成中...）", "", "（无文本回答，仅有推理过程）")
+                    _GENERIC_APOLOGY = "抱歉，我无法回答这个问题。"
                     _is_placeholder = (
                         current_content in _PLACEHOLDERS
                         or len(current_content) <= 10
                     )
+                    # 允许用有效完整正文覆盖通用兜底道歉，避免刷新后回退成道歉
+                    if current_content == _GENERIC_APOLOGY and len(full_content.strip()) > 20:
+                        _is_placeholder = True
                     # 额外保护：如果新内容比现有内容短很多（短于现有的50%），
                     # 且现有内容已有实质内容（>50字符），则不覆盖。
                     _existing_is_real = len(current_content) > 50

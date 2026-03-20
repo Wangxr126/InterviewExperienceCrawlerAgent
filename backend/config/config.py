@@ -910,6 +910,11 @@ class _Settings:
         return mode if mode in ("process", "thread") else "process"
 
     @property
+    def crawler_auto_resume_fetched_on_startup(self) -> bool:
+        """后端重启时是否自动恢复 fetched 遗留任务（子进程续跑）"""
+        return _get_bool("CRAWLER_AUTO_RESUME_FETCHED_ON_STARTUP", True)
+
+    @property
     def crawler_recursive_retry_max(self) -> int:
         """爬取+提取失败任务的最大递归重试次数"""
         return _get_int("CRAWLER_RECURSIVE_RETRY_MAX", 10)

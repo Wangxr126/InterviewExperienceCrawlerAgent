@@ -551,26 +551,108 @@ function buildCy() {
     .slice(0, 10)
   const renderNodes = [...connectedNodes, ...isolatedTopTags]
 
+  // =========================
+  // 数据驱动图指标（结构+样式）
+  // =========================
+  const metrics = {}
+  renderNodes.forEach((n) => {
+    metrics[n.id] = {
+      degree: 0,
+      weightedDegree: 0,
+      questionCount: 0,
+      cooccurCount: 0,
+      bridgeCount: 0, // 跨类型连接次数（tag<->question）
+    }
+  })
+
+  let maxEdgeWeight = 1
+  edges.forEach((e) => {
+    const w = Number(e.weight || 1)
+    maxEdgeWeight = Math.max(maxEdgeWeight, w)
+    if (!metrics[e.source] || !metrics[e.target]) return
+    metrics[e.source].degree += 1
+    metrics[e.target].degree += 1
+    metrics[e.source].weightedDegree += w
+    metrics[e.target].weightedDegree += w
+    if ((e.type || '').includes('cooccur')) {
+      metrics[e.source].cooccurCount += 1
+      metrics[e.target].cooccurCount += 1
+    }
+    const sType = nodeById.value[e.source]?.type
+    const tType = nodeById.value[e.target]?.type
+    if (sType && tType && sType !== tType) {
+      metrics[e.source].bridgeCount += 1
+      metrics[e.target].bridgeCount += 1
+    }
+    if ((e.type || '') === 'contains_tag') {
+      if (String(e.source).startsWith('tag:')) metrics[e.source].questionCount += 1
+      if (String(e.target).startsWith('tag:')) metrics[e.target].questionCount += 1
+    }
+  })
+
+  const importanceList = renderNodes.map((n) => {
+    const m = metrics[n.id] || {}
+    const rawImportance =
+      (m.weightedDegree || 0) * 0.55 +
+      (m.degree || 0) * 0.2 +
+      (m.bridgeCount || 0) * 0.2 +
+      (m.questionCount || 0) * 0.35
+    return rawImportance
+  })
+  const maxImportance = Math.max(1, ...importanceList)
+
+  function nodeTier(importanceNorm) {
+    if (importanceNorm >= 0.72) return 'core'
+    if (importanceNorm >= 0.38) return 'hub'
+    return 'leaf'
+  }
+
   const elements = {
-    nodes: renderNodes.map((n) => ({
-      data: {
-        id: n.id,
-        label: n.label || '',
-        type: n.type || 'unknown',
-        weight: Number(n.weight || 0),
-        score: n.score,
-        studied_at: n.studied_at,
-      },
-    })),
-    edges: edges.map((e, idx) => ({
-      data: {
-        id: `${e.type || 'edge'}:${e.source}->${e.target}:${idx}`,
-        source: e.source,
-        target: e.target,
-        weight: Number(e.weight || 1),
-        type: e.type || 'edge',
-      },
-    })),
+    nodes: renderNodes.map((n) => {
+      const m = metrics[n.id] || {}
+      const importance =
+        ((m.weightedDegree || 0) * 0.55 +
+          (m.degree || 0) * 0.2 +
+          (m.bridgeCount || 0) * 0.2 +
+          (m.questionCount || 0) * 0.35) / maxImportance
+      const tier = nodeTier(importance)
+      return {
+        data: {
+          id: n.id,
+          label: n.label || '',
+          type: n.type || 'unknown',
+          weight: Number(n.weight || 0),
+          score: n.score,
+          studied_at: n.studied_at,
+          degree: m.degree || 0,
+          weighted_degree: m.weightedDegree || 0,
+          question_count: m.questionCount || 0,
+          bridge_count: m.bridgeCount || 0,
+          cooccur_count: m.cooccurCount || 0,
+          importance,     // 0..1
+          tier,           // core/hub/leaf
+          node_size: 18 + importance * 34,
+          node_opacity: 0.45 + importance * 0.5,
+          label_opacity: 0.4 + importance * 0.6,
+        },
+      }
+    }),
+    edges: edges.map((e, idx) => {
+      const w = Number(e.weight || 1)
+      const strength = Math.max(0.05, Math.min(1, w / maxEdgeWeight))
+      return {
+        data: {
+          id: `${e.type || 'edge'}:${e.source}->${e.target}:${idx}`,
+          source: e.source,
+          target: e.target,
+          weight: w,
+          strength,
+          type: e.type || 'edge',
+          edge_width: 0.4 + strength * 3.2,
+          edge_opacity: 0.06 + strength * 0.5,
+        },
+      }
+    }),
   }
 
   const totalNodes = renderNodes.length || 1
@@ -588,17 +670,18 @@ function buildCy() {
       {
         selector: 'node',
         style: {
-          'background-color': '#7b879a',
+          'background-color': '#94a3b8',
           'border-width': 2,
           'border-color': '#d8e0ec',
-          'width': 'mapData(weight, 0, 60, 18, 40)',
-          'height': 'mapData(weight, 0, 60, 18, 40)',
+          'width': 'data(node_size)',
+          'height': 'data(node_size)',
           'label': 'data(label)',
-          'font-size': 'mapData(weight, 0, 60, 10, 13)',
-          'text-opacity': 0.92,
+          'font-size': 'mapData(importance, 0, 1, 10, 14)',
+          'text-opacity': 'data(label_opacity)',
+          'opacity': 'data(node_opacity)',
           'color': '#334155',
           'text-background-color': '#ffffff',
-          'text-background-opacity': 0.72,
+          'text-background-opacity': 'mapData(importance, 0, 1, 0.48, 0.86)',
           'text-background-padding': 2,
           'text-border-color': '#cbd5e1',
           'text-border-width': 0.6,
@@ -616,7 +699,7 @@ function buildCy() {
       {
         selector: 'node[type = "tag"]',
         style: {
-          'background-color': '#4f46e5',
+          'background-color': 'mapData(importance, 0, 1, #6366f1, #312e81)',
           'background-gradient-stop-colors': '#6366f1 #4f46e5',
           'background-gradient-direction': 'to-bottom',
           'shape': 'ellipse',
@@ -626,12 +709,26 @@ function buildCy() {
       {
         selector: 'node[type = "question"]',
         style: {
-          'background-color': '#0f766e',
+          'background-color': 'mapData(importance, 0, 1, #14b8a6, #115e59)',
           'background-gradient-stop-colors': '#14b8a6 #0f766e',
           'background-gradient-direction': 'to-bottom',
           'shape': 'round-rectangle',
           'border-width': 2,
           'border-color': '#99f6e4',
+        },
+      },
+      {
+        selector: 'node[tier = "core"]',
+        style: {
+          'z-index': 24,
+          'text-opacity': 1,
+          'font-weight': 700,
+        },
+      },
+      {
+        selector: 'node[tier = "leaf"]',
+        style: {
+          'opacity': 'mapData(importance, 0, 1, 0.38, 0.8)',
         },
       },
       {
@@ -676,8 +773,8 @@ function buildCy() {
           'curve-style': 'bezier',
           'target-arrow-shape': 'none',
           'line-color': '#94a3b8',
-          'width': 'mapData(weight, 0, 60, 0.5, 2.6)',
-          'opacity': 'mapData(weight, 0, 60, 0.06, 0.36)',
+          'width': 'data(edge_width)',
+          'opacity': 'data(edge_opacity)',
           'z-index': 1,
         },
       },
@@ -693,9 +790,9 @@ function buildCy() {
       {
         selector: 'edge[type ^= "cooccur"]',
         style: {
-          'line-color': '#818cf8',
-          'opacity': 'mapData(weight, 0, 60, 0.08, 0.42)',
-          'width': 'mapData(weight, 0, 60, 0.6, 2.8)',
+          'line-color': 'mapData(strength, 0, 1, #93c5fd, #4f46e5)',
+          'opacity': 'mapData(strength, 0, 1, 0.08, 0.52)',
+          'width': 'mapData(strength, 0, 1, 0.8, 3.4)',
         },
       },
       {

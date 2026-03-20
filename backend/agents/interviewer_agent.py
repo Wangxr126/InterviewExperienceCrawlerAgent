@@ -487,6 +487,10 @@ class InterviewerAgent(ReActAgent):
         from backend.agents.context import get_current_user_id
 
         results = []
+        # 记录本轮流式工具参数（按 tool_call_id 索引），用于 TOOL_CALL_FINISH 丢参时兜底补回。
+        # 注意：这是“后端真实参数缓存”，不是前端推断。
+        if not hasattr(self, "_stream_tool_args_cache"):
+            self._stream_tool_args_cache = {}
 
         builtin_calls = [tc for tc in tool_calls if tc.function.name in self._builtin_tools]
         user_calls = [tc for tc in tool_calls if tc.function.name not in self._builtin_tools]
@@ -500,6 +504,7 @@ class InterviewerAgent(ReActAgent):
                 arguments = json.loads(tc.function.arguments)
             except json.JSONDecodeError as e:
                 results.append((tool_name, tool_call_id, {"content": f"错误：参数格式不正确 - {str(e)}", "args": {}}))
+                self._stream_tool_args_cache[tool_call_id] = {}
                 agent_tool_runtime_stats.record(
                     agent_name=self.name,
                     tool_name=tool_name,
@@ -508,6 +513,7 @@ class InterviewerAgent(ReActAgent):
                     user_id=get_current_user_id(),
                 )
                 continue
+            self._stream_tool_args_cache[tool_call_id] = arguments
 
             await self._emit_event(
                 EventType.TOOL_CALL, on_tool_call,
@@ -548,6 +554,7 @@ class InterviewerAgent(ReActAgent):
                     try:
                         arguments = json.loads(tc.function.arguments)
                     except json.JSONDecodeError as e:
+                        self._stream_tool_args_cache[tool_call_id] = {}
                         agent_tool_runtime_stats.record(
                             agent_name=self.name,
                             tool_name=tool_name,
@@ -556,6 +563,7 @@ class InterviewerAgent(ReActAgent):
                             user_id=get_current_user_id(),
                         )
                         return (tool_name, tool_call_id, {"content": f"错误：参数格式不正确 - {str(e)}", "args": {}})
+                    self._stream_tool_args_cache[tool_call_id] = arguments
 
                     await self._emit_event(
                         EventType.TOOL_CALL, on_tool_call,
@@ -1035,8 +1043,85 @@ class InterviewerAgent(ReActAgent):
         await asyncio.to_thread(sqlite_service.update_session_history, session_id, "assistant", "（生成中...）")
 
         full_content = ""
+        stream_visible_content = ""
         duration_ms = 0
         final_thinking_steps: list = []  # 从 agent_finish 提取的完整推理步骤
+        authoritative_eval_score = None
+        authoritative_eval_payload = None
+        raw_agent_finish_result = ""
+
+        def _sanitize_stream_text(raw: str, trim: bool = True) -> str:
+            """清洗模型可能泄露的 DSML/函数调用中间文本，仅用于最终落库正文。"""
+            import re as _re
+            if not raw:
+                return ""
+            s = str(raw)
+            s = _re.sub(r"<[｜|]\s*DSML\s*[｜|]\s*function_calls\s*>[\s\S]*?</[｜|]\s*DSML\s*[｜|]\s*function_calls\s*>", "", s, flags=_re.IGNORECASE)
+            s = _re.sub(r"^\s*<\/?[｜|]\s*DSML\s*[｜|][^>]*>\s*$", "", s, flags=_re.IGNORECASE | _re.MULTILINE)
+            # 兼容标签被清掉后残留的纯文本调用行（invoke/parameter）
+            s = _re.sub(r"^\s*invoke\s+name=.*$", "", s, flags=_re.IGNORECASE | _re.MULTILINE)
+            s = _re.sub(r"^\s*parameter\s+name=.*$", "", s, flags=_re.IGNORECASE | _re.MULTILINE)
+            s = _re.sub(r"\n{3,}", "\n\n", s)
+            return s.strip() if trim else s
+
+        def _extract_score_from_text(text: str):
+            import re as _re
+            if not text:
+                return None
+            m = _re.search(r"评分\s*[:：]\s*([0-5](?:\.\d+)?)\s*/\s*5", text)
+            if m:
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    return None
+            m2 = _re.search(r"([0-5](?:\.\d+)?)\s*/\s*5", text)
+            if m2:
+                try:
+                    return float(m2.group(1))
+                except Exception:
+                    return None
+            return None
+
+        def _align_score_text(text: str, score: float) -> str:
+            import re as _re
+            if not text:
+                return text
+            score_str = f"{score:.1f}"
+            out = text
+            out = _re.sub(r"(评分\s*[:：]\s*)([0-5](?:\.\d+)?)\s*/\s*5", rf"\g<1>{score_str}/5", out, count=1)
+            out = _re.sub(r"(评分\s*)([0-5](?:\.\d+)?)\s*/\s*5", rf"\g<1>{score_str}/5", out, count=1)
+            return out
+
+        def _build_eval_answer_from_payload(payload: dict) -> str:
+            """评分类问题：以 submit_answer 工具返回为唯一真值构造最终正文。"""
+            if not isinstance(payload, dict):
+                return ""
+            score = payload.get("score", 0)
+            feedback = str(payload.get("feedback") or "").strip()
+            strong_points = payload.get("strong_points") or []
+            missed_points = payload.get("missed_points") or []
+            error_points = payload.get("error_points") or []
+            standard_answer = str(payload.get("standard_answer") or "").strip()
+            sm2 = payload.get("sm2") if isinstance(payload.get("sm2"), dict) else {}
+            next_review = sm2.get("next_review_at") if sm2 else None
+            lines = [f"📝 评分：{float(score):.1f}/5"]
+            if feedback:
+                lines += ["", feedback]
+            if isinstance(strong_points, list):
+                lines += ["", "✅ 答对："]
+                lines += [f"- {str(x)}" for x in strong_points if str(x).strip()]
+            if isinstance(missed_points, list) and missed_points:
+                lines += ["", "✗ 遗漏："]
+                lines += [f"- {str(x)}" for x in missed_points if str(x).strip()]
+            if isinstance(error_points, list) and error_points:
+                lines += ["", "⚠ 错误点："]
+                lines += [f"- {str(x)}" for x in error_points if str(x).strip()]
+            if standard_answer:
+                lines += ["", "📚 标准答案：", standard_answer]
+            if next_review:
+                lines += ["", f"📌 下次复习：{next_review}"]
+            lines += ["其他操作：换个问法 | 延伸知识点 | 下一题"]
+            return "\n".join(lines).strip()
 
         try:
             async for event in self.arun_stream(full_input):
@@ -1045,10 +1130,47 @@ class InterviewerAgent(ReActAgent):
                 if event.type.value == "llm_chunk":
                     chunk = event.data.get("chunk") or event.data.get("content") or ""
                     full_content += chunk
+                    # 流式分片阶段不能 strip，否则会吞掉换行/空格，刷新后历史文本会“挤成一行”
+                    stream_visible_content += _sanitize_stream_text(chunk, trim=False)
+                elif event.type.value == "tool_call_finish":
+                    tool_name = (event.data.get("tool_name") or "").strip()
+                    if tool_name == "submit_answer":
+                        raw_result = event.data.get("result") or ""
+                        try:
+                            _obj = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+                        except Exception:
+                            _obj = None
+                        if isinstance(_obj, dict) and _obj.get("score") is not None:
+                            try:
+                                authoritative_eval_score = float(_obj.get("score"))
+                            except Exception:
+                                pass
+                            authoritative_eval_payload = _obj
                 elif event.type.value == "agent_finish":
                     result = event.data.get("result") or ""
-                    if result.strip():
-                        full_content = result  # agent_finish.result 是最终完整答案，直接覆盖
+                    raw_agent_finish_result = str(result or "")
+                    clean_result = _sanitize_stream_text(result)
+                    # 避免“通用兜底道歉”覆盖已经流式生成的有效正文（刷新后读历史会看到道歉）
+                    is_generic_apology = "抱歉，我无法回答这个问题。" in clean_result
+                    has_useful_stream = len((stream_visible_content or "").strip()) > 20
+                    if clean_result and not (is_generic_apology and has_useful_stream):
+                        full_content = clean_result
+                    elif has_useful_stream:
+                        full_content = stream_visible_content.strip()
+                    # 评分类问题：若 submit_answer 已返回真值，最终正文以工具真值为准（避免 step1 草稿污染）
+                    if isinstance(authoritative_eval_payload, dict):
+                        rebuilt = _build_eval_answer_from_payload(authoritative_eval_payload)
+                        if rebuilt:
+                            full_content = rebuilt
+                            logger.info("[chat_stream] 使用 submit_answer 真值重建最终正文")
+                    # 若 submit_answer 已返回权威分数，且正文分数不一致，则以后者对齐为权威分数
+                    if authoritative_eval_score is not None and full_content:
+                        shown = _extract_score_from_text(full_content)
+                        if shown is not None and abs(shown - authoritative_eval_score) > 1e-6:
+                            logger.warning(
+                                f"[chat_stream] 评分不一致，按 submit_answer 对齐: shown={shown} authoritative={authoritative_eval_score}"
+                            )
+                            full_content = _align_score_text(full_content, authoritative_eval_score)
                     # 提取 arun_stream 附加的完整 thinking_steps
                     raw_steps = event.data.get("thinking") or []
                     if isinstance(raw_steps, list) and raw_steps:
@@ -1060,6 +1182,12 @@ class InterviewerAgent(ReActAgent):
 
             # 流结束：持久化
             duration_ms = int((time.time() - start_time) * 1000)
+            logger.info(
+                "[chat_stream] DeepSeek最终返回 raw_len=%s final_len=%s preview=%r",
+                len(raw_agent_finish_result or ""),
+                len(full_content or ""),
+                (full_content or "")[:300],
+            )
             try:
                 await asyncio.to_thread(self.save_session, session_id)
                 await asyncio.to_thread(
@@ -1210,14 +1338,37 @@ class InterviewerAgent(ReActAgent):
 
             elif ev_name == "LLM_CHUNK":
                 yield event
+            elif ev_name == "TOOL_CALL":
+                # 框架若能在工具执行前发出 TOOL_CALL，这里直接转成前端消费的 TOOL_CALL_START，
+                # 避免只能在 TOOL_CALL_FINISH 时“补发 start”，导致看起来不实时。
+                tool_name = event.data.get("tool_name", "")
+                step_no = event.data.get("step", current_step)
+                args = _normalize_tool_args(
+                    event.data.get("args", event.data.get("tool_args", event.data.get("arguments")))
+                )
+                started = step_tools_started.get(step_no, [])
+                if tool_name and tool_name not in ("Thought", "Finish") and tool_name not in started:
+                    started.append(tool_name)
+                    step_tools_started[step_no] = started
+                    yield StreamEvent.create(
+                        StreamEventType.TOOL_CALL_START,
+                        self.name,
+                        tool_name=tool_name,
+                        args=args,
+                        step=step_no,
+                    )
             elif ev_name == "TOOL_CALL_FINISH":
                 tool_name = event.data.get("tool_name", "")
                 step_no = event.data.get("step", current_step)
+                tool_call_id = event.data.get("tool_call_id", "")
                 raw_args = (
                     event.data.get("args")
                     if "args" in event.data
                     else event.data.get("tool_args", event.data.get("arguments"))
                 )
+                # 若底层 finish 事件丢参，强制使用后端执行时缓存的真实 args 回填
+                if (raw_args is None or raw_args == "" or raw_args == {}) and tool_call_id:
+                    raw_args = getattr(self, "_stream_tool_args_cache", {}).get(tool_call_id)
                 args = _normalize_tool_args(raw_args)
                 result = event.data.get("result", "")
 
@@ -1241,8 +1392,27 @@ class InterviewerAgent(ReActAgent):
                         "args": args,
                         "result": result,
                     })
-
-                yield event
+                # 强制回传 args，避免部分底层适配器在 finish 事件里丢参
+                enriched_finish = dict(event.data or {})
+                enriched_finish["args"] = args
+                if "result" not in enriched_finish:
+                    enriched_finish["result"] = result
+                if "step" not in enriched_finish:
+                    enriched_finish["step"] = step_no
+                if "tool_name" not in enriched_finish:
+                    enriched_finish["tool_name"] = tool_name
+                if "tool_call_id" not in enriched_finish and tool_call_id:
+                    enriched_finish["tool_call_id"] = tool_call_id
+                yield StreamEvent.create(
+                    StreamEventType.TOOL_CALL_FINISH,
+                    self.name,
+                    **enriched_finish,
+                )
+                if tool_call_id:
+                    try:
+                        getattr(self, "_stream_tool_args_cache", {}).pop(tool_call_id, None)
+                    except Exception:
+                        pass
 
             elif ev_name == "STEP_FINISH":
                 # 保存当前步骤到汇总
@@ -1262,12 +1432,15 @@ class InterviewerAgent(ReActAgent):
                     if rc:
                         thinking_emitted_for_step.add(current_step)
                         current_step_obj["thought"] = rc
+                        logger.info(f"[arun_stream] THINKING step={current_step} len={len(rc)}")
                         yield StreamEvent.create(
                             StreamEventType.THINKING,
                             self.name,
                             chunk=rc,
                             step=current_step,
                         )
+                    else:
+                        logger.debug(f"[arun_stream] THINKING 缺失 step={current_step}（adapter 未返回 reasoning_content）")
                 if current_step_obj.get("__step"):
                     thinking_steps.append(dict(current_step_obj))
                 yield event

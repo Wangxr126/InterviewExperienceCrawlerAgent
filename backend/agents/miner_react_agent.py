@@ -193,6 +193,15 @@ class MinerReActAgent(ReActAgent):
 
             if not tool_calls:
                 final_answer = content or "抱歉，我无法回答这个问题。"
+                if final_answer == "抱歉，我无法回答这个问题。":
+                    content_preview = (content or "").strip()
+                    print(
+                        "[APOLOGY_REASON] 触发通用兜底回复："
+                        f"content_empty={not bool(content_preview)}, "
+                        f"tool_calls_count=0, "
+                        f"step={current_step}, "
+                        f"content_preview={content_preview[:200]!r}"
+                    )
                 print(f"💬 直接回复: {final_answer}")
 
                 self.add_message(Message(input_text, "user"))

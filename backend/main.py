@@ -507,6 +507,32 @@ async def startup_event():
     except Exception:
         logger.warning("[Startup] Stage2 补跑失败（不影响主服务启动）", exc_info=True)
 
+    # fetched 恢复补跑：后端重启后，自动继续上次未完成的正文提取任务
+    # 依赖 crawl_tasks.status 持久化，无需额外状态文件
+    try:
+        if _s.crawler_auto_resume_fetched_on_startup:
+            with sqlite_service._get_conn() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM crawl_tasks WHERE status='fetched'"
+                ).fetchone()
+                fetched_count = int(row["c"] or 0) if row else 0
+            if fetched_count > 0:
+                resume_batch_size = max(
+                    int(getattr(_s, "crawler_process_batch_size", 30) or 30),
+                    fetched_count,
+                )
+                logger.info(
+                    "[Startup] 检测到 fetched 遗留任务 %d 条，启动子进程自动恢复（batch_size=%d）",
+                    fetched_count,
+                    resume_batch_size,
+                )
+                _spawn_process_tasks_worker(
+                    batch_size=resume_batch_size,
+                    reason="startup-resume-fetched",
+                )
+    except Exception:
+        logger.warning("[Startup] fetched 自动恢复失败（不影响主服务启动）", exc_info=True)
+
     # 同步预热 LLM，确保首次请求不因冷启动超时
     if _s.llm_warmup_enabled and _s.llm_base_url:
         await asyncio.to_thread(_warmup_llm_sync)
@@ -1262,49 +1288,77 @@ async def api_chat_stream(req: ChatRequest):
     _chat_logger.info(f"[Stream ←] user={_user_id} | {req.message[:]}")
 
     async def generate():
-        for attempt in range(3):
-            try:
-                _chat_logger.info(f"[Stream] 使用 arun_stream，attempt={attempt+1}")
-                # 参照官方 streaming-sse-guide：async for event in agent.arun_stream()
-                async for sse_line in orchestrator.chat_stream(
-                    user_id=_user_id,
-                    message=req.message,
-                    resume=req.resume,
-                    session_id=_session_id,
-                ):
-                    # sse_line 是字符串，需要编码为字节
-                    if isinstance(sse_line, str):
-                        if not sse_line.endswith('\n\n'):
-                            sse_line += '\n\n'
-                        yield sse_line.encode('utf-8')
+        # 用后台生产者 + 队列解耦 HTTP 连接生命周期。
+        # 即使前端刷新/断开，生产者仍可继续完成本轮对话并落库，避免“被打断”。
+        queue: asyncio.Queue = asyncio.Queue()
+        sentinel = object()
+
+        async def _producer():
+            for attempt in range(3):
+                try:
+                    _chat_logger.info(f"[Stream] 使用 arun_stream，attempt={attempt+1}")
+                    async for sse_line in orchestrator.chat_stream(
+                        user_id=_user_id,
+                        message=req.message,
+                        resume=req.resume,
+                        session_id=_session_id,
+                    ):
+                        if isinstance(sse_line, str):
+                            if not sse_line.endswith('\n\n'):
+                                sse_line += '\n\n'
+                            await queue.put(sse_line.encode('utf-8'))
+                        else:
+                            await queue.put(sse_line)
+                    _chat_logger.info("[Stream →] 完成")
+                    break
+                except asyncio.TimeoutError:
+                    if attempt < 2:
+                        _chat_logger.warning(f"[Stream] 超时，重试 {attempt + 2}/3...")
+                        await asyncio.sleep(2)
                     else:
-                        yield sse_line
-                _chat_logger.info(f"[Stream →] 完成")
-                return
-            except asyncio.TimeoutError:
-                if attempt < 2:
-                    _chat_logger.warning(f"[Stream] 超时，重试 {attempt + 2}/3...")
-                    await asyncio.sleep(2)
-                else:
-                    yield f"data: {json.dumps({'error': f'⚠️ 响应超时（{_settings.interviewer_timeout}s），LLM 服务可能繁忙，请稍后重试'}, ensure_ascii=False)}\n\n"
-            except Exception as e:
-                err_str = str(e)
-                if attempt < 2 and _is_retryable_error(e):
-                    _chat_logger.warning(f"[Stream] 连接错误，重试 {attempt + 2}/3: {err_str[:80]}")
-                    await asyncio.sleep(2)
-                    continue
-                if "429" in err_str or "SetLimitExceeded" in err_str or "TooManyRequests" in err_str:
-                    msg = (
-                        "⚠️ **API 限额已到**（429 SetLimitExceeded）\n\n"
-                        "原因：火山引擎「安全体验模式」限制了每日调用次数。\n\n"
-                        "**解决方法**（两步）：\n"
-                        "1. 打开 https://console.volcengine.com/\n"
-                        "2. 进入「模型推理」→「安全体验模式」→ 关闭或调高限制\n\n"
-                        "关闭后刷新页面即可恢复正常使用。"
-                    )
-                    yield f"data: {json.dumps({'error': msg}, ensure_ascii=False)}\n\n"
-                else:
-                    yield f"data: {json.dumps({'error': f'⚠️ 错误：{err_str[:300]}'}, ensure_ascii=False)}\n\n"
+                        await queue.put(
+                            f"data: {json.dumps({'error': f'⚠️ 响应超时（{_settings.interviewer_timeout}s），LLM 服务可能繁忙，请稍后重试'}, ensure_ascii=False)}\n\n".encode("utf-8")
+                        )
+                except Exception as e:
+                    err_str = str(e)
+                    if attempt < 2 and _is_retryable_error(e):
+                        _chat_logger.warning(f"[Stream] 连接错误，重试 {attempt + 2}/3: {err_str[:80]}")
+                        await asyncio.sleep(2)
+                        continue
+                    if "429" in err_str or "SetLimitExceeded" in err_str or "TooManyRequests" in err_str:
+                        msg = (
+                            "⚠️ **API 限额已到**（429 SetLimitExceeded）\n\n"
+                            "原因：火山引擎「安全体验模式」限制了每日调用次数。\n\n"
+                            "**解决方法**（两步）：\n"
+                            "1. 打开 https://console.volcengine.com/\n"
+                            "2. 进入「模型推理」→「安全体验模式」→ 关闭或调高限制\n\n"
+                            "关闭后刷新页面即可恢复正常使用。"
+                        )
+                        await queue.put(f"data: {json.dumps({'error': msg}, ensure_ascii=False)}\n\n".encode("utf-8"))
+                    else:
+                        await queue.put(
+                            f"data: {json.dumps({'error': f'⚠️ 错误：{err_str[:300]}'}, ensure_ascii=False)}\n\n".encode("utf-8")
+                        )
+                    break
+            await queue.put(sentinel)
+
+        producer_task = asyncio.create_task(_producer())
+        try:
+            while True:
+                item = await queue.get()
+                if item is sentinel:
+                    break
+                yield item
+        except asyncio.CancelledError:
+            _chat_logger.warning("[Stream] 客户端连接断开：后台继续生成并保存本轮结果")
+            raise
+        finally:
+            # 关键：不要在这里取消 producer_task，允许其在客户端断开后继续跑完。
+            if producer_task.done():
+                try:
+                    producer_task.result()
+                except Exception as e:
+                    _chat_logger.error(f"[Stream] 后台生产者异常: {e}")
 
     return StreamingResponse(
         generate(),

@@ -68,13 +68,13 @@
                             <span v-if="tool._pending" class="tool-pending-badge">评分中…</span>
                           </div>
                           <template v-if="!tool._pending">
-                            <div v-if="hasToolArgs(tool)" class="tool-args-inner">
+                            <div class="tool-args-inner">
                               <span class="args-label">参数:</span>
-                              <div class="args-rich-json" v-html="renderToolDataHtml(getToolArgs(tool))"></div>
+                              <div class="args-rich-json" v-html="renderToolArgsHtml(tool)"></div>
                             </div>
-                            <div v-if="tool.result != null || tool.observation != null" class="tool-args-inner">
+                            <div class="tool-args-inner">
                               <span class="args-label">结果:</span>
-                              <div class="args-rich-json" v-html="renderToolDataHtml(tool.result || tool.observation)"></div>
+                              <div class="args-rich-json" v-html="renderToolResultHtml(tool)"></div>
                             </div>
                           </template>
                         </template>
@@ -84,17 +84,18 @@
                             <code class="step-code">{{ tool.name }}</code>
                             <span v-if="tool._pending" class="tool-pending-badge">调用中…</span>
                           </div>
-                          <div v-if="hasToolArgs(tool)" class="tool-args-inner">
+                          <div class="tool-args-inner">
                             <span class="args-label">参数:</span>
-                            <div class="args-rich-json" v-html="renderToolDataHtml(getToolArgs(tool))"></div>
-                          </div>
-                          <div v-if="!tool._pending && (tool.result != null || tool.observation != null)" class="tool-args-inner">
-                            <span class="args-label">结果:</span>
-                            <div class="args-rich-json" v-html="renderToolDataHtml(tool.result || tool.observation)"></div>
+                            <div class="args-rich-json" v-html="renderToolArgsHtml(tool)"></div>
                           </div>
                           <div v-if="tool._pending" class="tool-args-inner tool-pending-result">
+                            <span class="args-label">结果:</span>
                             <span class="tool-spinner"></span>
                             <span class="step-text" style="color:#94a3b8">等待结果…</span>
+                          </div>
+                          <div v-else class="tool-args-inner">
+                            <span class="args-label">结果:</span>
+                            <div class="args-rich-json" v-html="renderToolResultHtml(tool)"></div>
                           </div>
                         </template>
                       </div>
@@ -125,26 +126,9 @@
                           <div class="obs-answer-body" v-html="renderObsRichText(getObsParsedCached(step).answer_text)"></div>
                         </div>
                       </div>
-                      <!-- 其他 JSON：键值列表，长文本可折叠 -->
+                      <!-- 其他 JSON：统一按 args-kv 树渲染（参数名 + 参数值） -->
                       <div v-else-if="getObsParsedCached(step)" class="obs-kv-wrap">
-                        <div v-for="(val, key) in getObsParsedCached(step)" :key="key" class="obs-kv-row">
-                          <span class="obs-kv-key">{{ key }}</span>
-                          <div class="obs-kv-val">
-                            <template v-if="typeof val === 'object' && val !== null">
-                              <pre class="obs-kv-json">{{ JSON.stringify(val, null, 2) }}</pre>
-                            </template>
-                            <template v-else>
-                              <span v-if="String(val).length <= 120">{{ val }}</span>
-                              <span v-else>
-                                <span v-if="!step._obsExpand?.[key]">{{ String(val).slice(0, 120) }}…</span>
-                                <span v-else v-html="renderObsRichText(String(val))"></span>
-                                <button type="button" class="obs-expand-btn" @click="toggleObsExpand(step, key)">
-                                  {{ step._obsExpand?.[key] ? '收起' : '展开' }}
-                                </button>
-                              </span>
-                            </template>
-                          </div>
-                        </div>
+                        <div class="args-rich-json" v-html="renderToolDataHtml(getObsParsedCached(step))"></div>
                       </div>
                       <!-- 无法解析为键值或非对象：保留原样格式化 JSON -->
                       <div v-else class="obs-json-wrap">
@@ -322,17 +306,12 @@ const formatObsJson = (text) => {
   if (!text || typeof text !== 'string') return ''
   const extracted = extractJsonFromText(text)
   if (extracted) {
-    try {
-      const parsed = JSON.parse(extracted)
-      return JSON.stringify(parsed, null, 2)
-    } catch { /* fallback */ }
+    const parsed = parseJsonLikeString(extracted)
+    if (parsed.ok) return JSON.stringify(parsed.value, null, 2)
   }
-  try {
-    const parsed = JSON.parse(text.trim())
-    return JSON.stringify(parsed, null, 2)
-  } catch {
-    return text
-  }
+  const parsed = parseJsonLikeString(text.trim())
+  if (parsed.ok) return JSON.stringify(parsed.value, null, 2)
+  return text
 }
 
 /** 从文本中提取 JSON 片段（支持工具返回被包裹的情况） */
@@ -376,6 +355,9 @@ function stripDsmlBlocks(text) {
   // 若存在未闭合 DSML 起始标签，直接截断
   const danglingStart = s.search(/<[｜|]\s*DSML\s*[｜|]/i)
   if (danglingStart >= 0) s = s.slice(0, danglingStart)
+  // 兼容：DSML 标签被切分后，可能残留为纯文本 invoke/parameter 行，统一过滤
+  s = s.replace(/^\s*invoke\s+name=.*$/gim, '')
+  s = s.replace(/^\s*parameter\s+name=.*$/gim, '')
   return s.replace(/\n{3,}/g, '\n\n')
 }
 
@@ -416,6 +398,17 @@ function filterChunkWithDsmlGuard(chunk, pendingBuf) {
   return { safe: combined, pending: newPending }
 }
 
+/** 检测是否进入了工具调用计划文本（应从聊天正文中屏蔽） */
+function detectToolPlanText(text) {
+  if (!text || typeof text !== 'string') return false
+  const t = text
+  // DSML 标签、被切分后的 invoke/parameter 行都视为工具计划文本
+  return /[｜|]\s*DSML\s*[｜|]/i.test(t)
+    || /^\s*invoke\s+name\s*=.*$/im.test(t)
+    || /^\s*parameter\s+name\s*=.*$/im.test(t)
+    || /function_calls/i.test(t)
+}
+
 const sanitizeDisplayText = (text, trim = true) => {
   if (!text || typeof text !== 'string') return text || ''
   const cleaned = stripDsmlBlocks(normalizeEscapedText(text))
@@ -432,22 +425,19 @@ const isObsJson = (text) => {
   const t = text.trim()
   if (!(t.startsWith('{') || t.startsWith('['))) {
     const extracted = extractJsonFromText(text)
-    if (extracted) return true
+    if (extracted) return parseJsonLikeString(extracted).ok
     return false
   }
-  try {
-    JSON.parse(t)
-    return true
-  } catch {
-    const extracted = extractJsonFromText(text)
-    return !!extracted
-  }
+  if (parseJsonLikeString(t).ok) return true
+  const extracted = extractJsonFromText(text)
+  return extracted ? parseJsonLikeString(extracted).ok : false
 }
 
 /** 避免把「工具调用 JSON 计划」当思考展示：若为 [{"name":"xxx",...}] 则替换为简短说明 */
 function normalizeThoughtForStep(thought) {
   if (!thought || typeof thought !== 'string') return thought || ''
-  const s = thought.trim()
+  // 推理区也要做 DSML 清洗，避免 function_calls 原文泄露到 UI
+  const s = sanitizeDisplayText(thought).trim()
   if (!s.startsWith('[{') || !s.includes('"name"')) return s.length > 800 ? s.slice(0, 800) + '…' : s
   try {
     const parsed = JSON.parse(s)
@@ -516,12 +506,10 @@ function getObsParsed(text) {
   if (!text || typeof text !== 'string') return null
   const raw = extractJsonFromText(text) || text.trim()
   if (!raw || raw.startsWith('[')) return null
-  try {
-    const o = JSON.parse(raw)
-    return typeof o === 'object' && o !== null && !Array.isArray(o) ? o : null
-  } catch {
-    return null
-  }
+  const parsed = parseJsonLikeString(raw)
+  if (!parsed.ok) return null
+  const o = parsed.value
+  return typeof o === 'object' && o !== null && !Array.isArray(o) ? o : null
 }
 
 /** 带缓存的解析，避免同一步在模板中多次 parse */
@@ -578,53 +566,182 @@ function renderObsRichText(str) {
 function getToolArgs(tool) {
   if (!tool || typeof tool !== 'object') return {}
   const raw = tool.args ?? tool.toolArgs ?? tool.parameters ?? {}
-  if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw
-  if (typeof raw === 'string') {
-    try {
-      const parsed = JSON.parse(raw)
-      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { _raw: raw }
-    } catch {
-      return { _raw: raw }
-    }
-  }
-  return {}
+  return parseToolArgsLike(raw)
 }
 
-function hasToolArgs(tool) {
-  const args = getToolArgs(tool)
-  return !!(args && Object.keys(args).length)
+function toSingleLineText(input) {
+  if (input == null) return ''
+  return String(input)
+    .replace(/\s*\r?\n+\s*/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function parseToolArgsLike(raw) {
+  if (raw == null) return {}
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw
+  if (typeof raw === 'string') {
+    const parsed = parseJsonLikeString(raw)
+    if (parsed.ok) {
+      const v = parsed.value
+      return (v && typeof v === 'object' && !Array.isArray(v)) ? v : { _raw: raw }
+    }
+    return { _raw: raw }
+  }
+  return { _raw: String(raw) }
+}
+
+function parseJsonLikeString(raw) {
+  if (typeof raw !== 'string') return { ok: false, value: null }
+  const txt = raw.trim()
+  if (!txt) return { ok: false, value: null }
+  try {
+    return { ok: true, value: JSON.parse(txt) }
+  } catch {
+    // fallback: 兼容 Python dict/list 字符串（单引号 + True/False/None）
+    const pyLike = txt
+      .replace(/\bTrue\b/g, 'true')
+      .replace(/\bFalse\b/g, 'false')
+      .replace(/\bNone\b/g, 'null')
+      .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, s) => `"${String(s).replace(/"/g, '\\"')}"`)
+    try {
+      return { ok: true, value: JSON.parse(pyLike) }
+    } catch {
+      return { ok: false, value: null }
+    }
+  }
+}
+
+function extractToolArgsFromEvent(data) {
+  // 注意：不要读取 data.input。部分流式适配器会把结果内容放在 input 字段，导致“参数/结果”显示串位。
+  const raw =
+    data?.args ??
+    data?.tool_args ??
+    data?.arguments ??
+    data?.tool_arguments ??
+    data?.tool_input ??
+    data?.parameters
+  return parseToolArgsLike(raw)
 }
 
 function renderToolDataHtml(data) {
+  const renderPlainText = (text) => {
+    const normalized = toSingleLineText(normalizeEscapedText(String(text)))
+    return `<pre class="args-kv-text">${escapeHtml(normalized)}</pre>`
+  }
+
+  const maybeRenderStringAsStructured = (text, level = 0) => {
+    const parsed = parseJsonLikeString(text)
+    if (!parsed.ok) return null
+    const val = parsed.value
+    if (val == null || typeof val !== 'object') return null
+    if (Array.isArray(val)) return renderArrayValue(val, level)
+    return renderObjectValue(val, level)
+  }
+
+  const renderLongText = (text) => {
+    const str = String(text)
+    return renderPlainText(str)
+  }
+
+  const renderArrayValue = (arr, level = 0) => {
+    if (!arr.length) return '<span class="args-kv-primitive">[]</span>'
+    const items = arr.map((item, idx) => renderJsonNode(String(idx), item, level + 1)).join('')
+    return `<div class="args-kv-group">
+      <div class="args-kv-group-title">数组(${arr.length})</div>
+      <div class="args-kv-wrap args-kv-nested level-${Math.min(level + 1, 3)}">${items}</div>
+    </div>`
+  }
+
+  const renderObjectValue = (obj, level = 0) => {
+    const entries = Object.entries(obj)
+    if (!entries.length) return '<span class="args-kv-primitive">{}</span>'
+    const childRows = entries.map(([k, v]) => renderJsonNode(k, v, level + 1)).join('')
+    return `<div class="args-kv-group">
+      <div class="args-kv-group-title">对象(${entries.length})</div>
+      <div class="args-kv-wrap args-kv-nested level-${Math.min(level + 1, 3)}">${childRows}</div>
+    </div>`
+  }
+
+  const renderJsonNode = (key, value, level = 0) => {
+    const keyHtml = `<span class="args-kv-key">${escapeHtml(key)}：</span>`
+    const wrap = (content) => `<div class="args-kv-row"><div class="args-kv-inline">${keyHtml}<div class="args-kv-val">${content}</div></div></div>`
+    if (value == null) return wrap('<span class="args-kv-primitive">null</span>')
+    if (typeof value === 'string') {
+      const nested = maybeRenderStringAsStructured(value, level)
+      if (nested) return wrap(nested)
+      return wrap(renderLongText(value))
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return wrap(`<span class="args-kv-primitive">${escapeHtml(String(value))}</span>`)
+    }
+    if (Array.isArray(value)) {
+      return wrap(renderArrayValue(value, level))
+    }
+    if (typeof value === 'object') {
+      return wrap(renderObjectValue(value, level))
+    }
+    return wrap(`<span class="args-kv-primitive">${escapeHtml(String(value))}</span>`)
+  }
+
   if (data == null) return ''
   // 1) 字符串：优先按 JSON 解析，失败按 markdown + 公式渲染
   if (typeof data === 'string') {
     const text = normalizeEscapedText(data)
-    try {
-      const parsed = JSON.parse(text)
-      return renderToolDataHtml(parsed)
-    } catch {
-      return renderObsRichText(text)
-    }
+    const nested = maybeRenderStringAsStructured(text)
+    if (nested) return `<div class="args-kv-wrap">${nested}</div>`
+    return renderLongText(text)
   }
 
   // 2) 对象：做紧凑 key-value 渲染，字符串值支持公式
   if (typeof data === 'object') {
     const entries = Array.isArray(data) ? data.map((v, i) => [String(i), v]) : Object.entries(data)
-    const rows = entries.map(([k, v]) => {
-      if (v == null) return `<div class="args-kv-row"><span class="args-kv-key">${k}</span><span class="args-kv-val">null</span></div>`
-      if (typeof v === 'string') {
-        return `<div class="args-kv-row"><span class="args-kv-key">${k}</span><div class="args-kv-val">${renderObsRichText(v)}</div></div>`
-      }
-      if (typeof v === 'number' || typeof v === 'boolean') {
-        return `<div class="args-kv-row"><span class="args-kv-key">${k}</span><span class="args-kv-val">${String(v)}</span></div>`
-      }
-      return `<div class="args-kv-row"><span class="args-kv-key">${k}</span><pre class="args-json">${JSON.stringify(v, null, 2)}</pre></div>`
-    })
+    const rows = entries.map(([k, v]) => renderJsonNode(k, v))
     return `<div class="args-kv-wrap">${rows.join('')}</div>`
   }
 
-  return renderObsRichText(String(data))
+  return renderPlainText(String(data))
+}
+
+function renderToolArgsHtml(tool) {
+  const args = getToolArgs(tool)
+  if (!args || !Object.keys(args).length) {
+    return `<pre class="args-kv-text">${escapeHtml('无入参')}</pre>`
+  }
+  // 参数统一按 JSON 展示，避免不同工具字段差异导致的视觉歧义
+  return `<pre class="args-kv-text">${escapeHtml(stringifyAsJson(args))}</pre>`
+}
+
+function stringifyAsJson(raw) {
+  if (raw == null) return ''
+  if (typeof raw === 'string') {
+    const parsed = parseJsonLikeString(raw)
+    if (parsed.ok) return JSON.stringify(parsed.value, null, 2)
+    return toSingleLineText(raw)
+  }
+  try {
+    return JSON.stringify(raw, null, 2)
+  } catch {
+    return toSingleLineText(String(raw))
+  }
+}
+
+function renderToolResultHtml(tool) {
+  const raw = tool?.result ?? tool?.observation
+  if (raw == null || raw === '') {
+    return `<pre class="args-kv-text">${escapeHtml('暂无结果')}</pre>`
+  }
+  const jsonText = stringifyAsJson(raw)
+  return `<pre class="args-kv-text">${escapeHtml(jsonText)}</pre>`
 }
 
 /** 切换某一步某 key 的长文本展开状态 */
@@ -1016,7 +1133,8 @@ const send = async () => {
     let buffer = ''
     let receivedFirstDelta = false
     let shouldStopStream = false
-    const STREAM_READ_TIMEOUT_MS = 45000
+    let suppressPlanToChat = false
+      const STREAM_READ_TIMEOUT_MS = 45000
     let streamEndedByTimeout = false
 
     /**
@@ -1080,9 +1198,12 @@ const send = async () => {
       // ── llm_chunk：流式追加正文 ───────────────────────────
       if (evType === 'llm_chunk') {
         const raw = data.chunk ?? data.content ?? ''
+        if (detectToolPlanText(raw)) {
+          suppressPlanToChat = true
+        }
         const { safe: chunk, pending } = filterChunkWithDsmlGuard(raw, dsmlPendingBuf)
         dsmlPendingBuf = pending
-        if (chunk) {
+        if (chunk && !suppressPlanToChat) {
           // 第一个正文 chunk 到达时，自动折叠思考块
           if (!receivedFirstDelta && aiMsg.thinking.length > 0) {
             aiMsg.thinkingOpen = false
@@ -1098,6 +1219,8 @@ const send = async () => {
       if (evType === 'thinking') {
         const chunk = data.chunk ?? data.content ?? ''
         if (!chunk || typeof chunk !== 'string') return
+        // 工具计划/DSML 文本不进入推理展示，避免“step2 内容”污染对话可见区域
+        if (detectToolPlanText(chunk)) return
         const stepNo = data.step ?? 1
         const normalized = normalizeThoughtForStep(chunk)
         const stepObj = getOrCreateStep(aiMsg, stepNo)
@@ -1112,7 +1235,10 @@ const send = async () => {
       if (evType === 'tool_call_start') {
         const toolName = (data.tool_name ?? '').replace(/^[🔧\s]+/u, '').trim()
         const stepNo = data.step ?? 1
-        const args = data.args ?? data.tool_args ?? {}
+        const args = extractToolArgsFromEvent(data)
+        if (toolName === 'get_question_detail' && !Object.keys(args).length) {
+          console.warn('[tool_call_start] get_question_detail 未拿到参数', data)
+        }
         if (!toolName || toolName === 'Thought' || toolName === 'Finish') return
         const stepObj = getOrCreateStep(aiMsg, stepNo)
         stepObj.tools.push({
@@ -1134,7 +1260,10 @@ const send = async () => {
         const toolName = (data.tool_name ?? '').replace(/^[🔧\s]+/u, '').trim()
         const stepNo = data.step ?? 1
         const result = data.result ?? ''
-        const args = data.args ?? data.tool_args ?? {}
+        const args = extractToolArgsFromEvent(data)
+        if (toolName === 'get_question_detail' && !Object.keys(args).length) {
+          console.warn('[tool_call_finish] get_question_detail 未拿到参数', data)
+        }
 
         // Thought 工具：把推理写入步骤 thought 字段
         if (toolName === 'Thought') {
@@ -1168,24 +1297,31 @@ const send = async () => {
           }
           stepObj.tools.push(target)
         }
-        // get_question_detail 的结果由步骤观察区展示，submit_answer 结果需保存供评分卡片渲染
-        const SILENT_TOOLS = ['get_question_detail']
-        if (!SILENT_TOOLS.includes(toolName)) {
-          target.result = obs
-          target.observation = obs
-          target.observationIsJson = isObsJson(obs)
-        }
+        // 统一实时展示所有工具的结果（包括 get_question_detail）
+        target.result = obs
+        target.observation = obs
+        target.observationIsJson = isObsJson(obs)
         target._pending = false
         if (Object.keys(args).length && !Object.keys(target.args ?? {}).length) {
           target.args = args
+        } else if (toolName === 'get_question_detail' && !Object.keys(target.args ?? {}).length) {
+          // 极端情况下后端事件丢了 args，尝试从结果里回填 question_id，避免“无入参”。
+          const parsed = parseJsonLikeString(obs)
+          const qid = parsed.ok && parsed.value && typeof parsed.value === 'object'
+            ? (parsed.value.question_id || '')
+            : ''
+          if (qid) target.args = { question_id: qid }
         }
         messages.value.splice(aiMsgIndex, 1, { ...aiMsg })
         streamingMsg.value = messages.value[aiMsgIndex]
+        // 工具调用结束后恢复正文输出（下一步真正回答可继续进入聊天框）
+        suppressPlanToChat = false
         // 工具调用时不自动滚动，保持用户视图稳定
       }
 
       // ── step_finish：忽略（步骤已完整）─────────────────────
       if (evType === 'step_finish') {
+        suppressPlanToChat = false
         return
       }
 
@@ -1197,15 +1333,25 @@ const send = async () => {
         // 只在 finalResult 非空时才覆盖；若是通用兜底道歉且已有有效流式内容，则保留流式正文
         const isGenericApology = /抱歉，我无法回答这个问题/.test(finalResult)
         const hasUsefulStreamContent = (aiMsg.content || '').trim().length > 20
+        if (isGenericApology) {
+          console.warn('[chat] 命中通用兜底回复', {
+            hasUsefulStreamContent,
+            streamContentLength: (aiMsg.content || '').trim().length,
+            finalResultPreview: finalResult.slice(0, 200),
+          })
+        }
         if (finalResult && !(isGenericApology && hasUsefulStreamContent)) {
           aiMsg.content = finalResult
         }
         aiMsg.duration_ms = data.duration_ms ?? (Date.now() - (aiMsg._startTs ?? Date.now()))
 
         // 优先使用后端汇总的 thinking_steps（比流式增量更完整）
-        if (Array.isArray(data.thinking) && data.thinking.length > 0) {
+        const finalThinking = Array.isArray(data.thinking) && data.thinking.length > 0
+          ? data.thinking
+          : (Array.isArray(data.thinking_steps) && data.thinking_steps.length > 0 ? data.thinking_steps : null)
+        if (finalThinking) {
           const cleanName = (n) => typeof n === 'string' ? n.replace(/^[🔧\s]+/u, '').trim() : (n || '')
-          aiMsg.thinking = data.thinking.map((step, idx) => ({
+          aiMsg.thinking = finalThinking.map((step, idx) => ({
             ...step,
             __step: (step.__step && step.__step !== 'pending') ? step.__step : (idx + 1),
             tools: Array.isArray(step.tools)
@@ -1224,6 +1370,7 @@ const send = async () => {
         streamingMsg.value = messages.value[aiMsgIndex]
         syncStreamState(true)
         shouldStopStream = true
+        suppressPlanToChat = false
         return
       }
 
@@ -1239,6 +1386,7 @@ const send = async () => {
         syncStreamState(true)
         console.error(`[错误事件] ${errMsg}`)
         shouldStopStream = true
+        suppressPlanToChat = false
         return
       }
     }
@@ -1281,7 +1429,7 @@ const send = async () => {
           if (!eventBlock.trim()) continue
           
           let eventType = ''
-          let dataLine = ''
+          const dataLines = []
           
           // 解析 SSE 格式: event: xxx\ndata: {...}
           for (const line of eventBlock.split(/\r?\n/)) {
@@ -1289,10 +1437,11 @@ const send = async () => {
             if (trimmed.startsWith('event: ')) {
               eventType = trimmed.slice(7)
             } else if (trimmed.startsWith('data: ')) {
-              dataLine = trimmed.slice(6)
+              dataLines.push(trimmed.slice(6))
             }
           }
-          
+
+          const dataLine = dataLines.join('\n')
           if (!dataLine) continue
           
           try {
@@ -1324,15 +1473,16 @@ const send = async () => {
       // done 时可能剩余最后一个未被空行终止的事件块，主动再解析一次
       if (buffer.trim()) {
         let eventType = ''
-        let dataLine = ''
+        const dataLines = []
         for (const line of buffer.split(/\r?\n/)) {
           const trimmed = line.trim()
           if (trimmed.startsWith('event: ')) {
             eventType = trimmed.slice(7)
           } else if (trimmed.startsWith('data: ')) {
-            dataLine = trimmed.slice(6)
+            dataLines.push(trimmed.slice(6))
           }
         }
+        const dataLine = dataLines.join('\n')
         if (dataLine) {
           try {
             const payload = JSON.parse(dataLine)
@@ -1733,6 +1883,10 @@ onUnmounted(() => {
   background: #f8fafc;
   padding: 8px;
 }
+.args-kv-nested {
+  margin-top: 6px;
+  background: #f1f5f9;
+}
 .args-kv-row {
   display: flex;
   flex-direction: column;
@@ -1751,6 +1905,43 @@ onUnmounted(() => {
   color: #334155;
   line-height: 1.55;
   word-break: break-word;
+}
+.args-kv-primitive {
+  color: #334155;
+}
+.args-kv-md {
+  border-left: 2px solid #cbd5e1;
+  padding-left: 8px;
+}
+.args-kv-text {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  color: #334155;
+  font-size: 12px;
+  line-height: 1.55;
+  font-family: 'Consolas', 'Fira Code', monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.args-kv-group-title {
+  color: #475569;
+  font-size: 11px;
+  margin-bottom: 6px;
+}
+.args-kv-collapse {
+  width: 100%;
+}
+.args-kv-summary {
+  cursor: pointer;
+  color: #475569;
+  font-size: 11px;
+  user-select: none;
+}
+.args-kv-summary:hover {
+  color: #1e293b;
 }
 .args-kv-val :deep(.katex-display),
 .args-kv-val .katex-display {
