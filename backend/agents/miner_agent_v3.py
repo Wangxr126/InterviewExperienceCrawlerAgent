@@ -18,7 +18,10 @@ from hello_agents.tools import ToolRegistry
 
 from backend.config.config import settings
 from backend.agents.prompts.miner_prompt import get_miner_prompt, format_miner_user_prompt
-from backend.services.logging.agent_tool_runtime_stats import agent_tool_runtime_stats
+from backend.services.logging.agent_tool_runtime_stats import (
+    agent_tool_runtime_stats,
+    tool_execution_success_for_stats,
+)
 from backend.tools.miner_tools import OcrImagesTool, MarkUnrelatedTool
 from backend.agents.two_stage_miner_agent import TwoStageExtractor
 
@@ -297,7 +300,7 @@ class MinerAgentV3(ReActAgent):
             agent_tool_runtime_stats.record(
                 agent_name=self.name,
                 tool_name=tool_name,
-                success=not str(result).startswith("❌"),
+                success=tool_execution_success_for_stats(str(result)),
                 execution_time_ms=(time.time() - _t0) * 1000.0,
                 user_id=get_current_user_id(),
             )

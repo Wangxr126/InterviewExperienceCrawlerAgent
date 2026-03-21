@@ -56,7 +56,15 @@ class OcrImagesTool(Tool):
                 )
             else:
                 logger.warning("[OcrTool] OCR 未识别到文字")
-                return ToolResponse.success(text="", data={"image_count": len(self._image_paths), "char_count": 0, "ocr_called": True})
+                # 有图但无文字：业务上常记 warning，统计上应计为「未成功产出 OCR 内容」
+                return ToolResponse.partial(
+                    text="未从图片中识别到有效文字，请结合正文判断或考虑标记无关。",
+                    data={
+                        "image_count": len(self._image_paths),
+                        "char_count": 0,
+                        "ocr_called": True,
+                    },
+                )
         except Exception as e:
             logger.error(f"[OcrTool] OCR 失败: {e}")
             return ToolResponse.error(code="OCR_FAILED", message=f"OCR 执行失败: {str(e)}")

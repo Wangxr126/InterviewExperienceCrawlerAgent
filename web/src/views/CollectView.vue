@@ -144,6 +144,11 @@
         <el-tooltip content="将「已完成」或「失败」且有正文的帖子全部重新提取（删除旧题目后用 LLM 重新提取）" placement="top">
           <el-button type="info" :loading="reExtractLoading" @click.prevent="showReExtractDialog = true">重新提取所有</el-button>
         </el-tooltip>
+        <el-tooltip content="自动筛选 Stage2 未完成（含待精加工/答案仍为 Stage1 粗稿）的帖子，仅调用豆包精加工，不重新跑 Rough/Stage1" placement="top">
+          <el-button type="warning" plain :loading="stage2UnfinishedLoading" @click.prevent="reExtractStage2Unfinished">
+            提取 Stage2 未完成
+          </el-button>
+        </el-tooltip>
         <el-tooltip content="先抓取「待抓取」帖子的正文，再对「待提取」的做 LLM 提取，同步等待完成" placement="top">
           <el-button type="success" :loading="processLoading" @click.prevent="processQueue">抓取正文并提取</el-button>
         </el-tooltip>
@@ -189,7 +194,7 @@
       <div class="section-header">
         <h3 class="section-title">📋 帖子记录</h3>
         <div class="table-toolbar">
-          <el-select v-model="taskFilter" placeholder="状态" clearable size="small" style="width:90px">
+          <el-select v-model="taskFilter" placeholder="状态" clearable size="small" style="width:130px">
             <el-option v-for="opt in STATUS_OPTIONS" :key="opt.value" :label="`${opt.label}`" :value="opt.value" />
           </el-select>
           <el-tooltip placement="bottom" effect="light">
@@ -197,6 +202,7 @@
               <div class="status-help">
                 <div><strong>待抓取</strong>：已发现链接，尚未获取正文</div>
                 <div><strong>待提取</strong>：正文已获取，待 LLM 提取面试题</div>
+                <div><strong>Stage2未提取</strong>：处于待精加工或答案仍为 Stage1 粗答案</div>
                 <div><strong>已完成</strong>：题目已提取并入库</div>
                 <div><strong>无关帖</strong>：LLM 判断正文与面经无关，参与「清洗无关帖」后删除</div>
                 <div><strong>失败</strong>：抓取正文或 LLM 提取时出错</div>
@@ -487,6 +493,7 @@ const extractLoading   = ref(false)
 const retryLoading     = ref(false)
 const reExtractLoading = ref(false)
 const cleanLoading     = ref(false)
+const stage2UnfinishedLoading = ref(false)
 const ncResult   = ref(null)
 const ncCrawlLog = ref([])  // 牛客发现链接列表，用于日志展示
 const xhsMsg     = ref(null)
@@ -525,6 +532,7 @@ const form = reactive({ keywords: '', maxPages: 5, xhsCount: 20 })
 const STATUS_OPTIONS = [
   { value: 'pending',   label: '待抓取',  desc: '未获取正文' },
   { value: 'fetched',   label: '待提取',  desc: '待 LLM 提取' },
+  { value: 'stage2_unfinished', label: 'Stage2未提取', desc: '待精加工或答案未精加工' },
   { value: 'done',      label: '已完成',  desc: '题目已入库' },
   { value: 'unrelated', label: '无关帖',  desc: 'LLM 判断与面经无关' },
   { value: 'error',     label: '失败',    desc: '抓取或提取出错' },
@@ -537,8 +545,8 @@ const STATUS_META = {
   error:      { label: '失败',   color: '#f56c6c' },
   skipped:    { label: '已跳过', color: '#c0c4cc' },
 }
-const STATUS_LABEL = { pending:'待抓取', fetched:'待提取', stage2_pending:'待精加工', done:'已完成', unrelated:'无关帖', error:'失败', skipped:'已跳过' }
-const STATUS_TAG   = { pending:'warning', fetched:'', stage2_pending:'', done:'success', unrelated:'info', error:'danger', skipped:'info' }
+const STATUS_LABEL = { pending:'待抓取', fetched:'待提取', stage2_pending:'待精加工', stage2_unfinished:'Stage2未提取', done:'已完成', unrelated:'无关帖', error:'失败', skipped:'已跳过' }
+const STATUS_TAG   = { pending:'warning', fetched:'', stage2_pending:'warning', stage2_unfinished:'warning', done:'success', unrelated:'info', error:'danger', skipped:'info' }
 
 const fetchedCount = computed(() => {
   const v = rawStats.value['fetched']
@@ -1003,6 +1011,31 @@ const confirmReExtractAll = async () => {
     ElMessage.error('重新提取失败')
   } finally {
     reExtractLoading.value = false
+  }
+}
+
+const reExtractStage2Unfinished = async () => {
+  stage2UnfinishedLoading.value = true
+  extractMsg.value = null
+  try {
+    const d = await api.reExtractStage2Unfinished()
+    if (d?.status === 'ok') {
+      extractMsg.value = { ok: true, text: `🔄 ${d.message || '已提交 Stage2 未完成批量重提取'}` }
+      if ((d?.count ?? 0) > 0) {
+        extractPolling.value = true
+      }
+      await loadStats()
+      await loadTasks()
+      ElMessage.success(d.message || '已启动后台重提取')
+    } else {
+      extractMsg.value = { ok: false, text: d?.message || d?.detail || '提交失败' }
+      ElMessage.warning(d?.message || d?.detail || '提交失败')
+    }
+  } catch {
+    extractMsg.value = { ok: false, text: 'Stage2 未完成批量重提取请求失败，请确认后端已运行' }
+    ElMessage.error('请求失败')
+  } finally {
+    stage2UnfinishedLoading.value = false
   }
 }
 

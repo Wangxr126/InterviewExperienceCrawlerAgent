@@ -17,6 +17,30 @@ from typing import Any, Dict, Optional
 from backend.config.config import settings
 
 
+def tool_execution_success_for_stats(
+    result_str: Optional[str] = None,
+    *,
+    response_status: Any = None,
+) -> bool:
+    """
+    与控制台/框架约定对齐的「是否计为成功」判定，用于工具统计看板。
+
+    - 若传入 hello_agents 的 ToolStatus，则仅 SUCCESS 计成功（ERROR / PARTIAL 计失败）。
+    - 否则根据返回给模型的字符串：以 ❌ / ⚠️ 开头计失败（覆盖部分成功、错误前缀）。
+    """
+    if response_status is not None:
+        try:
+            from hello_agents.tools.response import ToolStatus
+
+            return response_status == ToolStatus.SUCCESS
+        except Exception:
+            pass
+    s = (result_str or "").strip()
+    if s.startswith("❌") or s.startswith("⚠️"):
+        return False
+    return True
+
+
 class AgentToolRuntimeStats:
     def __init__(self) -> None:
         self._lock = threading.Lock()

@@ -314,10 +314,14 @@ async def run_job_now(job_id: str):
                     headless=headless
                 )
             elif job["job_type"] == "process_tasks":
-                batch_size = job_params.get('process_batch_size')
+                batch_size = job_params.get("process_batch_size")
+                from backend.services.crawler.task_executor import execute as task_execute_fn
+
                 await asyncio.to_thread(
-                    crawl_scheduler.trigger_process_tasks,
-                    batch_size=batch_size
+                    task_execute_fn,
+                    "process_tasks",
+                    "button",
+                    batch_size=batch_size,
                 )
         except Exception as e:
             import logging

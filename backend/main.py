@@ -20,8 +20,12 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
         pass
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 
-# 禁用 requests/urllib3 版本兼容性警告
-os.environ['PYTHONWARNINGS'] = 'ignore::requests.exceptions.RequestsDependencyWarning'
+# 禁用 requests/urllib3 版本兼容性警告（使用 filterwarnings，避免 PYTHONWARNINGS 的 invalid module name 报错）
+try:
+    import requests.exceptions
+    warnings.filterwarnings('ignore', category=requests.exceptions.RequestsDependencyWarning)
+except Exception:
+    pass
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', message='.*urllib3.*')
 warnings.filterwarnings('ignore', message='.*chardet.*')
@@ -58,6 +62,12 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 _BACKEND_DATA = _cfg.backend_data_dir
 
 _BACKEND_LOGS = Path(_cfg.log_dir)
+
+_BATCH_EXTRACT_STATE_FILE = _BACKEND_LOGS / "batch_extract_state.json"
+_BATCH_EXTRACT_ABORT_FILE = _BACKEND_LOGS / "batch_extract.abort"
+
+# 父进程持有的批量提取子进程句柄，shutdown 时用于优雅终止
+_batch_extract_proc: "subprocess.Popen | None" = None
 
 _MEMORY_DIR = Path(_cfg.memory_data_dir)
 
@@ -409,8 +419,10 @@ if _POST_IMAGES_DIR.exists():
 # 添加调度器管理 API 路由
 
 from backend.api.scheduler_api import router as scheduler_router
+from backend.api.reasoning_api import router as reasoning_router
 
 app.include_router(scheduler_router)
+app.include_router(reasoning_router)
 
 
 
@@ -496,6 +508,40 @@ async def startup_event():
     _src = getattr(_s, "crawler_source", "local")
     logger.info(f"爬虫调度器已启动 | 牛客抓取来源={_src}")
 
+    # 批量提取恢复：检测上次 shutdown 时保存的未完成进度
+    try:
+        if _BATCH_EXTRACT_STATE_FILE.exists():
+            with open(_BATCH_EXTRACT_STATE_FILE, "r", encoding="utf-8") as f:
+                import json
+                state = json.load(f)
+            if state.get("interrupted_at"):
+                completed = set(state.get("completed", []))
+                task_ids = state.get("task_ids", [])
+                remaining = [t for t in task_ids if t not in completed]
+                if remaining:
+                    # 主 logger 为 loguru 时，% 占位符+额外参数不会格式化，须用 f-string
+                    logger.info(
+                        f"[Startup] 检测到未完成批量提取：已完成 {len(completed)}/{state.get('total', 0)}，"
+                        f"剩余 {len(remaining)} 条。"
+                    )
+                    if getattr(_s, "crawler_auto_resume_batch_extract_on_startup", True):
+                        log_path = _BACKEND_LOGS / "batch_extract.log"
+                        cmd = (
+                            [sys.executable, "-m", "backend.services.scheduling.batch_extract_worker"]
+                            + remaining
+                        )
+                        _spawn_batch_extract_subprocess(cmd, log_path, len(remaining))
+                        logger.info(
+                            f"[Startup] 已自动恢复批量提取子进程，剩余 {len(remaining)} 条，日志: {log_path}"
+                        )
+                    else:
+                        logger.info(
+                            "[Startup] 已关闭自动恢复（CRAWLER_AUTO_RESUME_BATCH_EXTRACT_ON_STARTUP=false），"
+                            "请调用 POST /api/crawler/tasks/resume-batch"
+                        )
+    except (OSError, ValueError, KeyError):
+        pass
+
     # Stage2 恢复补跑：后端重启后，优先处理上次遗留的 pending/in_progress
     # （即使不足 batch_size，也会 lease 并按实际数量处理）
     try:
@@ -522,9 +568,8 @@ async def startup_event():
                     fetched_count,
                 )
                 logger.info(
-                    "[Startup] 检测到 fetched 遗留任务 %d 条，启动子进程自动恢复（batch_size=%d）",
-                    fetched_count,
-                    resume_batch_size,
+                    f"[Startup] 检测到 fetched 遗留任务 {fetched_count} 条，"
+                    f"启动子进程自动恢复（batch_size={resume_batch_size}）"
                 )
                 _spawn_process_tasks_worker(
                     batch_size=resume_batch_size,
@@ -543,7 +588,45 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """FastAPI 停止时关闭调度器"""
+    """FastAPI 停止时关闭调度器，并优雅终止批量提取子进程、持久化进度"""
+    global _batch_extract_proc
+    if _batch_extract_proc is not None and _batch_extract_proc.poll() is None:
+        try:
+            _BATCH_EXTRACT_ABORT_FILE.write_text("1", encoding="utf-8")
+        except OSError:
+            pass
+        await asyncio.sleep(2)
+        try:
+            _batch_extract_proc.terminate()
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, _batch_extract_proc.wait),
+                timeout=5.0,
+            )
+        except (asyncio.TimeoutError, OSError):
+            try:
+                _batch_extract_proc.kill()
+            except OSError:
+                pass
+        log_path = _BACKEND_LOGS / "batch_extract.log"
+        try:
+            with open(_BATCH_EXTRACT_STATE_FILE, "r", encoding="utf-8") as f:
+                import json
+                state = json.load(f)
+            start_offset = state.get("log_start_offset", 0)
+            completed = _parse_completed_from_log(log_path, start_offset)
+            _save_batch_extract_state(
+                state.get("task_ids", []),
+                state.get("total", 0),
+                start_offset,
+                completed=completed,
+                interrupted_at=__import__("datetime").datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+            logger.info(
+                f"[Shutdown] 批量提取已保存进度：已完成 {len(completed)}/{state.get('total', 0)}，重启后可恢复"
+            )
+        except (OSError, ValueError) as e:
+            logger.warning("[Shutdown] 保存批量提取进度失败: %s", e)
+        _batch_extract_proc = None
     crawl_scheduler.stop()
 
 
@@ -1698,6 +1781,68 @@ def get_chat_history(user_id: str):
     return {"messages": messages, "session_id": session_id}
 
 
+@app.get("/api/user/{user_id}/chat/history/all")
+def get_all_chat_history(user_id: str):
+    """获取用户所有对话历史（所有会话）"""
+    import re as _re
+    from datetime import datetime as _dt, timedelta as _td
+    
+    # 获取该用户的所有会话
+    all_sessions = sqlite_service.get_all_sessions_for_user(user_id)
+    if not all_sessions:
+        return {"messages": [], "total_sessions": 0}
+    
+    all_messages = []
+    base_time = _dt.now()
+    
+    # 遍历所有会话，合并消息
+    for session in all_sessions:
+        raw_history = session.get("conversation_history") or []
+        session_id = session.get("session_id")
+        
+        for msg in raw_history:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "") or ""
+            content = msg.get("content", "") or ""
+            if role == "user":
+                # 去掉【q_id:xxx】等内部标记
+                content = _re.sub(r"【q_id:[^】]*】", "", content).strip()
+                # 如果有 [用户消息] 格式，只保留用户部分
+                if "\n[用户消息]\n" in content:
+                    content = content.split("\n[用户消息]\n", 1)[-1].strip()
+                elif content.startswith("[系统]"):
+                    lines = content.split("\n")
+                    content = "\n".join(
+                        l for l in lines
+                        if not l.startswith("[系统]") and not l.startswith("[Task]") and not l.startswith("[Output]")
+                    ).strip()
+            if not content and role != "assistant":
+                continue
+            out = {
+                "role": role,
+                "content": content,
+                "timestamp": msg.get("timestamp") or msg.get("ts") or "",
+                "session_id": session_id,
+            }
+            if not out["timestamp"]:
+                out["timestamp"] = (base_time - _td(minutes=max(0, len(raw_history) - len(all_messages)))).isoformat()
+            if msg.get("thinking"):
+                # 🔧 规范化 thinking 数据，确保格式一致
+                out["thinking"] = _normalize_thinking_for_frontend(msg["thinking"])
+            if msg.get("duration_ms") is not None:
+                out["duration_ms"] = msg["duration_ms"]
+            all_messages.append(out)
+    
+    # 按时间戳排序
+    all_messages.sort(key=lambda m: m.get("timestamp", ""), reverse=False)
+    
+    # 🔧 补充推理过程：若 assistant 没有 thinking，则按同时间段 tools 日志补占位工具调用
+    _attach_placeholder_tools_from_logs(all_messages, user_id=user_id, session_id=all_sessions[0].get("session_id") if all_sessions else "")
+    
+    return {"messages": all_messages, "total_sessions": len(all_sessions)}
+
+
 @app.post("/api/user/{user_id}/chat/clear")
 def clear_chat_session(user_id: str):
     """清空 .env 默认会话的 conversation_history"""
@@ -2099,7 +2244,7 @@ async def trigger_crawler(req: CrawlTriggerRequest):
 
 @app.post("/api/crawler/process")
 async def process_crawler_queue(batch_size: int | None = Query(default=None, ge=1, le=200)):
-    """手动触发任务处理队列（同步处理队列，阻塞等待）"""
+    """手动触发任务处理队列。process 模式：提交子进程后立即返回；thread 模式：线程池内同步跑完整批。"""
     batch_size = batch_size if batch_size is not None else _cfg.crawler_process_batch_size
     logger.info(f"[API] 同步处理队列 被调用 batch_size={batch_size}")
     import asyncio
@@ -2304,6 +2449,65 @@ async def re_extract_all_posts(batch_size: int | None = Query(default=None, ge=1
         "reset": reset_count,
         "questions_deleted": deleted_questions,
         "source_info": task_get_source_info(),
+    }
+
+
+@app.post("/api/crawler/re-extract-stage2-unfinished")
+async def re_extract_stage2_unfinished_posts():
+    """
+    批量重提取「Stage2 未完成」帖子：
+    1) crawl_tasks.status = stage2_pending
+    2) crawl_tasks.status = done 且存在题目 answer_text == raw_answer（疑似只完成 Stage1）
+    """
+    import sqlite3
+
+    logger.info("[API] 重提取 Stage2 未完成帖子 被调用")
+
+    with sqlite3.connect(sqlite_service.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT ct.task_id
+            FROM crawl_tasks ct
+            WHERE ct.status = 'stage2_pending'
+               OR (
+                    ct.status = 'done'
+                    AND EXISTS (
+                        SELECT 1
+                        FROM questions q
+                        WHERE q.source_url = ct.source_url
+                          AND trim(COALESCE(q.raw_answer, '')) != ''
+                          AND trim(COALESCE(q.answer_text, '')) = trim(COALESCE(q.raw_answer, ''))
+                    )
+               )
+            ORDER BY ct.id DESC
+            LIMIT 500
+            """
+        ).fetchall()
+        task_ids = [r["task_id"] for r in rows if r["task_id"]]
+
+    if not task_ids:
+        return {
+            "status": "ok",
+            "message": "没有发现 Stage2 未完成的帖子",
+            "count": 0,
+        }
+
+    # 仅豆包 Stage2 精加工：入队 stage2_pending + stage2_retry_worker，禁止走 batch_extract_worker（会重跑 Rough）
+    cmd = [sys.executable, "-m", "backend.services.scheduling.stage2_retry_worker"] + task_ids
+    log_path = _BACKEND_LOGS / "stage2_retry.log"
+    _spawn_batch_extract_subprocess(
+        cmd,
+        log_path,
+        len(task_ids),
+        persist_batch_state=False,
+        progress_label="[Stage2补跑]",
+    )
+    logger.info(f"[API] Stage2 未完成补跑（豆包）已启动，共 {len(task_ids)} 条，日志: {log_path}")
+    return {
+        "status": "ok",
+        "message": f"已提交 {len(task_ids)} 条，后台仅执行 Stage2（豆包）精加工，不写 Rough",
+        "count": len(task_ids),
     }
 
 
@@ -2551,40 +2755,71 @@ def _validate_batch_task_ids(task_ids: list) -> list:
 
 def _spawn_process_tasks_worker(batch_size: int, reason: str):
     """启动 process_tasks 子进程，避免父进程退出导致后台线程中断。"""
-    import subprocess
+    from backend.services.scheduling.process_tasks_spawn import spawn_process_tasks_worker
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "backend.services.scheduling.process_tasks_worker",
-        "--batch-size",
-        str(batch_size),
-    ]
-    kwargs = {}
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        kwargs["start_new_session"] = True
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(_PROJECT_ROOT),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=os.environ.copy(),
-        **kwargs,
-    )
-    logger.info(f"[后台子进程] ▶ 启动 process_tasks worker pid={proc.pid} reason={reason} batch_size={batch_size}")
-    return proc
+    return spawn_process_tasks_worker(batch_size=batch_size, reason=reason)
 
 
-def _spawn_batch_extract_subprocess(cmd: list, log_path: Path, total_count: int) -> None:
-    """启动批量提取子进程，日志全量写文件，控制台每 60 秒打印一次进度条"""
+def _save_batch_extract_state(task_ids: list, total: int, log_start_offset: int, completed: list | None = None, interrupted_at: str | None = None) -> None:
+    """持久化批量提取状态，供 shutdown 时保存进度、startup 时恢复"""
+    import json
+    from datetime import datetime
+    state = {
+        "task_ids": task_ids,
+        "total": total,
+        "log_start_offset": log_start_offset,
+        "started_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    if completed is not None:
+        state["completed"] = completed
+    if interrupted_at:
+        state["interrupted_at"] = interrupted_at
+    try:
+        with open(_BATCH_EXTRACT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        logger.warning("保存批量提取状态失败: %s", e)
+
+
+def _parse_completed_from_log(log_path: Path, start_offset: int) -> list:
+    """从 log 中解析「完成 task_id=」行，提取已完成的 task_id 列表"""
+    import re
+    completed = []
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(max(0, start_offset))
+            for line in f:
+                m = re.search(r"完成 task_id=([A-Za-z0-9\-]+)", line)
+                if m:
+                    completed.append(m.group(1))
+    except OSError:
+        pass
+    return completed
+
+
+def _spawn_batch_extract_subprocess(
+    cmd: list,
+    log_path: Path,
+    total_count: int,
+    *,
+    persist_batch_state: bool = True,
+    progress_label: str = "[批量提取]",
+) -> None:
+    """启动批量提取子进程，日志全量写文件，控制台每 60 秒打印一次进度条。
+
+    子进程 stdout/stderr 直接追加写入日志文件（不用 PIPE），避免父进程退出或终端中断时
+    管道断裂导致子进程写入失败、进度条与实际不符或任务假死。
+    父进程 shutdown 时会写 abort 文件通知子进程优雅退出，并持久化已完成进度供下次恢复。
+
+    persist_batch_state=False 时：不写批量提取断点状态、不占用 _batch_extract_proc（用于 Stage2 补跑子进程）。
+    """
+    import re
     import subprocess
     import threading
+    global _batch_extract_proc
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    logf = open(log_path, "a", encoding="utf-8")
+    task_ids = cmd[3:] if len(cmd) > 3 else []
     completed = 0
     last_print_time = [0]  # 用 list 以便闭包内修改
     lock = threading.Lock()
@@ -2618,73 +2853,111 @@ def _spawn_batch_extract_subprocess(cmd: list, log_path: Path, total_count: int)
             filled = int(bar_len * completed / total_count) if total_count else 0
             bar = "█" * filled + "░" * (bar_len - filled)
             ts = now_beijing_str("%Y-%m-%d %H:%M:%S")
-            msg = f"\r{ts} | INFO    | [批量提取] {bar} {completed}/{total_count} ({pct}%)\n"
+            msg = f"\r{ts} | INFO    | {progress_label} {bar} {completed}/{total_count} ({pct}%)\n"
             sys.stdout.write(_with_color(msg, C_PROGRESS))
             sys.stdout.flush()
 
-    def read_and_tee(pipe):
-        nonlocal completed
-        try:
-            for line in iter(pipe.readline, b""):
-                if not line:
-                    break
-                try:
-                    text = line.decode("utf-8", errors="replace")
-                except Exception:
-                    text = str(line)
-                logf.write(text)
-                logf.flush()
-                # 解析进度：完成 task_id=xxx 或 全部完成
-                if "[BatchExtractWorker] 完成 task_id=" in text:
-                    with lock:
-                        completed += 1
-                if "[BatchExtractWorker] 全部完成" in text:
-                    with lock:
-                        completed = total_count
-                # 主终端透传 Stage2 关键进度（队列触发/开始/单任务完成/失败/本轮汇总）
-                if "[Stage2Processor]" in text:
-                    if (
-                        "队列 " in text
-                        or "开始处理 " in text
-                        or "处理中 " in text
-                        or "完成 task_id=" in text
-                        or "处理失败 task_id=" in text
-                        or "本轮完成 " in text
-                    ):
-                        sys.stdout.write(_colorize_log_line(text if text.endswith("\n") else text + "\n"))
-                        sys.stdout.flush()
-                # 主终端透传 BatchExtractWorker 关键日志（开始/处理中/完成/异常）
-                if "[BatchExtractWorker]" in text:
-                    if (
-                        "开始批量提取" in text
-                        or "处理 " in text
-                        or "完成 task_id=" in text
-                        or "批量提取异常" in text
-                        or "全部完成" in text
-                    ):
-                        sys.stdout.write(_colorize_log_line(text if text.endswith("\n") else text + "\n"))
-                        sys.stdout.flush()
-                # 每 60 秒打印一次进度
-                now = time.time()
-                if now - last_print_time[0] >= 60:
-                    last_print_time[0] = now
-                    _print_progress()
-        finally:
-            pipe.close()
-            with lock:
-                _print_progress()
-            logf.close()
+    _re_batch_done = re.compile(r"\[BatchExtractWorker\]\s+完成\s+task_id=")
+    _re_stage2_done = re.compile(r"\[Stage2Processor\]\s+完成\s+task_id=")
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        env=os.environ,
-        **({"start_new_session": True} if sys.platform != "win32" else {}),
-    )
-    t = threading.Thread(target=read_and_tee, args=(proc.stdout,), daemon=True)
-    t.start()
+    def _handle_log_line(text: str) -> None:
+        nonlocal completed
+        # 解析进度：完成 task_id=xxx 或 全部完成（与 _parse_completed_from_log 一致，避免空格/格式微差漏计）
+        if _re_batch_done.search(text) or _re_stage2_done.search(text):
+            with lock:
+                completed += 1
+            _print_progress()
+            last_print_time[0] = time.time()
+        if "[BatchExtractWorker] 全部完成" in text or "[Stage2RetryWorker] 结束" in text:
+            with lock:
+                completed = total_count
+            _print_progress()
+            last_print_time[0] = time.time()
+        # 主终端透传 Stage2 关键进度（队列触发/开始/单任务完成/失败/本轮汇总）
+        if "[Stage2Processor]" in text:
+            if (
+                "队列 " in text
+                or "开始处理 " in text
+                or "处理中 " in text
+                or "完成 task_id=" in text
+                or "处理失败 task_id=" in text
+                or "本轮完成 " in text
+            ):
+                sys.stdout.write(_colorize_log_line(text if text.endswith("\n") else text + "\n"))
+                sys.stdout.flush()
+        # 主终端透传 BatchExtractWorker 关键日志（开始/处理中/完成/异常）
+        if "[BatchExtractWorker]" in text:
+            if (
+                "开始批量提取" in text
+                or "处理 " in text
+                or "完成 task_id=" in text
+                or "批量提取异常" in text
+                or "全部完成" in text
+            ):
+                sys.stdout.write(_colorize_log_line(text if text.endswith("\n") else text + "\n"))
+                sys.stdout.flush()
+        now = time.time()
+        if now - last_print_time[0] >= 60:
+            last_print_time[0] = now
+            _print_progress()
+
+    start_offset = log_path.stat().st_size if log_path.exists() else 0
+    try:
+        _BATCH_EXTRACT_ABORT_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if persist_batch_state:
+        _save_batch_extract_state(task_ids, total_count, start_offset)
+    env = os.environ.copy()
+    env["BATCH_EXTRACT_ABORT_FILE"] = str(_BATCH_EXTRACT_ABORT_FILE)
+    logf = open(log_path, "a", encoding="utf-8", buffering=1)
+    popen_kw: dict = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": logf,
+        "stderr": subprocess.STDOUT,
+        "env": env,
+    }
+    if sys.platform == "win32":
+        popen_kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kw["start_new_session"] = True
+    proc = subprocess.Popen(cmd, **popen_kw)
+    if persist_batch_state:
+        _batch_extract_proc = proc  # noqa: PLW0603 (global set in function)
+    try:
+        logf.close()
+    except Exception:
+        pass
+
+    def follow_log_tail():
+        nonlocal completed
+        pos = start_offset
+        line_buf = ""
+        try:
+            while True:
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as rf:
+                        rf.seek(pos)
+                        chunk = rf.read()
+                        pos = rf.tell()
+                except OSError:
+                    chunk = ""
+                if chunk:
+                    line_buf += chunk
+                    parts = line_buf.split("\n")
+                    line_buf = parts.pop() if parts else ""
+                    for p in parts:
+                        _handle_log_line(p + "\n")
+                elif proc.poll() is not None:
+                    if line_buf:
+                        _handle_log_line(line_buf if line_buf.endswith("\n") else line_buf + "\n")
+                    break
+                time.sleep(0.35)
+        finally:
+            # 不可在持锁时调用 _print_progress（其内部再次 acquire 同一把 Lock 会死锁）
+            _print_progress()
+
+    threading.Thread(target=follow_log_tail, daemon=True).start()
 
 
 @app.post("/api/crawler/tasks/re-extract-batch")
@@ -2710,6 +2983,34 @@ async def re_extract_batch_tasks(body: dict):
     _spawn_batch_extract_subprocess(cmd, log_path, len(valid_ids))
     logger.info(f"[API] 批量重新提取已启动（子进程），共 {len(valid_ids)} 条，日志: {log_path}")
     return {"status": "ok", "message": f"已提交 {len(valid_ids)} 条，后台执行中", "count": len(valid_ids)}
+
+
+@app.post("/api/crawler/tasks/resume-batch")
+async def resume_batch_extract():
+    """恢复上次父进程 shutdown 时中断的批量提取，从剩余任务继续执行。"""
+    import json
+    global _batch_extract_proc
+    if _batch_extract_proc is not None and _batch_extract_proc.poll() is None:
+        return {"status": "busy", "message": "已有批量提取进行中，请稍后再试", "count": 0}
+    if not _BATCH_EXTRACT_STATE_FILE.exists():
+        return {"status": "ok", "message": "无待恢复的批量提取", "count": 0}
+    try:
+        with open(_BATCH_EXTRACT_STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError) as e:
+        raise HTTPException(status_code=500, detail=f"读取状态失败: {e}")
+    if not state.get("interrupted_at"):
+        return {"status": "ok", "message": "上次批量提取已完成，无需恢复", "count": 0}
+    completed = set(state.get("completed", []))
+    task_ids = state.get("task_ids", [])
+    remaining = [t for t in task_ids if t not in completed]
+    if not remaining:
+        return {"status": "ok", "message": "剩余任务为空，已完成", "count": 0}
+    cmd = [sys.executable, "-m", "backend.services.scheduling.batch_extract_worker"] + remaining
+    log_path = _BACKEND_LOGS / "batch_extract.log"
+    _spawn_batch_extract_subprocess(cmd, log_path, len(remaining))
+    logger.info(f"[API] 批量提取恢复已启动，剩余 {len(remaining)} 条")
+    return {"status": "ok", "message": f"已恢复，剩余 {len(remaining)} 条后台执行中", "count": len(remaining)}
 
 
 def _validate_single_task_id(task_id: str) -> tuple:
@@ -2850,7 +3151,7 @@ async def refetch_xhs_body(task_id: str = Query(..., description="任务 ID")):
 
 def get_crawl_tasks(
 
-    status: Optional[str] = Query(None, description="pending/fetched/done/error"),
+    status: Optional[str] = Query(None, description="pending/fetched/stage2_pending/stage2_unfinished/done/error"),
 
     platform: Optional[str] = Query(None),
 
@@ -2877,10 +3178,23 @@ def get_crawl_tasks(
     params = []
 
     if status:
-
-        where_parts.append("status = ?")
-
-        params.append(status)
+        if status == "stage2_unfinished":
+            where_parts.append(
+                "("
+                "status = 'stage2_pending' "
+                "OR ("
+                "status = 'done' AND EXISTS ("
+                "SELECT 1 FROM questions q "
+                "WHERE q.source_url = crawl_tasks.source_url "
+                "AND trim(COALESCE(q.raw_answer, '')) != '' "
+                "AND trim(COALESCE(q.answer_text, '')) = trim(COALESCE(q.raw_answer, ''))"
+                ")"
+                ")"
+                ")"
+            )
+        else:
+            where_parts.append("status = ?")
+            params.append(status)
 
     if platform:
 
@@ -2934,7 +3248,17 @@ def get_crawl_tasks(
 
             f"length(raw_content) AS content_len, discover_keyword, extraction_source, "
 
-            f"extract_duration_min, agent_used_tool, trace_session_id "
+            f"extract_duration_min, agent_used_tool, trace_session_id, "
+            f"CASE "
+            f"  WHEN status = 'stage2_pending' THEN 1 "
+            f"  WHEN status = 'done' AND EXISTS ("
+            f"    SELECT 1 FROM questions q "
+            f"    WHERE q.source_url = crawl_tasks.source_url "
+            f"      AND trim(COALESCE(q.raw_answer, '')) != '' "
+            f"      AND trim(COALESCE(q.answer_text, '')) = trim(COALESCE(q.raw_answer, ''))"
+            f"  ) THEN 1 "
+            f"  ELSE 0 "
+            f"END AS stage2_unfinished "
 
             f"FROM crawl_tasks {where} {order_clause} LIMIT ? OFFSET ?",
 
@@ -2963,6 +3287,9 @@ def get_crawl_tasks(
         if task.get("processed_at"):
 
             task["processed_at"] = timestamp_to_beijing(task["processed_at"])
+
+        if int(task.get("stage2_unfinished") or 0) == 1:
+            task["status"] = "stage2_unfinished"
 
         tasks.append(task)
 

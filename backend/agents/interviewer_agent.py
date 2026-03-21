@@ -10,6 +10,7 @@
 import asyncio
 import json
 import logging
+import re
 import requests
 import time
 from collections import defaultdict
@@ -25,7 +26,11 @@ from backend.tools.interviewer_tools import get_interviewer_tools, KnowledgeReco
 from backend.agents.prompts.interviewer_prompt import interviewer_prompt
 from backend.llm.deepseek_thinking_adapter import DeepSeekThinkingOpenAIAdapter
 from backend.services.storage.sqlite_service import sqlite_service
-from backend.services.logging.agent_tool_runtime_stats import agent_tool_runtime_stats
+from backend.services.logging.agent_tool_runtime_stats import (
+    agent_tool_runtime_stats,
+    tool_execution_success_for_stats,
+)
+from backend.agents.dsml_utils import strip_dsml_from_text
 
 logger = logging.getLogger(__name__)
 
@@ -43,33 +48,23 @@ def _save_eval_failure(input_preview: str, raw_output: str, error: str) -> None:
         logger.debug(f"保存评估失败记录异常: {e}")
 
 
-def _fix_json_invalid_escape(s: str) -> str:
-    """修复 LLM 返回的 JSON 中非法转义，避免 Invalid \\escape 解析失败。"""
-    if not s or "\\" not in s:
-        return s
-    res = []
-    i = 0
-    while i < len(s):
-        if s[i] == "\\" and i + 1 < len(s):
-            n = s[i + 1]
-            if n in '"\\/bfnrt':
-                res.append(s[i])
-                res.append(n)
-                i += 2
-                continue
-            if n == "u" and i + 5 <= len(s):
-                hex_part = s[i + 2 : i + 6]
-                if all(c in "0123456789abcdefABCDEF" for c in hex_part):
-                    res.append(s[i : i + 6])
-                    i += 6
-                    continue
-            res.append("\\\\")
-            res.append(n)
-            i += 2
-            continue
-        res.append(s[i])
-        i += 1
-    return "".join(res)
+def _chat_stream_user_requests_eval(message: str) -> bool:
+    """判断本轮用户是否在「做题并要求评分」场景。
+
+    此类回合里模型可能在工具返回前就流式输出一版草稿评分。抑制正文 llm_chunk 时，
+    前端仅以 agent_finish 中的模型最终正文为准，避免先看到与终稿不一致的片段。
+    """
+    if not message or not str(message).strip():
+        return False
+    s = str(message).strip()
+    if "评分" in s:
+        return True
+    if "q_id:" in s and ("练习" in s or "道题" in s):
+        return True
+    return False
+
+
+
 
 
 _knowledge_recommender = KnowledgeRecommender()
@@ -94,6 +89,7 @@ def _normalize_thinking_steps_for_db(steps: list) -> list:
     - 去除工具名的 🔧 前缀
     - 统一 result/observation 字段
     - 保留 thought、__step、tools 字段
+    - thought 中剔除 DSML，避免推理区展示工具调用原文
     """
     if not isinstance(steps, list):
         return []
@@ -119,9 +115,11 @@ def _normalize_thinking_steps_for_db(steps: list) -> list:
                 'observation': obs_str,
                 'observationIsJson': _is_obs_json(obs_str),
             })
+        _th = step.get("thought", "")
+        _thought = strip_dsml_from_text(str(_th) if _th else "")
         result.append({
             '__step': step.get('__step', idx + 1),
-            'thought': step.get('thought', ''),
+            'thought': _thought,
             'tools': tools,
         })
     return result
@@ -147,9 +145,9 @@ def _evaluate_answer_structured(question_text: str,
         "\n\n【评分规则】"
         "\n1. score 取值仅为以下之一：0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0"
         "\n2. score<5 时，shortcomings 必须列出具体不足"
-        "\n3. error_points：含 wrong（错误）和 correct（正确），用于纠正"
-        "\n4. missed_points：用户遗漏的知识点"
-        "\n5. feedback：分条列点，包含亮点、不足、错误纠正、遗漏补充、改进建议"
+        "\n3. error_points：含 wrong（错误/不严谨表述）和 correct（正确表述），用于混淆点；无则 []"
+        "\n4. missed_points：用户遗漏的知识点，尽量与参考答案维度逐项对齐"
+        "\n5. feedback：须含评分细则 + ✓答对 + ✗遗漏 + ⚠混淆点（与 error_points 一致；无混淆时写「无明显概念性混淆」）"
         "\n\n【评分细则】"
         "\n依据：①答对要点占比 ②遗漏要点数 ③混淆/错误数"
         "\n· 5.0：答对核心要点 ≥90%，无遗漏、无错误"
@@ -191,16 +189,12 @@ def _evaluate_answer_structured(question_text: str,
         )
         if resp.status_code == 200:
             content = resp.json()["choices"][0]["message"]["content"]
-            result = None
             try:
                 result = json.loads(content)
-            except json.JSONDecodeError:
-                try:
-                    result = json.loads(_fix_json_invalid_escape(content))
-                except json.JSONDecodeError as e:
-                    logger.error(f"_evaluate_answer_structured JSON 解析失败: {e}")
-                    _save_eval_failure(prompt, content, error=str(e))
-                    return default
+            except json.JSONDecodeError as e:
+                logger.error(f"_evaluate_answer_structured JSON 解析失败: {e}")
+                _save_eval_failure(prompt, content, error=str(e))
+                return default
             raw_score = result.get("score", 3)
             try:
                 score_val = float(raw_score)
@@ -404,7 +398,7 @@ class InterviewerAgent(ReActAgent):
             async_enabled=True,
             max_concurrent_tools=3,
             hook_timeout_seconds=5.0,
-            stream_enabled=True,
+            stream_enabled=settings.interviewer_streamable,
             stream_buffer_size=100,
             stream_include_thinking=True,
             stream_include_tool_calls=True,
@@ -436,7 +430,7 @@ class InterviewerAgent(ReActAgent):
         logger.info(
             f"[InterviewerAgent] 初始化完成 model={_model} "
             f"base_url={settings.interviewer_base_url or settings.llm_base_url} "
-            f"max_steps={max_steps}"
+            f"max_steps={max_steps} streamable={settings.interviewer_streamable}"
         )
 
     @property
@@ -479,7 +473,7 @@ class InterviewerAgent(ReActAgent):
     ):
         """
         重写父类方法，使 TOOL_CALL_FINISH StreamEvent 的 data 中包含 args 字段，
-        从而让 chat_stream 的 tool_call_finish 处理逻辑能正确读取工具参数。
+        便于前端或其它消费者关联工具入参与结果。
         """
         import asyncio as _asyncio
         from hello_agents.core.streaming import StreamEvent, StreamEventType
@@ -536,7 +530,7 @@ class InterviewerAgent(ReActAgent):
             agent_tool_runtime_stats.record(
                 agent_name=self.name,
                 tool_name=tool_name,
-                success=not str(result_content).startswith("❌"),
+                success=tool_execution_success_for_stats(str(result_content)),
                 execution_time_ms=(time.time() - _t0) * 1000.0,
                 user_id=get_current_user_id(),
             )
@@ -574,11 +568,13 @@ class InterviewerAgent(ReActAgent):
                     print(f"🔧 调用工具: {tool_name}({arguments})")
 
                     tool = self.tool_registry.get_tool(tool_name)
+                    response_status = None
                     if not tool:
                         result_content = f"❌ 工具 {tool_name} 不存在"
                     else:
                         try:
                             tool_response = await tool.arun_with_timing(arguments)
+                            response_status = tool_response.status
                             result_content = tool_response.text
                             truncate_result = self.truncator.truncate(
                                 tool_name=tool_name, output=result_content
@@ -596,18 +592,23 @@ class InterviewerAgent(ReActAgent):
 
                     if result_content.startswith("❌"):
                         print(result_content)
+                    elif result_content.startswith("⚠️"):
+                        print(result_content)
                     else:
                         print(f"👀 观察: {result_content}")
 
                     agent_tool_runtime_stats.record(
                         agent_name=self.name,
                         tool_name=tool_name,
-                        success=not str(result_content).startswith("❌"),
+                        success=tool_execution_success_for_stats(
+                            str(result_content),
+                            response_status=response_status,
+                        ),
                         execution_time_ms=(time.time() - _t0) * 1000.0,
                         user_id=get_current_user_id(),
                     )
 
-                    # ✅ 携带 args，供 chat_stream 的 tool_call_finish 处理逻辑读取
+                    # ✅ 携带 args，便于流式事件消费方读取工具参数
                     return (tool_name, tool_call_id, {"content": result_content, "args": arguments})
 
             user_results = await _asyncio.gather(*[execute_one(tc) for tc in user_calls])
@@ -624,7 +625,7 @@ class InterviewerAgent(ReActAgent):
         _t0 = time.time()
         try:
             result = super()._execute_tool_call(tool_name, arguments)
-            ok = not str(result).startswith("❌")
+            ok = tool_execution_success_for_stats(str(result))
             agent_tool_runtime_stats.record(
                 agent_name=self.name,
                 tool_name=tool_name,
@@ -994,6 +995,19 @@ class InterviewerAgent(ReActAgent):
         except Exception as log_err:
             logger.warning(f"日志保存失败: {log_err}")
 
+        # 🔧 关键修复：持久化推理步骤到数据库，确保刷新后仍能显示
+        try:
+            normalized_steps = _normalize_thinking_steps_for_db(thinking_steps) if thinking_steps else None
+            sqlite_service.patch_last_assistant_content(
+                session_id,
+                response or "（无文本回答）",
+                normalized_steps or None,
+                int((time.time() - start_time) * 1000),
+            )
+            logger.info(f"[对话处理] 💾 推理步骤已持久化: {len(normalized_steps) if normalized_steps else 0} 步")
+        except Exception as e:
+            logger.error(f"[对话处理] 推理步骤持久化失败: {e}", exc_info=True)
+
         logger.info(f"[性能] 总耗时: {time.time() - start_time:.2f}s")
         logger.info("=" * 60)
         return response, thinking_steps
@@ -1009,7 +1023,14 @@ class InterviewerAgent(ReActAgent):
         resume: Optional[str] = None,
         session_id: Optional[str] = None,
     ):
-        """流式对话：直接使用 hello_agents arun_stream()，所有事件原样推送前端。"""
+        """流式对话：hello_agents arun_stream()；事件推送前端。
+
+        评分类用户消息（含「评分」或 练习+q_id）时：可不向客户端转发正文 llm_chunk；
+        agent_finish 中的正文为 ReAct 返回的模型最终输出（final answer），不再用 submit_answer
+        的 JSON 覆盖聊天内容。
+
+        若 settings.interviewer_streamable 为 False，整轮仍完整跑完 arun_stream（不省略推理/思考/工具/正文），
+        仅在结束后按相同事件顺序一次性 yield SSE。"""
         start_time = time.time()
         if not session_id:
             session_id = settings.default_session_id
@@ -1043,142 +1064,83 @@ class InterviewerAgent(ReActAgent):
         await asyncio.to_thread(sqlite_service.update_session_history, session_id, "assistant", "（生成中...）")
 
         full_content = ""
-        stream_visible_content = ""
         duration_ms = 0
-        final_thinking_steps: list = []  # 从 agent_finish 提取的完整推理步骤
-        authoritative_eval_score = None
-        authoritative_eval_payload = None
+        final_thinking_steps: list = []
         raw_agent_finish_result = ""
+        _sse_buffer: list = []
+        _stream_to_client = settings.interviewer_streamable
+        if not _stream_to_client:
+            logger.info("[chat_stream] INTERVIEWER_STREAMABLE=false，将整轮完成后一次性下发（跳过 llm_chunk）")
 
-        def _sanitize_stream_text(raw: str, trim: bool = True) -> str:
-            """清洗模型可能泄露的 DSML/函数调用中间文本，仅用于最终落库正文。"""
-            import re as _re
-            if not raw:
-                return ""
-            s = str(raw)
-            s = _re.sub(r"<[｜|]\s*DSML\s*[｜|]\s*function_calls\s*>[\s\S]*?</[｜|]\s*DSML\s*[｜|]\s*function_calls\s*>", "", s, flags=_re.IGNORECASE)
-            s = _re.sub(r"^\s*<\/?[｜|]\s*DSML\s*[｜|][^>]*>\s*$", "", s, flags=_re.IGNORECASE | _re.MULTILINE)
-            # 兼容标签被清掉后残留的纯文本调用行（invoke/parameter）
-            s = _re.sub(r"^\s*invoke\s+name=.*$", "", s, flags=_re.IGNORECASE | _re.MULTILINE)
-            s = _re.sub(r"^\s*parameter\s+name=.*$", "", s, flags=_re.IGNORECASE | _re.MULTILINE)
-            s = _re.sub(r"\n{3,}", "\n\n", s)
-            return s.strip() if trim else s
+        suppress_eval_body_chunks = bool(_stream_to_client and _chat_stream_user_requests_eval(message))
+        if suppress_eval_body_chunks:
+            logger.info("[chat_stream] 评分类消息：抑制正文 llm_chunk 下发，最终以 agent_finish 模型终稿为准")
 
-        def _extract_score_from_text(text: str):
-            import re as _re
-            if not text:
-                return None
-            m = _re.search(r"评分\s*[:：]\s*([0-5](?:\.\d+)?)\s*/\s*5", text)
-            if m:
-                try:
-                    return float(m.group(1))
-                except Exception:
-                    return None
-            m2 = _re.search(r"([0-5](?:\.\d+)?)\s*/\s*5", text)
-            if m2:
-                try:
-                    return float(m2.group(1))
-                except Exception:
-                    return None
-            return None
-
-        def _align_score_text(text: str, score: float) -> str:
-            import re as _re
-            if not text:
-                return text
-            score_str = f"{score:.1f}"
-            out = text
-            out = _re.sub(r"(评分\s*[:：]\s*)([0-5](?:\.\d+)?)\s*/\s*5", rf"\g<1>{score_str}/5", out, count=1)
-            out = _re.sub(r"(评分\s*)([0-5](?:\.\d+)?)\s*/\s*5", rf"\g<1>{score_str}/5", out, count=1)
-            return out
-
-        def _build_eval_answer_from_payload(payload: dict) -> str:
-            """评分类问题：以 submit_answer 工具返回为唯一真值构造最终正文。"""
-            if not isinstance(payload, dict):
-                return ""
-            score = payload.get("score", 0)
-            feedback = str(payload.get("feedback") or "").strip()
-            strong_points = payload.get("strong_points") or []
-            missed_points = payload.get("missed_points") or []
-            error_points = payload.get("error_points") or []
-            standard_answer = str(payload.get("standard_answer") or "").strip()
-            sm2 = payload.get("sm2") if isinstance(payload.get("sm2"), dict) else {}
-            next_review = sm2.get("next_review_at") if sm2 else None
-            lines = [f"📝 评分：{float(score):.1f}/5"]
-            if feedback:
-                lines += ["", feedback]
-            if isinstance(strong_points, list):
-                lines += ["", "✅ 答对："]
-                lines += [f"- {str(x)}" for x in strong_points if str(x).strip()]
-            if isinstance(missed_points, list) and missed_points:
-                lines += ["", "✗ 遗漏："]
-                lines += [f"- {str(x)}" for x in missed_points if str(x).strip()]
-            if isinstance(error_points, list) and error_points:
-                lines += ["", "⚠ 错误点："]
-                lines += [f"- {str(x)}" for x in error_points if str(x).strip()]
-            if standard_answer:
-                lines += ["", "📚 标准答案：", standard_answer]
-            if next_review:
-                lines += ["", f"📌 下次复习：{next_review}"]
-            lines += ["其他操作：换个问法 | 延伸知识点 | 下一题"]
-            return "\n".join(lines).strip()
+        def _sanitize_stream_text(raw: str) -> str:
+            """直接返回原始文本，DeepSeek 已能正确处理。"""
+            return str(raw) if raw else ""
 
         try:
+            from hello_agents.core.streaming import StreamEvent, StreamEventType
+
+            _last_db_progress_ts = 0.0
+            _db_progress_interval_sec = 0.45
+
             async for event in self.arun_stream(full_input):
-                sse_line = event.to_sse()
                 # 累积最终文本 & 推理步骤
                 if event.type.value == "llm_chunk":
                     chunk = event.data.get("chunk") or event.data.get("content") or ""
                     full_content += chunk
-                    # 流式分片阶段不能 strip，否则会吞掉换行/空格，刷新后历史文本会“挤成一行”
-                    stream_visible_content += _sanitize_stream_text(chunk, trim=False)
-                elif event.type.value == "tool_call_finish":
-                    tool_name = (event.data.get("tool_name") or "").strip()
-                    if tool_name == "submit_answer":
-                        raw_result = event.data.get("result") or ""
-                        try:
-                            _obj = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
-                        except Exception:
-                            _obj = None
-                        if isinstance(_obj, dict) and _obj.get("score") is not None:
+                    # 流式正文节流落库：刷新页面时至少能恢复已生成的部分正文（推理步骤由前端 localStorage 兜底）
+                    _now_pg = time.time()
+                    if _now_pg - _last_db_progress_ts >= _db_progress_interval_sec:
+                        _strip = (full_content or "").strip()
+                        if len(_strip) >= 12:
+                            _last_db_progress_ts = _now_pg
                             try:
-                                authoritative_eval_score = float(_obj.get("score"))
-                            except Exception:
-                                pass
-                            authoritative_eval_payload = _obj
+                                await asyncio.to_thread(
+                                    sqlite_service.patch_last_assistant_content,
+                                    session_id,
+                                    full_content,
+                                    None,
+                                    None,
+                                )
+                            except Exception as _pg_err:
+                                logger.debug("[chat_stream] 中间落库跳过: %s", _pg_err)
                 elif event.type.value == "agent_finish":
                     result = event.data.get("result") or ""
                     raw_agent_finish_result = str(result or "")
-                    clean_result = _sanitize_stream_text(result)
-                    # 避免“通用兜底道歉”覆盖已经流式生成的有效正文（刷新后读历史会看到道歉）
-                    is_generic_apology = "抱歉，我无法回答这个问题。" in clean_result
-                    has_useful_stream = len((stream_visible_content or "").strip()) > 20
-                    if clean_result and not (is_generic_apology and has_useful_stream):
-                        full_content = clean_result
-                    elif has_useful_stream:
-                        full_content = stream_visible_content.strip()
-                    # 评分类问题：若 submit_answer 已返回真值，最终正文以工具真值为准（避免 step1 草稿污染）
-                    if isinstance(authoritative_eval_payload, dict):
-                        rebuilt = _build_eval_answer_from_payload(authoritative_eval_payload)
-                        if rebuilt:
-                            full_content = rebuilt
-                            logger.info("[chat_stream] 使用 submit_answer 真值重建最终正文")
-                    # 若 submit_answer 已返回权威分数，且正文分数不一致，则以后者对齐为权威分数
-                    if authoritative_eval_score is not None and full_content:
-                        shown = _extract_score_from_text(full_content)
-                        if shown is not None and abs(shown - authoritative_eval_score) > 1e-6:
-                            logger.warning(
-                                f"[chat_stream] 评分不一致，按 submit_answer 对齐: shown={shown} authoritative={authoritative_eval_score}"
-                            )
-                            full_content = _align_score_text(full_content, authoritative_eval_score)
-                    # 提取 arun_stream 附加的完整 thinking_steps
+                    full_content = _sanitize_stream_text(result)
                     raw_steps = event.data.get("thinking") or []
                     if isinstance(raw_steps, list) and raw_steps:
                         final_thinking_steps = _normalize_thinking_steps_for_db(raw_steps)
+
+                skip_chunk_to_client = (
+                    suppress_eval_body_chunks and event.type.value == "llm_chunk"
+                )
+                if event.type.value == "agent_finish":
+                    _agent_name = getattr(event, "agent_name", None) or self.name
+                    _finish_data = dict(event.data or {})
+                    _finish_data["result"] = full_content
+                    sse_line = StreamEvent.create(
+                        StreamEventType.AGENT_FINISH,
+                        _agent_name,
+                        **_finish_data,
+                    ).to_sse()
+                else:
+                    sse_line = event.to_sse()
+
                 if isinstance(sse_line, str) and sse_line.strip():
+                    if not _stream_to_client and event.type.value == "llm_chunk":
+                        continue  # 非流式模式跳过 llm_chunk，正文仅在 agent_finish 整块展示
+                    if skip_chunk_to_client:
+                        continue
                     if not sse_line.endswith("\n\n"):
                         sse_line += "\n\n"
-                    yield sse_line
+                    if _stream_to_client:
+                        yield sse_line
+                    else:
+                        _sse_buffer.append(sse_line)
 
             # 流结束：持久化
             duration_ms = int((time.time() - start_time) * 1000)
@@ -1199,6 +1161,14 @@ class InterviewerAgent(ReActAgent):
                 )
             except Exception as e:
                 logger.error(f"[chat_stream] 保存失败: {e}", exc_info=True)
+
+            if not _stream_to_client and _sse_buffer:
+                logger.info(
+                    "[chat_stream] interviewer_streamable=false，一次性下发 %s 条 SSE（内容未删减）",
+                    len(_sse_buffer),
+                )
+                for _line in _sse_buffer:
+                    yield _line
 
             self._write_working(user_id, f"AI：{full_content[:100]}", importance=0.4, session_id=session_id)
             await asyncio.to_thread(
@@ -1297,9 +1267,11 @@ class InterviewerAgent(ReActAgent):
     async def arun_stream(self, input_text: str, **kwargs):
         """
         覆盖父类：
-        1. 在 LLM_CHUNK 之后检测 reasoning_content，补推 THINKING 事件（DeepSeek 思维链）
-        2. 在 TOOL_CALL_FINISH 之前补推 TOOL_CALL_START 事件
-        3. 在 AGENT_FINISH 时把完整 thinking_steps 附加到事件 data 中
+        1. 若适配器实现 astream_invoke_with_tools（DeepSeekThinkingOpenAIAdapter）：每步仅一次
+           stream+tools 请求，不再使用父类「无 tools 流式 + invoke_with_tools」双请求。
+        2. 在 LLM_CHUNK 之后检测 reasoning_content，补推 THINKING 事件（DeepSeek 思维链）
+        3. 在 TOOL_CALL_FINISH 之前补推 TOOL_CALL_START 事件
+        4. 在 AGENT_FINISH 时把完整 thinking_steps 附加到事件 data 中
         """
         from hello_agents.core.streaming import StreamEvent, StreamEventType
 
@@ -1309,6 +1281,7 @@ class InterviewerAgent(ReActAgent):
         current_step_obj: dict = {}          # 当前步骤的数据
         step_tools_started: dict = {}        # step_no -> [tool_name, ...]
         thinking_emitted_for_step: set = set()  # 已推 thinking 的 step 编号
+        step_incremental_thinking: set = set()  # 已通过 THINKING 流式推过的 step，避免 STEP_FINISH 再整包重复
 
         def _normalize_tool_args(raw_args: Any) -> Dict[str, Any]:
             if raw_args is None:
@@ -1326,7 +1299,21 @@ class InterviewerAgent(ReActAgent):
                     return {"_raw": s}
             return {"_raw": str(raw_args)}
 
-        async for event in super().arun_stream(input_text, **kwargs):
+        _adapter = getattr(getattr(self, "llm", None), "_adapter", None)
+        if _adapter is not None and callable(
+            getattr(_adapter, "astream_invoke_with_tools", None)
+        ):
+            from backend.agents.react_stream_single_request import (
+                react_arun_stream_single_tool_stream,
+            )
+
+            _base_stream = react_arun_stream_single_tool_stream(
+                self, input_text, **kwargs
+            )
+        else:
+            _base_stream = super().arun_stream(input_text, **kwargs)
+
+        async for event in _base_stream:
             ev_name = event.type.name  # 'STEP_START' / 'LLM_CHUNK' / ...
 
             if ev_name == "STEP_START":
@@ -1337,6 +1324,20 @@ class InterviewerAgent(ReActAgent):
                 yield event
 
             elif ev_name == "LLM_CHUNK":
+                yield event
+            elif ev_name == "THINKING":
+                # 适配层已按 delta.reasoning_content 拆片；直接透传，并在本步聚合 thought（供 agent_finish）
+                raw_step = event.data.get("step", current_step)
+                try:
+                    step_no = int(raw_step)
+                except (TypeError, ValueError):
+                    step_no = current_step
+                chunk = event.data.get("chunk") or ""
+                if chunk:
+                    step_incremental_thinking.add(step_no)
+                    if current_step_obj.get("__step") == step_no:
+                        prev = current_step_obj.get("thought") or ""
+                        current_step_obj["thought"] = prev + chunk
                 yield event
             elif ev_name == "TOOL_CALL":
                 # 框架若能在工具执行前发出 TOOL_CALL，这里直接转成前端消费的 TOOL_CALL_START，
@@ -1416,37 +1417,58 @@ class InterviewerAgent(ReActAgent):
 
             elif ev_name == "STEP_FINISH":
                 # 保存当前步骤到汇总
-                # Read reasoning_content here: stream is done, last_stats is ready
+                # 流式推理已在 THINKING 事件中按片发出；此处用 last_stats 中的全文做 canonical thought（含 DSML 清洗）
+                rc = ""
+                _adapter = getattr(getattr(self, "llm", None), "_adapter", None)
+                if _adapter and hasattr(_adapter, "last_stats"):
+                    _stats = _adapter.last_stats
+                    rc = getattr(_stats, "reasoning_content", None) or ""
+                if not rc:
+                    _llm = getattr(self, "llm", None)
+                    _stats = getattr(_llm, "last_call_stats", None)
+                    rc = getattr(_stats, "reasoning_content", None) or ""
+                rc_show = strip_dsml_from_text(rc) if rc else ""
+                if rc_show:
+                    current_step_obj["thought"] = rc_show
+                had_incremental = current_step in step_incremental_thinking
                 if current_step not in thinking_emitted_for_step:
-                    rc = ""
-                    # Try adapter.last_stats first (written after astream_invoke finishes)
-                    _adapter = getattr(getattr(self, "llm", None), "_adapter", None)
-                    if _adapter and hasattr(_adapter, "last_stats"):
-                        _stats = _adapter.last_stats
-                        rc = getattr(_stats, "reasoning_content", None) or ""
-                    # Fallback: llm.last_call_stats
-                    if not rc:
-                        _llm = getattr(self, "llm", None)
-                        _stats = getattr(_llm, "last_call_stats", None)
-                        rc = getattr(_stats, "reasoning_content", None) or ""
-                    if rc:
-                        thinking_emitted_for_step.add(current_step)
-                        current_step_obj["thought"] = rc
-                        logger.info(f"[arun_stream] THINKING step={current_step} len={len(rc)}")
+                    if rc_show and not had_incremental:
+                        logger.info(f"[arun_stream] THINKING(整包) step={current_step} len={len(rc_show)}")
                         yield StreamEvent.create(
                             StreamEventType.THINKING,
                             self.name,
-                            chunk=rc,
+                            chunk=rc_show,
                             step=current_step,
                         )
-                    else:
-                        logger.debug(f"[arun_stream] THINKING 缺失 step={current_step}（adapter 未返回 reasoning_content）")
+                    elif rc_show and had_incremental:
+                        logger.debug(
+                            f"[arun_stream] step={current_step} 已流式 THINKING，STEP_FINISH 不再整包重复"
+                        )
+                    elif not rc_show and rc:
+                        logger.debug(
+                            f"[arun_stream] THINKING step={current_step} 经 DSML 清洗后为空，跳过整包"
+                        )
+                    elif not rc:
+                        logger.debug(
+                            f"[arun_stream] THINKING 缺失 step={current_step}（adapter 未返回 reasoning_content）"
+                        )
+                    thinking_emitted_for_step.add(current_step)
                 if current_step_obj.get("__step"):
                     thinking_steps.append(dict(current_step_obj))
                 yield event
 
             elif ev_name == "AGENT_FINISH":
                 # 把完整 thinking_steps 附加到 agent_finish 事件
+                # 兜底：部分流实现可能直接 AGENT_FINISH 而未发 STEP_FINISH，此时 current_step_obj 尚未并入
+                if current_step_obj.get("__step"):
+                    _sn = current_step_obj.get("__step")
+                    if not any(
+                        isinstance(s, dict) and s.get("__step") == _sn for s in thinking_steps
+                    ):
+                        _th = (current_step_obj.get("thought") or "").strip()
+                        _tools = current_step_obj.get("tools") or []
+                        if _th or _tools:
+                            thinking_steps.append(dict(current_step_obj))
                 enriched = dict(event.data)
                 enriched["thinking"] = thinking_steps
                 yield StreamEvent.create(

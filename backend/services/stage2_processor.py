@@ -10,19 +10,34 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from typing import List, Dict, Any
 
 from backend.config.config import settings
+from backend.services.logging.agent_tool_runtime_stats import agent_tool_runtime_stats
 from backend.services.storage import sqlite_service
 from backend.services.volcengine_stage2_client import call_single, call_batch
 from backend.agents.prompts.two_stage_prompts import ENRICH_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
+# 工具统计页展示用：Stage2 不走 ReAct 工具循环，需单独打点
+STAGE2_STATS_AGENT = "Stage2"
+STAGE2_STATS_TOOL = "stage2_enrich"
+
 # 防止并发执行 Stage2 处理器
 _stage2_lock = threading.Lock()
 _stage2_running = False
+
+
+def _record_stage2_tool_call(success: bool, execution_time_ms: float = 0.0) -> None:
+    agent_tool_runtime_stats.record(
+        agent_name=STAGE2_STATS_AGENT,
+        tool_name=STAGE2_STATS_TOOL,
+        success=success,
+        execution_time_ms=float(execution_time_ms or 0.0),
+    )
 
 
 def _extract_json_from_stage2(text: str) -> str:
@@ -109,8 +124,10 @@ def _process_single_item(
         # 允许 answer_text 中保留 Markdown 换行等控制字符（不做清洗）
         # 只要求整体结构是 JSON 数组对象：[{...}, {...}]
         questions = json.loads(merged, strict=False)
+        # 语种/标签校验仅在 miner 提取路径（question_extractor）执行；Stage2 精加工不再拦截英文题干等。
+        raw_content = item.get("content") or ""
         task_id = item["task_id"]
-        content = item.get("content") or ""
+        content = raw_content
         stage1_output = item.get("stage1_output") or ""
         source_url = item.get("source_url") or ""
 
@@ -152,11 +169,13 @@ def _process_single_item(
                 ))
             conn.commit()
 
-        # 更新 crawl_tasks
+        # 更新 crawl_tasks（须写入 extraction_source，否则默认空串会变成 NULL，列表「来源」一直为 --）
+        extraction_src = "image" if bool(item.get("agent_used_tool")) else "content"
         sqlite_service.update_task_status(
             task_id,
             "done",
             questions_count=len(questions),
+            extraction_source=extraction_src,
             agent_used_tool=bool(item.get("agent_used_tool")),
             trace_session_id=item.get("trace_session_id") or None,
         )
@@ -188,110 +207,149 @@ def _process_single_item(
         return False
 
 
-def _run_stage2_processor_impl():
-    """实际执行 Stage2 批量处理"""
-    global _stage2_running
-    batch_size = settings.miner_stage2_batch_size
+def _is_retryable_api_error(e: Exception) -> bool:
+    """429/503 等可重试的 API 错误，应切换备用模型"""
+    msg = str(e).lower()
+    return "429" in msg or "503" in msg or "setlimit" in msg or "toomanyrequests" in msg
+
+
+def _execute_stage2_on_leased_items(items: List[Dict]) -> None:
+    """
+    对已 lease 的一批 stage2_pending 项调用豆包并写库。
+    不负责 lease / _stage2_running；结束时打印本轮 success/fail 与剩余队列长度。
+    """
     use_batch = settings.miner_stage2_use_batch
     models = settings.miner_stage2_models
-    if not models:
-        logger.warning("[Stage2Processor] 未配置 Stage2 模型，跳过")
+    if not models or not items:
         return
 
-    # 先做一次陈旧 in_progress 回收，避免队列永远卡死
-    sqlite_service.recover_stale_stage2_pending(settings.miner_stage2_recovery_stale_seconds)
-    worker_id = f"stage2-{uuid.uuid4().hex[:8]}"
-    items = sqlite_service.lease_stage2_pending_batch(batch_size, worker_id=worker_id)
-    if not items:
-        return
-
-    logger.info("[Stage2Processor] 开始处理 %d 条，use_batch=%s", len(items), use_batch)
+    logger.info(
+        "[Stage2Processor] 开始处理 %d 条，use_batch=%s，模型链=%s",
+        len(items),
+        use_batch,
+        [m["model"] for m in models],
+    )
     success_count = 0
     fail_count = 0
-    cfg = models[0]
-    model_name = cfg["model"]
-    api_key = cfg["api_key"]
-    base_url = cfg["base_url"]
     temperature = settings.miner_stage2_temperature
     max_tokens = settings.miner_stage2_max_tokens
     timeout = settings.miner_stage2_timeout
+    last_error = None
 
     try:
-        if use_batch and len(items) > 1:
-            # 批量 API
-            user_contents = [it["enrich_input"] for it in items]
-            results = call_batch(
-                model=model_name,
-                api_key=api_key,
-                base_url=base_url,
-                system_prompt=ENRICH_SYSTEM_PROMPT,
-                user_contents=user_contents,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=timeout,
-            )
-            for i, item in enumerate(items):
-                enrich_result = results[i] if i < len(results) else ""
-                if enrich_result:
-                    enrich_result = (enrich_result or "").strip()
-                    enrich_result = re.sub(r"<think>[\s\S]*?</think>", "", enrich_result, flags=re.IGNORECASE)
-                    enrich_result = enrich_result.strip()
-                enrich_result = _extract_json_from_stage2(enrich_result or "")
-                logger.info(
-                    "[Stage2Processor] 处理中 %d/%d task_id=%s",
-                    i + 1,
-                    len(items),
-                    item.get("task_id"),
-                )
-                ok = _process_single_item(item, enrich_result or "[]", model_name)
-                if ok:
-                    success_count += 1
-                else:
-                    fail_count += 1
-        else:
-            # 单条 API
-            for i, item in enumerate(items):
-                enrich_input = item.get("enrich_input") or ""
-                logger.info(
-                    "[Stage2Processor] 处理中 %d/%d task_id=%s",
-                    i + 1,
-                    len(items),
-                    item.get("task_id"),
-                )
-                enrich_result = call_single(
-                    model=model_name,
-                    api_key=api_key,
-                    base_url=base_url,
-                    system_prompt=ENRICH_SYSTEM_PROMPT,
-                    user_content=enrich_input,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    timeout=timeout,
-                )
-                enrich_result = (enrich_result or "").strip()
-                enrich_result = re.sub(r"<think>[\s\S]*?</think>", "", enrich_result, flags=re.IGNORECASE)
-                enrich_result = _extract_json_from_stage2(enrich_result or "")
-                ok = _process_single_item(item, enrich_result or "[]", model_name)
-                if ok:
-                    success_count += 1
-                else:
-                    fail_count += 1
-    except Exception as e:
-        logger.error("[Stage2Processor] 批量处理异常: %s，将逐条重试", e)
-        # 批量接口失败：逐条标记 error，等待下一轮恢复/重试（lease 可能会在超时后回收）
-        for item in items:
+        for model_idx, cfg in enumerate(models):
+            model_name = cfg["model"]
+            api_key = cfg["api_key"]
+            base_url = cfg["base_url"]
             try:
-                sqlite_service.update_task_status(
-                    item["task_id"],
-                    "error",
-                    error_msg=f"Stage2 批量失败: {str(e)[:200]}",
-                )
+                if use_batch and len(items) > 1:
+                    user_contents = [it["enrich_input"] for it in items]
+                    _t_batch = time.perf_counter()
+                    results = call_batch(
+                        model=model_name,
+                        api_key=api_key,
+                        base_url=base_url,
+                        system_prompt=ENRICH_SYSTEM_PROMPT,
+                        user_contents=user_contents,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=timeout,
+                    )
+                    batch_ms = (time.perf_counter() - _t_batch) * 1000.0
+                    n_items = len(items)
+                    per_item_ms = (batch_ms / n_items) if n_items else 0.0
+                    for i, item in enumerate(items):
+                        enrich_result = results[i] if i < len(results) else ""
+                        if enrich_result:
+                            enrich_result = (enrich_result or "").strip()
+                            enrich_result = re.sub(r"<think>[\s\S]*?</think>", "", enrich_result, flags=re.IGNORECASE)
+                            enrich_result = enrich_result.strip()
+                        enrich_result = _extract_json_from_stage2(enrich_result or "")
+                        logger.info("[Stage2Processor] 处理中 %d/%d task_id=%s model=%s", i + 1, len(items), item.get("task_id"), model_name)
+                        ok = _process_single_item(item, enrich_result or "[]", model_name)
+                        _record_stage2_tool_call(ok, per_item_ms)
+                        if ok:
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                    last_error = None
+                    break
+                else:
+                    # 单条 API：每条 item 独立尝试模型链，某条 429 时只对该条切换备用
+                    for i, item in enumerate(items):
+                        enrich_input = item.get("enrich_input") or ""
+                        item_ok = False
+                        item_err = None
+                        for m_cfg in models:
+                            m_name = m_cfg["model"]
+                            m_key = m_cfg["api_key"]
+                            m_url = m_cfg["base_url"]
+                            logger.info("[Stage2Processor] 处理中 %d/%d task_id=%s model=%s", i + 1, len(items), item.get("task_id"), m_name)
+                            try:
+                                _t_single = time.perf_counter()
+                                enrich_result = call_single(
+                                    model=m_name,
+                                    api_key=m_key,
+                                    base_url=m_url,
+                                    system_prompt=ENRICH_SYSTEM_PROMPT,
+                                    user_content=enrich_input,
+                                    temperature=temperature,
+                                    max_tokens=max_tokens,
+                                    timeout=timeout,
+                                )
+                                api_ms = (time.perf_counter() - _t_single) * 1000.0
+                                enrich_result = (enrich_result or "").strip()
+                                enrich_result = re.sub(r"<think>[\s\S]*?</think>", "", enrich_result, flags=re.IGNORECASE)
+                                enrich_result = _extract_json_from_stage2(enrich_result or "")
+                                if _process_single_item(item, enrich_result or "[]", m_name):
+                                    success_count += 1
+                                    item_ok = True
+                                    _record_stage2_tool_call(True, api_ms)
+                                else:
+                                    fail_count += 1
+                                    _record_stage2_tool_call(False, api_ms)
+                                break
+                            except Exception as e:
+                                item_err = e
+                                if _is_retryable_api_error(e) and models.index(m_cfg) + 1 < len(models):
+                                    logger.warning("[Stage2Processor] task_id=%s model=%s 失败: %s，尝试备用", item.get("task_id"), m_name, str(e)[:100])
+                                else:
+                                    logger.error("[Stage2Processor] task_id=%s 所有模型失败: %s", item.get("task_id"), e)
+                                    break
+                        if not item_ok and item_err:
+                            fail_count += 1
+                            _record_stage2_tool_call(False, 0.0)
+                            try:
+                                sqlite_service.update_task_status(item["task_id"], "error", error_msg=f"Stage2 失败: {str(item_err)[:200]}")
+                                sqlite_service.mark_stage2_pending_error(item["task_id"], str(item_err)[:400])
+                            except Exception:
+                                pass
+                    last_error = None
+                    break
+            except Exception as e:
+                last_error = e
+                if _is_retryable_api_error(e) and model_idx + 1 < len(models):
+                    logger.warning("[Stage2Processor] 模型 %s 失败(可重试): %s，切换备用模型", model_name, str(e)[:150])
+                else:
+                    logger.error("[Stage2Processor] 模型 %s 失败: %s", model_name, e)
+                    break
+
+        if last_error is not None:
+            logger.error("[Stage2Processor] 所有模型均已失败，将任务标记为 error")
+            for item in items:
+                _record_stage2_tool_call(False, 0.0)
                 try:
-                    sqlite_service.mark_stage2_pending_error(item["task_id"], f"Stage2 批量失败: {str(e)[:200]}")
+                    sqlite_service.update_task_status(
+                        item["task_id"],
+                        "error",
+                        error_msg=f"Stage2 批量失败: {str(last_error)[:200]}",
+                    )
+                    try:
+                        sqlite_service.mark_stage2_pending_error(item["task_id"], f"Stage2 批量失败: {str(last_error)[:200]}")
+                    except Exception:
+                        pass
                 except Exception:
                     pass
-            except Exception:
-                pass
     finally:
         try:
             remain = sqlite_service.get_stage2_pending_count()
@@ -310,6 +368,56 @@ def _run_stage2_processor_impl():
                 success_count,
                 fail_count,
             )
+
+
+def run_stage2_retry_for_task_ids(task_ids: List[str]) -> None:
+    """
+    仅处理给定 task_id 在 stage2_pending 中的条目，循环 lease + 豆包直到这些 id 无 pending。
+    供子进程「Stage2 未完成补跑」调用；不跑 Stage1 / Rough Extractor。
+    """
+    if not task_ids:
+        return
+    if not settings.miner_stage2_models:
+        logger.warning("[Stage2Processor] 未配置 Stage2 模型，跳过补跑")
+        return
+    ids = list(dict.fromkeys([t for t in task_ids if t]))
+    sqlite_service.recover_stale_stage2_pending(settings.miner_stage2_recovery_stale_seconds)
+    batch_size = settings.miner_stage2_batch_size
+    worker_base = f"stage2-retry-{uuid.uuid4().hex[:8]}"
+    batch_num = 0
+    while True:
+        worker_id = f"{worker_base}-b{batch_num}"
+        items = sqlite_service.lease_stage2_pending_batch_for_task_ids(
+            batch_size, worker_id, ids
+        )
+        if not items:
+            break
+        _execute_stage2_on_leased_items(items)
+        batch_num += 1
+    logger.info("[Stage2Processor] 指定 task 的 Stage2 补跑已结束（批次=%d）", batch_num)
+
+
+def _run_stage2_processor_impl():
+    """实际执行 Stage2 批量处理，主模型失败时按序尝试备用模型"""
+    global _stage2_running
+    batch_size = settings.miner_stage2_batch_size
+    models = settings.miner_stage2_models
+    if not models:
+        logger.warning("[Stage2Processor] 未配置 Stage2 模型，跳过")
+        _stage2_running = False
+        return
+
+    # 先做一次陈旧 in_progress 回收，避免队列永远卡死
+    sqlite_service.recover_stale_stage2_pending(settings.miner_stage2_recovery_stale_seconds)
+    worker_id = f"stage2-{uuid.uuid4().hex[:8]}"
+    items = sqlite_service.lease_stage2_pending_batch(batch_size, worker_id=worker_id)
+    if not items:
+        _stage2_running = False
+        return
+
+    try:
+        _execute_stage2_on_leased_items(items)
+    finally:
         _stage2_running = False
 
 

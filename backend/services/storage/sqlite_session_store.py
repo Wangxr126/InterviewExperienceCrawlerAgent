@@ -55,7 +55,10 @@ def _message_to_storage(msg: Any) -> dict:
         "timestamp": d.get("timestamp"),
         "ts": d.get("timestamp") or datetime.now().isoformat(),
     }
-    if d.get("thinking"):
+    # 🔧 关键修复：确保 thinking 字段被保存（即使为空列表也要保存）
+    if "thinking" in d:
+        out["thinking"] = d["thinking"]
+    elif d.get("thinking") is not None:
         out["thinking"] = d["thinking"]
     if d.get("duration_ms") is not None:
         out["duration_ms"] = d["duration_ms"]
@@ -122,6 +125,12 @@ class SqliteSessionStore:
         except Exception as e:
             logger.debug(f"[SqliteSessionStore] 合并 thinking 时忽略: {e}")
 
+        # 🔧 调试日志：检查 thinking 数据是否被正确保存
+        for i, msg in enumerate(history_data):
+            if msg.get("role") == "assistant":
+                thinking_count = len(msg.get("thinking", [])) if msg.get("thinking") else 0
+                logger.info(f"[SqliteSessionStore.save] 消息 #{i} (assistant): thinking={thinking_count} 步, content_len={len(msg.get('content', ''))}")
+
         # session_meta：hello_agents 扩展字段
         session_meta = {
             "agent_config": agent_config,
@@ -167,6 +176,12 @@ class SqliteSessionStore:
             _normalize_msg_for_message(m) if isinstance(m, dict) else m
             for m in history_raw
         ]
+
+        # 🔧 调试日志：检查加载的 thinking 数据
+        for i, msg in enumerate(history):
+            if msg.get("role") == "assistant":
+                thinking_count = len(msg.get("thinking", [])) if msg.get("thinking") else 0
+                logger.info(f"[SqliteSessionStore.load] 消息 #{i} (assistant): thinking={thinking_count} 步, content_len={len(msg.get('content', ''))}")
 
         # 从 session_meta 解析 hello_agents 元数据
         session_meta = {}

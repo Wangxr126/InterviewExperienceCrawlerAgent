@@ -51,19 +51,36 @@ else:
     logger.warning("[BatchExtractWorker] ⚠️  .env 文件不存在: %s，将使用系统环境变量", _env_file)
 
 
+def _abort_requested() -> bool:
+    """父进程在 shutdown 时写入该文件，子进程检测到则优雅退出"""
+    import os
+    path = os.environ.get("BATCH_EXTRACT_ABORT_FILE", "")
+    if not path:
+        return False
+    from pathlib import Path
+    return Path(path).exists()
+
+
 def run_batch_extract(task_ids: list) -> None:
-    """在子进程中执行批量提取，与主进程完全隔离"""
+    """在子进程中执行批量提取，与主进程完全隔离。支持父进程 shutdown 时通过 abort 文件优雅退出。"""
     from backend.services.scheduling.scheduler import process_single_task
 
     logger.info("[BatchExtractWorker] 开始批量提取，共 %d 条", len(task_ids))
     for i, tid in enumerate(task_ids):
+        if _abort_requested():
+            logger.info("[BatchExtractWorker] 收到父进程退出信号，优雅中断，已完成 %d/%d", i, len(task_ids))
+            break
         try:
             logger.info("[BatchExtractWorker] 处理 %d/%d task_id=%s", i + 1, len(task_ids), tid)
             process_single_task(tid)
             logger.info("[BatchExtractWorker] 完成 task_id=%s", tid)
         except Exception as e:
             logger.error("[BatchExtractWorker] 批量提取异常 task_id=%s: %s", tid, e)
-    logger.info("[BatchExtractWorker] 全部完成")
+    completed_count = i if _abort_requested() else len(task_ids)
+    if completed_count >= len(task_ids):
+        logger.info("[BatchExtractWorker] 全部完成")
+    else:
+        logger.info("[BatchExtractWorker] 本轮结束，已完成 %d/%d（可重启后端自动恢复剩余）", completed_count, len(task_ids))
 
 
 def main():

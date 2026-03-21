@@ -2,9 +2,14 @@
 MinerReActAgent：在 ReActAgent 基础上增加 mark_unrelated 终止逻辑。
 当 mark_unrelated 被调用且返回 __UNRELATED__ 时，立即结束循环，不再执行后续步骤。
 """
+import logging
+
 from hello_agents import ReActAgent
 from hello_agents.tools.registry import ToolRegistry
-from backend.services.logging.agent_tool_runtime_stats import agent_tool_runtime_stats
+from backend.services.logging.agent_tool_runtime_stats import (
+    agent_tool_runtime_stats,
+    tool_execution_success_for_stats,
+)
 
 
 # 终止工具：调用后立即结束，不再继续
@@ -61,11 +66,15 @@ class MinerReActAgent(ReActAgent):
                 {"role": "user", "content": input_text}
             )
 
-        print(f"\n🤖 {self.name} 开始处理问题: {input_text}")
+        _ilog = logging.getLogger(__name__)
+        _n = len(input_text)
+        _prev = input_text[:400] + ("…" if _n > 400 else "")
+        _ilog.info("🤖 %s 开始处理问题（%d 字，预览前 400 字）: %s", self.name, _n, _prev)
+        _ilog.debug("%s 完整 user 输入:\n%s", self.name, input_text)
 
         while current_step < self.max_steps:
             current_step += 1
-            print(f"\n--- 第 {current_step} 步 ---")
+            _ilog.info("--- 第 %d 步 ---", current_step)
 
             self._current_step = current_step
 
@@ -150,7 +159,7 @@ class MinerReActAgent(ReActAgent):
                         agent_tool_runtime_stats.record(
                             agent_name=self.name,
                             tool_name=tool_name,
-                            success=not str(result_content).startswith("❌"),
+                            success=tool_execution_success_for_stats(result_content),
                             execution_time_ms=(time.time() - _t0) * 1000.0,
                             user_id=get_current_user_id(),
                         )
@@ -161,7 +170,7 @@ class MinerReActAgent(ReActAgent):
                         agent_tool_runtime_stats.record(
                             agent_name=self.name,
                             tool_name=tool_name,
-                            success=not str(result_content).startswith("❌"),
+                            success=tool_execution_success_for_stats(result_content),
                             execution_time_ms=(time.time() - _t0) * 1000.0,
                             user_id=get_current_user_id(),
                         )
@@ -246,6 +255,13 @@ class MinerReActAgent(ReActAgent):
                     arguments = json.loads(tool_call.function.arguments)
                 except json.JSONDecodeError as e:
                     print(f"❌ 工具参数解析失败: {e}")
+                    agent_tool_runtime_stats.record(
+                        agent_name=self.name,
+                        tool_name=tool_name,
+                        success=False,
+                        execution_time_ms=0.0,
+                        user_id=get_current_user_id(),
+                    )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
@@ -271,7 +287,9 @@ class MinerReActAgent(ReActAgent):
                     agent_tool_runtime_stats.record(
                         agent_name=self.name,
                         tool_name=tool_name,
-                        success=not str(result.get("content", "")).startswith("❌"),
+                        success=tool_execution_success_for_stats(
+                            str(result.get("content", ""))
+                        ),
                         execution_time_ms=(time.time() - _t0) * 1000.0,
                         user_id=get_current_user_id(),
                     )
@@ -323,7 +341,7 @@ class MinerReActAgent(ReActAgent):
                     agent_tool_runtime_stats.record(
                         agent_name=self.name,
                         tool_name=tool_name,
-                        success=not str(result).startswith("❌"),
+                        success=tool_execution_success_for_stats(str(result)),
                         execution_time_ms=(time.time() - _t0) * 1000.0,
                         user_id=get_current_user_id(),
                     )

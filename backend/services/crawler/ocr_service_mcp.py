@@ -1,17 +1,20 @@
 """
 图片 OCR 服务
 
-支持三种 OCR 方式，通过 .env 的 OCR_METHOD 配置切换：
+支持多种 OCR 方式，通过 .env 的 OCR_METHOD 配置切换：
 
-  ollama_vl     — 本地 Ollama 视觉模型（推荐，无需 API Key）
+  remote        — 云端视觉 OCR（OCR_REMOTE_* 独立变量，与 MINER/LLM 无关）
+  ollama_vl     — 本地 Ollama 视觉模型（无需 API Key）
   qwen_vl       — 阿里云百炼 Qwen-VL（已有 EMBED_API_KEY 即可用）
   claude_vision — Anthropic Claude Vision API（需要 ANTHROPIC_API_KEY）
 
 .env 示例：
-    OCR_METHOD=ollama_vl        # 切换到本地 Ollama
-    OCR_TIMEOUT=120             # 单张超时秒数
-    OCR_RETRIES=3               # 失败/乱码重试次数
-    OCR_MODEL=qwen3-vl:2b       # 可选，留空则自动选默认模型
+    OCR_METHOD=remote
+    OCR_REMOTE_API_KEY=...
+    OCR_REMOTE_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+    OCR_REMOTE_MODELS=[{"model":"doubao-1-5-vision-pro-32k-250115"},{"model":"doubao-1.5-vision-pro-250328"}]
+    OCR_TIMEOUT=300
+    OCR_RETRIES=3
 """
 import logging
 import base64
@@ -23,6 +26,13 @@ from pathlib import Path
 from backend.config.config import settings
 
 logger = logging.getLogger(__name__)
+
+_OCR_VISION_USER_TEXT = (
+    "请识别图片中的**所有**文字内容，按原文完整输出，**不要遗漏任何内容**。\n\n"
+    "要求：\n1. 逐字逐句识别，包括题目编号、问题、答案、注释等所有文本\n"
+    "2. 保持原文格式和换行\n3. 如果内容很长，也要完整输出，不要省略\n"
+    "4. 特别注意：面试题目通常较长，请确保识别完整，不要中途截断"
+)
 
 
 def _is_ocr_garbled(text: str) -> bool:
@@ -81,8 +91,7 @@ def _call_ollama_vl_ocr(image_path: str, timeout: int = 120) -> Optional[str]:
                 "content": [
                     {"type": "image_url",
                      "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                    {"type": "text",
-                     "text": "请识别图片中的**所有**文字内容，按原文完整输出，**不要遗漏任何内容**。\n\n要求：\n1. 逐字逐句识别，包括题目编号、问题、答案、注释等所有文本\n2. 保持原文格式和换行\n3. 如果内容很长，也要完整输出，不要省略\n4. 特别注意：面试题目通常较长，请确保识别完整，不要中途截断"}
+                    {"type": "text", "text": _OCR_VISION_USER_TEXT}
                 ]
             }],
             max_tokens=8192,
@@ -95,7 +104,77 @@ def _call_ollama_vl_ocr(image_path: str, timeout: int = 120) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────────────────────
-# 方式二：Qwen-VL（阿里云百炼 / dashscope）
+# 方式二：远程视觉 OCR（OpenAI 兼容接口，OCR_REMOTE_MODELS 多模型按序尝试）
+# ──────────────────────────────────────────────────────────────
+
+def _call_remote_ocr(image_path: str, timeout: int) -> Optional[str]:
+    """按 OCR_REMOTE_MODELS 顺序调用，任一成功即返回文本。"""
+    endpoints = settings.ocr_remote_models
+    if not endpoints:
+        logger.warning(
+            "[OCR-Remote] 无可用端点：请配置 OCR_REMOTE_MODELS（JSON）"
+            " 或 OCR_REMOTE_MODEL + OCR_REMOTE_API_KEY + OCR_REMOTE_BASE_URL"
+        )
+        return None
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        logger.error("[OCR-Remote] 缺少 openai 包")
+        return None
+
+    suffix = Path(image_path).suffix.lower()
+    mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}
+    mime = mime_map.get(suffix, "image/jpeg")
+
+    with open(image_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+
+    max_tokens = settings.ocr_remote_max_tokens
+    last_err: Optional[Exception] = None
+
+    for ep in endpoints:
+        model = ep.get("model") or ""
+        api_key = (ep.get("api_key") or "").strip()
+        base_url = (ep.get("base_url") or "").strip().rstrip("/")
+        if not model or not api_key or not base_url:
+            logger.warning(
+                "[OCR-Remote] 跳过无效端点（需 model + api_key + base_url）: model=%r",
+                model,
+            )
+            continue
+        try:
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                        {"type": "text", "text": _OCR_VISION_USER_TEXT},
+                    ],
+                }],
+                max_tokens=max_tokens,
+            )
+            text = resp.choices[0].message.content
+            if text and str(text).strip():
+                logger.info("[OCR-Remote] 成功 model=%s", model)
+                return str(text)
+            last_err = RuntimeError(f"empty content from {model}")
+            logger.warning("[OCR-Remote] model=%s 返回空内容，尝试下一模型", model)
+        except Exception as e:
+            last_err = e
+            logger.warning("[OCR-Remote] model=%s 失败: %s", model, e)
+
+    if last_err:
+        logger.error("[OCR-Remote] 全部模型失败: %s", last_err)
+    return None
+
+
+# ──────────────────────────────────────────────────────────────
+# 方式三：Qwen-VL（阿里云百炼 / dashscope）
 # ──────────────────────────────────────────────────────────────
 
 def _call_qwen_vl_ocr(image_path: str, timeout: int = 120) -> Optional[str]:
@@ -130,8 +209,7 @@ def _call_qwen_vl_ocr(image_path: str, timeout: int = 120) -> Optional[str]:
                 "content": [
                     {"type": "image_url",
                      "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                    {"type": "text",
-                     "text": "请识别图片中的**所有**文字内容，按原文完整输出，**不要遗漏任何内容**。\n\n要求：\n1. 逐字逐句识别，包括题目编号、问题、答案、注释等所有文本\n2. 保持原文格式和换行\n3. 如果内容很长，也要完整输出，不要省略\n4. 特别注意：面试题目通常较长，请确保识别完整，不要中途截断"}
+                    {"type": "text", "text": _OCR_VISION_USER_TEXT}
                 ]
             }],
             max_tokens=8192,
@@ -144,7 +222,7 @@ def _call_qwen_vl_ocr(image_path: str, timeout: int = 120) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────────────────────
-# 方式三：Claude Vision（Anthropic）
+# 方式四：Claude Vision（Anthropic）
 # ──────────────────────────────────────────────────────────────
 
 def _call_claude_vision_ocr(image_path: str, timeout: int = 120) -> Optional[str]:
@@ -175,8 +253,7 @@ def _call_claude_vision_ocr(image_path: str, timeout: int = 120) -> Optional[str
                 "content": [
                     {"type": "image",
                      "source": {"type": "base64", "media_type": mime, "data": b64}},
-                    {"type": "text",
-                     "text": "请识别图片中的**所有**文字内容，按原文完整输出，**不要遗漏任何内容**。\n\n要求：\n1. 逐字逐句识别，包括题目编号、问题、答案、注释等所有文本\n2. 保持原文格式和换行\n3. 如果内容很长，也要完整输出，不要省略\n4. 特别注意：面试题目通常较长，请确保识别完整，不要中途截断"}
+                    {"type": "text", "text": _OCR_VISION_USER_TEXT}
                 ]
             }],
         )
@@ -196,7 +273,8 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
     批量 OCR 本地图片，返回拼接后的文本。
 
     OCR 方式由 .env 的 OCR_METHOD 控制：
-      ollama_vl     — 本地 Ollama 视觉模型（推荐）
+      remote        — 云端视觉（OCR_REMOTE_*）
+      ollama_vl     — 本地 Ollama 视觉模型
       qwen_vl       — 阿里云百炼 Qwen-VL
       claude_vision — Claude Vision API
 
@@ -216,7 +294,19 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
     max_retries = settings.ocr_retries
     logger.info(f"[OCR] 方式={method}, 图片数={len(image_paths)}, timeout={timeout}s, retries={max_retries}, task={task_id}")
 
-    # 预检 API Key（ollama_vl 不需要）
+    # 预检（ollama_vl 不需要 Key）
+    if method == "remote":
+        if not (settings.ocr_remote_api_key or "").strip() or not (settings.ocr_remote_base_url or "").strip():
+            logger.warning(
+                "[OCR] remote 模式必须单独配置 OCR_REMOTE_API_KEY 与 OCR_REMOTE_BASE_URL（不复用 MINER/LLM）"
+            )
+            return ""
+        if not settings.ocr_remote_models:
+            logger.warning(
+                "[OCR] remote 模式需要 OCR_REMOTE_MODELS（JSON）"
+                " 或 OCR_REMOTE_MODEL + 上述 Key/Base"
+            )
+            return ""
     if method == "qwen_vl" and not settings.ocr_api_key:
         logger.warning("[OCR] qwen_vl 模式但未配置 API Key，请设置 OCR_API_KEY 或 EMBED_API_KEY")
         return ""
@@ -226,7 +316,9 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
 
     def _do_ocr(path: str) -> Optional[str]:
         t = None
-        if method == "ollama_vl":
+        if method == "remote":
+            t = _call_remote_ocr(path, timeout)
+        elif method == "ollama_vl":
             t = _call_ollama_vl_ocr(path, timeout)
         elif method == "claude_vision":
             t = _call_claude_vision_ocr(path, timeout)

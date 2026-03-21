@@ -76,9 +76,9 @@ def _evaluate_answer_structured(question_text: str,
         "\n\n【评分规则】"
         "\n1. score 取值仅为以下之一：0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0"
         "\n2. score<5 时，shortcomings 必须列出具体不足"
-        "\n3. error_points：含 wrong（错误）和 correct（正确），用于纠正"
-        "\n4. missed_points：用户遗漏的知识点"
-        "\n5. feedback：分条列点，包含亮点、不足、错误纠正、遗漏补充、改进建议"
+        "\n3. error_points：含 wrong（错误/不严谨表述）和 correct（正确表述），用于混淆点辨析；无则 []"
+        "\n4. missed_points：用户遗漏的知识点，尽量与参考答案维度逐项对齐"
+        "\n5. feedback：须含评分细则 + ✓答对 + ✗遗漏 + ⚠混淆点（与 error_points 一致；无混淆时写「无明显概念性混淆」）"
         "\n\n【评分细则】"
         "\n依据：①答对要点占比 ②遗漏要点数 ③混淆/错误数"
         "\n· 5.0：答对核心要点 ≥90%，无遗漏、无错误"
@@ -644,6 +644,7 @@ class SubmitAnswerTool(Tool):
                 "【意图】用户完成作答后，用于“记录+归档评分结果”。"
                 "【功能】不做评估、不调用任何 LLM；只写入：study_records / SM-2（next_review_at）/ 会话历史 / 标签掌握度。"
                 "【填槽】question_id、user_answer、score、feedback 必填；strong_points/missed_points/error_points 可选。"
+                "【feedback 格式】须含：评分细则 + 点评四段——✓答对、✗遗漏、⚠混淆点（与 error_points 对齐；无混淆时写明「无明显概念性混淆」）。"
                 "【薄弱点写入】record_weakness_notes=true（默认）则把 missed_points/error_points 写入本地薄弱点 note；false 时交给 record_weakness。"
                 "【返回】JSON：{score, feedback, missed_points, error_points, strong_points, tags, standard_answer, sm2, message_id, message}。"
             ),
@@ -654,7 +655,8 @@ class SubmitAnswerTool(Tool):
             ToolParameter("question_id", "string", "题目ID（q_id），必填", required=True),
             ToolParameter("user_answer", "string", "用户作答内容，可不传（系统自动取本轮用户消息）", required=False),
             ToolParameter("score", "number", "你给出的分数，取值 0/0.5/1.0/.../5.0，必填", required=True),
-            ToolParameter("feedback", "string", "你对作答的总体点评，必填", required=True),
+            ToolParameter("feedback", "string",
+                          "总体点评，必填；须含评分细则 + ✓答对 + ✗遗漏 + ⚠混淆点（与 error_points 一致）", required=True),
             ToolParameter("record_weakness_notes", "string",
                           "是否写入薄弱点 note：true/false（或 1/0），默认 true；当 false 时由 record_weakness 工具负责写入。",
                           required=False),

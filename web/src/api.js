@@ -18,6 +18,11 @@ export const api = {
     return r.json()
   },
 
+  async getAllChatHistory(userId) {
+    const r = await fetch(`${BASE}/api/user/${userId}/chat/history/all`)
+    return r.json()
+  },
+
   async clearChatSession(userId) {
     const r = await fetch(`${BASE}/api/user/${userId}/chat/clear`, {
       method: 'POST',
@@ -219,6 +224,13 @@ export const api = {
   async reExtractAll(batchSize = null) {
     const url = batchSize ? `${BASE}/api/crawler/re-extract-all?batch_size=${batchSize}` : `${BASE}/api/crawler/re-extract-all`
     const r = await fetch(url, {
+      method: 'POST',
+    })
+    return r.json()
+  },
+
+  async reExtractStage2Unfinished() {
+    const r = await fetch(`${BASE}/api/crawler/re-extract-stage2-unfinished`, {
       method: 'POST',
     })
     return r.json()

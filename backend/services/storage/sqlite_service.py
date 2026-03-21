@@ -1165,6 +1165,21 @@ class SqliteService:
             s["weak_tags"] = json.loads(s.get("weak_tags") or "[]")
             return s
 
+    def get_all_sessions_for_user(self, user_id: str) -> List[Dict]:
+        """获取用户所有会话（含对话历史）"""
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT * FROM interview_sessions
+                WHERE user_id = ? ORDER BY start_time DESC
+            """, (user_id,)).fetchall()
+            sessions = []
+            for row in rows:
+                s = dict(row)
+                s["conversation_history"] = json.loads(s.get("conversation_history") or "[]")
+                s["weak_tags"] = json.loads(s.get("weak_tags") or "[]")
+                sessions.append(s)
+            return sessions
+
     def close_session(self, session_id: str, ai_summary: str = "", weak_tags: List[str] = None):
         """关闭 session，计算统计数据"""
         with self._get_conn() as conn:
@@ -1262,12 +1277,25 @@ class SqliteService:
                             history[i]["duration_ms"] = duration_ms
                         logger.info(f"[patch_last_assistant_content] 更新 session_id={session_id} content_len={len(full_content)} thinking_steps={len(thinking) if thinking else 0}")
                     else:
-                        # 已有完整内容，只补充 thinking/duration_ms
-                        if thinking is not None and len(thinking) > 0 and not history[i].get("thinking"):
+                        # 流式过程中会先写入较短正文再增长：新正文更长时仍更新 content
+                        _new = (full_content or "").strip()
+                        _old = current_content.strip()
+                        if len(_new) > len(_old):
+                            history[i]["content"] = full_content
+                            ts = now_beijing().isoformat()
+                            history[i]["ts"] = ts
+                            history[i]["timestamp"] = ts
+                            logger.debug(
+                                f"[patch_last_assistant_content] 流式增长正文 session_id={session_id} "
+                                f"len {len(_old)}→{len(_new)}"
+                            )
+                        # 已有完整内容，补充或更新 thinking/duration_ms
+                        # 🔧 关键修复：即使 thinking 已存在，也要用新的 thinking_steps 覆盖（避免刷新后推理丢失）
+                        if thinking is not None and len(thinking) > 0:
                             history[i]["thinking"] = thinking
-                        if duration_ms is not None and history[i].get("duration_ms") is None:
+                        if duration_ms is not None:
                             history[i]["duration_ms"] = duration_ms
-                        logger.debug(f"[patch_last_assistant_content] 保留已有内容，仅补充元数据 session_id={session_id}")
+                        logger.debug(f"[patch_last_assistant_content] 保留已有内容，更新元数据 session_id={session_id} thinking_steps={len(thinking) if thinking else 0}")
                     break
             conn.execute(
                 "UPDATE interview_sessions SET conversation_history = ? WHERE session_id = ?",
@@ -1899,6 +1927,54 @@ class SqliteService:
                 WHERE task_id IN ({placeholders})
                 """,
                 [worker_id] + task_ids,
+            )
+            conn.commit()
+            return items
+
+    def lease_stage2_pending_batch_for_task_ids(
+        self, limit: int, worker_id: str, task_ids: List[str]
+    ) -> List[Dict]:
+        """
+        与 lease_stage2_pending_batch 相同，但只 lease 指定 task_id 集合内的 pending 项。
+        用于「Stage2 未完成补跑」等场景，避免与本队列中其它帖子混批。
+        """
+        if not task_ids:
+            return []
+        limit = int(limit or 0)
+        if limit <= 0:
+            return []
+        worker_id = worker_id or ""
+        uniq = list(dict.fromkeys([t for t in task_ids if t]))
+        if not uniq:
+            return []
+        placeholders = ",".join("?" * len(uniq))
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM stage2_pending
+                WHERE (status='pending' OR status IS NULL)
+                  AND task_id IN ({placeholders})
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                tuple(uniq) + (limit,),
+            ).fetchall()
+            items = [dict(r) for r in rows]
+            if not items:
+                return []
+            tids = [r["task_id"] for r in rows]
+            ph2 = ",".join("?" * len(tids))
+            conn.execute(
+                f"""
+                UPDATE stage2_pending
+                SET status='in_progress',
+                    worker_id=?,
+                    locked_at=CURRENT_TIMESTAMP,
+                    attempts=attempts+1,
+                    last_error=''
+                WHERE task_id IN ({ph2})
+                """,
+                [worker_id] + tids,
             )
             conn.commit()
             return items

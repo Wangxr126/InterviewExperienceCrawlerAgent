@@ -36,7 +36,12 @@ def main() -> int:
 
     from backend.services.crawler.task_executor import execute as task_execute
 
-    result = task_execute("process_tasks", "button", batch_size=args.batch_size)
+    result = task_execute(
+        "process_tasks",
+        "button",
+        batch_size=args.batch_size,
+        force_inline_process_tasks=True,
+    )
     logger.info(
         "[ProcessTasksWorker] 完成 questions_added=%s",
         result.get("questions_added", 0),

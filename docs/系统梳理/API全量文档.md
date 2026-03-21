@@ -1,6 +1,6 @@
 # 面经 Agent API 全量文档
 
-本文档按“接口分组 -> 接口清单 -> 关键说明”整理当前项目后端 API，覆盖 `backend/main.py`、`backend/api/scheduler_api.py`、`backend/api/reasoning_api.py`。
+本文档按「接口分组 → 接口清单 → 关键说明」整理当前后端 API，路由分布在 `backend/main.py`（主体）、`backend/api/scheduler_api.py`、`backend/api/reasoning_api.py`；后两者在 `main.py` 中通过 `include_router` 挂载。
 
 ## 1. 基础与系统接口
 
@@ -44,6 +44,7 @@
 | GET | `/api/user/{user_id}/graph-rag` | GraphRAG 图数据（题库图 + 做题图） |
 | GET | `/api/user/{user_id}/questions/{question_id}/study-records` | 某题历史作答记录 |
 | GET | `/api/user/{user_id}/chat/history` | 聊天历史 |
+| GET | `/api/user/{user_id}/chat/history/all` | 全量聊天历史（管理/导出场景） |
 | POST | `/api/user/{user_id}/chat/clear` | 清空聊天历史 |
 | GET | `/api/user/{user_id}/memory` | 用户记忆视图汇总 |
 
@@ -78,6 +79,7 @@
 | POST | `/api/crawler/clean-data` | 清洗无关/噪声数据 |
 | POST | `/api/crawler/retry-errors` | 重试失败任务 |
 | POST | `/api/crawler/re-extract-all` | 全量重提取 |
+| POST | `/api/crawler/re-extract-stage2-unfinished` | Stage2 未完成项重提取 |
 | POST | `/api/crawler/clear-all` | 清空采集相关数据 |
 
 ### 6.3 小红书登录与修复
@@ -97,6 +99,7 @@
 | GET | `/api/crawler/tasks/{task_id}/questions` | 单任务提取到的题目列表 |
 | POST | `/api/crawler/tasks/{task_id}/re-extract` | 单任务重提取 |
 | POST | `/api/crawler/tasks/re-extract-batch` | 批量重提取 |
+| POST | `/api/crawler/tasks/resume-batch` | 恢复上次中断的批量提取（配合 shutdown 进度文件） |
 | DELETE | `/api/crawler/tasks/{task_id}` | 删除单任务及关联数据 |
 | POST | `/api/crawler/tasks/delete-batch` | 批量删除任务 |
 

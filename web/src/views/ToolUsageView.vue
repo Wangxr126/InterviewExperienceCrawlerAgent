@@ -30,7 +30,13 @@
         </div>
       </div>
 
-      <el-table :data="tableRows" style="width:100%" row-key="row_key" border>
+      <el-table
+        :data="tableRows"
+        style="width:100%"
+        row-key="row_key"
+        border
+        :span-method="agentColumnSpanMethod"
+      >
         <el-table-column prop="agent_name" label="Agent" min-width="180" />
         <el-table-column prop="tool_name" label="工具名称" min-width="220" />
         <el-table-column prop="count" label="调用次数" width="120" align="right" />
@@ -80,6 +86,30 @@ const tableRows = computed(() => {
   }))
 })
 
+/** 连续相同 Agent 合并首列（与接口按 agent 分组后的顺序一致） */
+function agentColumnSpanMethod({ rowIndex, columnIndex }) {
+  if (columnIndex !== 0) {
+    return { rowspan: 1, colspan: 1 }
+  }
+  const rows = tableRows.value
+  if (!rows.length) {
+    return { rowspan: 1, colspan: 1 }
+  }
+  const name = rows[rowIndex]?.agent_name
+  if (rowIndex > 0 && rows[rowIndex - 1]?.agent_name === name) {
+    return { rowspan: 0, colspan: 0 }
+  }
+  let span = 1
+  for (let j = rowIndex + 1; j < rows.length; j++) {
+    if (rows[j]?.agent_name === name) {
+      span++
+    } else {
+      break
+    }
+  }
+  return { rowspan: span, colspan: 1 }
+}
+
 const load = async ({ silent = false } = {}) => {
   if (!silent) loading.value = true
   try {
@@ -119,6 +149,7 @@ watch(
       stopAutoRefresh()
     }
   },
+  { immediate: true },
 )
 
 onBeforeUnmount(() => stopAutoRefresh())

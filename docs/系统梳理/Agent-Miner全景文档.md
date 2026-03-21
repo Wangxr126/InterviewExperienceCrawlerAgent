@@ -1,6 +1,17 @@
 # MinerAgent 全景文档
 
-对应代码：`backend/agents/miner_agent.py`。
+## 0. 代码入口（当前架构）
+
+采集链路中的「题目提取」由多层模块协作，阅读时可按调用链自下而上对照：
+
+| 层级 | 典型模块 | 说明 |
+|------|----------|------|
+| 任务执行 | `backend/services/crawler/task_executor.py` | 按钮/定时任务统一入口 `execute()` |
+| 单任务处理 | `backend/services/crawler/question_extractor.py` | 单帖 OCR、调用 Miner、入库、Stage2 入队等 |
+| ReAct / 两阶段 | `backend/agents/miner_react_agent.py`、`two_stage_miner_agent.py` | ReAct 循环与 Stage1/Stage2 编排 |
+| Agent 基类 | `backend/agents/miner_agent.py`（及 `miner_agent_v3.py` 等变体） | 工具注册与 ReAct 步进 |
+
+下文以 **`backend/agents/miner_agent.py`** 中的 MinerAgent 为核心描述工具与行为；若你使用 `MINER_MODE=two_stage`，Stage2 富化在 `backend/services/stage2_processor.py` 与队列表 `stage2_pending` 上运行，详见进程与配置文档。
 
 ## 1. Agent 定位
 

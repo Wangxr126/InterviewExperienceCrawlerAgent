@@ -242,6 +242,7 @@ import hljs from 'highlight.js'
 import 'highlight.js/styles/github.css'
 import { api } from '../api.js'
 import { useChatStore } from '../stores/chatStore.js'
+import { saveChatDraft, loadChatDraft, clearChatDraft } from '../utils/chatPersistence.js'
 import { diagnoseSseStream } from '../sse-diagnostic.js'
 import { renderEnhancedContent, questionCardStyles } from '../utils/question-renderer.js'
 
@@ -264,7 +265,8 @@ marked.setOptions({
   breaks: true,
   gfm: true,
 })
-marked.use(markedKatex({ throwOnError: false, nonStandard: true }))
+// ⚠️ 禁用 KaTeX 公式渲染以避免卡死，只保留 Markdown 渲染
+// marked.use(markedKatex({ throwOnError: false, nonStandard: true }))
 
 const normalizeMathDelimiters = (text) => {
   if (!text || typeof text !== 'string') return text || ''
@@ -348,12 +350,12 @@ function extractJsonFromText(text) {
 function stripDsmlBlocks(text) {
   if (!text || typeof text !== 'string') return text
   let s = text
-  // 兼容全角/半角竖线与空白差异，删除完整 DSML 块
-  s = s.replace(/<[｜|]\s*DSML\s*[｜|]\s*function_calls\s*>[\s\S]*?<\/[｜|]\s*DSML\s*[｜|]\s*function_calls\s*>/gi, '')
+  // 兼容 `<｜DSML｜`、`<|DSML|>` 以及 `< | DSML |`（尖括号与竖线间有空格）
+  s = s.replace(/<\s*[｜|]\s*DSML\s*[｜|]\s*function_calls\s*>[\s\S]*?<\/\s*[｜|]\s*DSML\s*[｜|]\s*function_calls\s*>/gi, '')
   // 删除独立 DSML 标签行
-  s = s.replace(/^\s*<\/?[｜|]\s*DSML\s*[｜|][^>]*>\s*$/gim, '')
+  s = s.replace(/^\s*<\s*\/?\s*[｜|]\s*DSML\s*[｜|][^>]*>\s*$/gim, '')
   // 若存在未闭合 DSML 起始标签，直接截断
-  const danglingStart = s.search(/<[｜|]\s*DSML\s*[｜|]/i)
+  const danglingStart = s.search(/<\s*[｜|]\s*DSML\s*[｜|]/i)
   if (danglingStart >= 0) s = s.slice(0, danglingStart)
   // 兼容：DSML 标签被切分后，可能残留为纯文本 invoke/parameter 行，统一过滤
   s = s.replace(/^\s*invoke\s+name=.*$/gim, '')
@@ -388,10 +390,10 @@ function filterChunkWithDsmlGuard(chunk, pendingBuf) {
     if (newPending) break
   }
   // 3. 最后兜底：过滤残留 DSML 行
-  if (/[｜|]\s*DSML\s*[｜|]/i.test(combined)) {
+  if (/[｜|]\s*DSML\s*[｜|]/i.test(combined) || /<\s*[｜|]\s*DSML/i.test(combined)) {
     combined = combined
       .split('\n')
-      .filter(ln => !/[｜|]\s*DSML\s*[｜|]/i.test(ln))
+      .filter(ln => !/[｜|]\s*DSML\s*[｜|]/i.test(ln) && !/<\s*[｜|]\s*DSML/i.test(ln))
       .join('\n')
       .replace(/\n{3,}/g, '\n\n')
   }
@@ -404,6 +406,7 @@ function detectToolPlanText(text) {
   const t = text
   // DSML 标签、被切分后的 invoke/parameter 行都视为工具计划文本
   return /[｜|]\s*DSML\s*[｜|]/i.test(t)
+    || /<\s*[｜|]\s*DSML\s*[｜|]/i.test(t)
     || /^\s*invoke\s+name\s*=.*$/im.test(t)
     || /^\s*parameter\s+name\s*=.*$/im.test(t)
     || /function_calls/i.test(t)
@@ -413,7 +416,7 @@ const sanitizeDisplayText = (text, trim = true) => {
   if (!text || typeof text !== 'string') return text || ''
   const cleaned = stripDsmlBlocks(normalizeEscapedText(text))
     .split('\n')
-    .filter(ln => !/[｜|]\s*DSML\s*[｜|]/i.test(ln))
+    .filter(ln => !/[｜|]\s*DSML\s*[｜|]/i.test(ln) && !/<\s*[｜|]\s*DSML/i.test(ln))
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
   return trim ? cleaned.trim() : cleaned
@@ -807,11 +810,26 @@ let   sendInProgress = false  // 防止并发调用的标志
 const historyLoading = ref(false)  // loadHistory 正在进行中，prefillAndSend 需等待
 const STREAM_SYNC_INTERVAL_MS = 120
 let lastStreamSyncTs = 0
+let lastLocalPersistTs = 0
+const LOCAL_PERSIST_MS = 280
+/** 本地草稿：节流写入，force 时立即保存（用户发消息、流结束、错误） */
+const persistLocalDraft = (force = false) => {
+  if (!props.userId) return
+  const now = Date.now()
+  if (!force && now - lastLocalPersistTs < LOCAL_PERSIST_MS) return
+  lastLocalPersistTs = now
+  try {
+    saveChatDraft(props.userId, sessionId.value, JSON.parse(JSON.stringify(messages.value)))
+  } catch (e) {
+    console.warn('[ChatView] 本地草稿保存失败', e)
+  }
+}
 const syncStreamState = (force = false) => {
   const now = Date.now()
   if (force || now - lastStreamSyncTs >= STREAM_SYNC_INTERVAL_MS) {
     lastStreamSyncTs = now
     chatStore.syncMessages(messages.value)
+    persistLocalDraft(force)
   }
 }
 
@@ -889,8 +907,21 @@ const toggleRecording = () => {
   }
 }
 
-// 挂载时初始化语音识别
-onMounted(() => { initSpeech() })
+const onBeforeUnloadPersist = () => {
+  if (props.userId && messages.value.length) {
+    try {
+      saveChatDraft(props.userId, sessionId.value, JSON.parse(JSON.stringify(messages.value)))
+    } catch (_) { /* ignore */ }
+  }
+}
+
+// 挂载时初始化语音识别 + 刷新前落盘
+onMounted(() => {
+  initSpeech()
+  if (typeof window !== 'undefined') {
+    window.addEventListener('beforeunload', onBeforeUnloadPersist)
+  }
+})
 
 const quickQuestions = [
   '出一道 Redis 面试题',
@@ -942,7 +973,7 @@ const restoreFromStore = () => {
   return true
 }
 
-const loadHistory = async () => {
+const loadHistory = async (loadAll = false) => {
   if (!props.userId) return
   
   if (loading.value || streamingMsg.value) {
@@ -957,7 +988,10 @@ const loadHistory = async () => {
 
   historyLoading.value = true
   try {
-    const d = await api.getChatHistory(props.userId)
+    // 如果 loadAll=true，加载所有会话的历史；否则加载当前会话
+    const d = loadAll 
+      ? await api.getAllChatHistory(props.userId)
+      : await api.getChatHistory(props.userId)
     lastLoadedUserId = props.userId
     
     if (d.messages?.length) {
@@ -981,6 +1015,7 @@ const loadHistory = async () => {
             }] : []
             return {
               ...step,
+              thought: normalizeThoughtForStep(step.thought || ''),
               tools: convertedTools,
               // 清除旧字段避免模板重复渲染
               action: undefined,
@@ -991,6 +1026,7 @@ const loadHistory = async () => {
           // 新格式：规范化 tools 数组中的字段
           return {
             ...step,
+            thought: normalizeThoughtForStep(step.thought || ''),
             tools: Array.isArray(step.tools)
               ? step.tools.map(t => ({
                   ...t,
@@ -1016,16 +1052,84 @@ const loadHistory = async () => {
       const lastApi = apiMsgs[apiMsgs.length - 1]
       const storeHasNewer = chatStore.userId === props.userId && lastStore?.role === 'assistant' &&
         ((lastStore.content?.length || 0) > (lastApi?.content?.length || 0) || lastStore.streaming)
-      if (storeHasNewer) {
+      if (storeHasNewer && !loadAll) {
         if (restoreFromStore()) return
       }
-      messages.value = apiMsgs
+      // 本地草稿：刷新后若服务端仍为「生成中…」或缺少已展示的推理步骤，用浏览器草稿补齐
+      let msgsToApply = apiMsgs
+      const draft = loadChatDraft(props.userId)
+      if (draft?.messages?.length && draft.userId === props.userId) {
+        const maxAge = 24 * 60 * 60 * 1000
+        if ((Date.now() - (draft.savedAt || 0)) < maxAge) {
+          const lastD = draft.messages[draft.messages.length - 1]
+          const lastA = apiMsgs[apiMsgs.length - 1]
+          const apiPlaceholder = lastA?.role === 'assistant' && String(lastA.content || '').includes('生成中')
+          const dThinking = lastD?.thinking?.length || 0
+          const aThinking = lastA?.thinking?.length || 0
+          const useDraft =
+            draft.messages.length > apiMsgs.length ||
+            lastD?.streaming === true ||
+            (apiPlaceholder && dThinking > aThinking) ||
+            (lastD?.role === 'assistant' && lastA?.role === 'assistant' &&
+              (lastD.content || '').length > (lastA.content || '').length + 8 &&
+              dThinking >= aThinking)
+          if (useDraft) {
+            msgsToApply = draft.messages.map((m) => {
+              const normalizedThinking = normalizeThinkingFromDb(m.thinking)
+              return {
+                role: m.role,
+                content: m.content || '',
+                thinking: normalizedThinking,
+                thinkingOpen: (normalizedThinking?.length ?? 0) > 0,
+                timestamp: m.timestamp || new Date().toISOString(),
+                streaming: false,
+                duration_ms: m.duration_ms,
+                isError: !!m.isError,
+              }
+            })
+            console.log('[loadHistory] 已从本地草稿恢复（含分步推理内容）')
+          }
+        }
+      }
+      messages.value = msgsToApply
       if (d.session_id) {
         sessionId.value = d.session_id
         chatStore.sessionId = d.session_id  // 同步到 store，供其他视图使用
       }
       scrollToBottom()
-      console.log(`[loadHistory] 加载了 ${d.messages.length} 条历史消息`)
+      console.log(`[loadHistory] 加载了 ${d.messages.length} 条历史消息${loadAll ? '（所有会话）' : ''}`)
+    } else {
+      const draft = loadChatDraft(props.userId)
+      if (draft?.messages?.length && draft.userId === props.userId &&
+          (Date.now() - (draft.savedAt || 0)) < 24 * 60 * 60 * 1000) {
+        const normalizeThinkingFromDb = (thinking) => {
+          if (!Array.isArray(thinking)) return []
+          return thinking.map(step => ({
+            ...step,
+            thought: normalizeThoughtForStep(step.thought || ''),
+            tools: Array.isArray(step.tools) ? step.tools : [],
+          }))
+        }
+        messages.value = draft.messages.map((m) => {
+          const normalizedThinking = normalizeThinkingFromDb(m.thinking)
+          return {
+            role: m.role,
+            content: m.content || '',
+            thinking: normalizedThinking,
+            thinkingOpen: (normalizedThinking?.length ?? 0) > 0,
+            timestamp: m.timestamp || new Date().toISOString(),
+            streaming: false,
+            duration_ms: m.duration_ms,
+            isError: !!m.isError,
+          }
+        })
+        if (draft.sessionId) {
+          sessionId.value = draft.sessionId
+          chatStore.sessionId = draft.sessionId
+        }
+        scrollToBottom()
+        console.log('[loadHistory] 服务端无历史，已从本地草稿恢复')
+      }
     }
   } catch (e) { console.warn('加载对话历史失败', e) }
   finally { historyLoading.value = false }
@@ -1041,6 +1145,7 @@ const clearChat = async () => {
   sessionId.value = getFixedSessionId()
   lastLoadedUserId = props.userId
   chatStore.clear()
+  clearChatDraft(props.userId)
 }
 
 // 当传入 { display, api } 时，屏幕只展示 display，实际发给 AI 的是 api
@@ -1094,6 +1199,7 @@ const send = async () => {
     thinkingOpen: false,
     timestamp: new Date().toISOString()  // 添加用户消息时间戳
   })
+  persistLocalDraft(true)
   // 用户消息发送后，滚动到该消息顶部（而不是底部）
   scrollToLatestMessageTop()
 
@@ -1224,9 +1330,8 @@ const send = async () => {
         const stepNo = data.step ?? 1
         const normalized = normalizeThoughtForStep(chunk)
         const stepObj = getOrCreateStep(aiMsg, stepNo)
-        stepObj.thought = stepObj.thought
-          ? `${stepObj.thought}\n${normalized}`
-          : normalized
+        // 后端按 delta.reasoning_content 细粒度推片：直接拼接，勿用 \n 连接（否则每字一行）
+        stepObj.thought = (stepObj.thought || '') + (normalized || '')
         syncStreamState()
         return
       }
@@ -1354,6 +1459,8 @@ const send = async () => {
           aiMsg.thinking = finalThinking.map((step, idx) => ({
             ...step,
             __step: (step.__step && step.__step !== 'pending') ? step.__step : (idx + 1),
+            // 与流式 THINKING 一致：落库/汇总的 thought 可能含 DSML，需清洗后再展示
+            thought: normalizeThoughtForStep(step.thought || ''),
             tools: Array.isArray(step.tools)
               ? step.tools.map(t => ({
                   ...t,
@@ -1517,6 +1624,7 @@ const send = async () => {
       }
       streamingMsg.value = null
       chatStore.finishStream(messages.value)
+      persistLocalDraft(true)
       // 流式完成后滚动到消息顶部
       scrollToLatestMessageTop()
     }
@@ -1537,6 +1645,8 @@ const send = async () => {
       }
     } else {
       console.warn('流式接口失败，降级到普通接口', err)
+      const idx = messages.value.findIndex(m => m.streaming && m.role === 'assistant')
+      const partialAssistant = idx >= 0 ? messages.value[idx] : null
       try {
         const ctrl = new AbortController()
         const timer = setTimeout(() => ctrl.abort(), 300000)
@@ -1546,19 +1656,36 @@ const send = async () => {
           session_id: sessionId.value,
         }, ctrl.signal)
         clearTimeout(timer)
-        messages.value = messages.value.filter(m => !m.streaming)
-        messages.value.push({
-          role: 'assistant',
-          content: d.reply || '⚠️ 无回复',
-          streaming: false,
-          thinking: d.thinking || [],
-          thinkingOpen: false,
-        })
+        if (idx >= 0) {
+          messages.value[idx] = {
+            ...partialAssistant,
+            content: d.reply || '⚠️ 无回复',
+            streaming: false,
+            thinking: d.thinking || partialAssistant.thinking || [],
+            thinkingOpen: (d.thinking || partialAssistant.thinking || []).length > 0,
+          }
+        } else {
+          messages.value.push({
+            role: 'assistant',
+            content: d.reply || '⚠️ 无回复',
+            streaming: false,
+            thinking: d.thinking || [],
+            thinkingOpen: (d.thinking || []).length > 0,
+          })
+        }
+        persistLocalDraft(true)
         // 降级接口完成后滚动到消息顶部
         scrollToLatestMessageTop()
       } catch (e2) {
-        messages.value = messages.value.filter(m => !m.streaming)
-        messages.value.push({ role: 'assistant', content: '⚠️ 连接失败，请检查后端是否运行', streaming: false, thinking: [], thinkingOpen: false })
+        if (idx >= 0 && partialAssistant) {
+          partialAssistant.streaming = false
+          partialAssistant.content = (partialAssistant.content || '') +
+            '\n\n⚠️ **连接失败**（已保留上方已生成的内容与推理步骤）\n\n请检查后端是否运行后重试。'
+          messages.value.splice(idx, 1, { ...partialAssistant })
+        } else {
+          messages.value.push({ role: 'assistant', content: '⚠️ 连接失败，请检查后端是否运行', streaming: false, thinking: [], thinkingOpen: false })
+        }
+        persistLocalDraft(true)
         ElMessage.error('LLM 调用失败')
       }
     }
@@ -1570,6 +1697,7 @@ const send = async () => {
       streamingMsg.value = null
     }
     chatStore.finishStream(messages.value)
+    persistLocalDraft(true)
     abortCtrl = null
     // 最后滚动到消息顶部
     scrollToLatestMessageTop()
@@ -1578,15 +1706,19 @@ const send = async () => {
 
 watch([() => props.isActive, () => props.userId], ([active, uid], [prevActive, prevUid]) => {
   if (uid) sessionId.value = getFixedSessionId()
-  // 页面激活时加载历史
+  // 页面激活时加载所有历史记录
   if (active && uid) {
-    loadHistory()
+    loadHistory(true)  // 默认加载所有会话的历史
   }
   // 🔧 页面失活时不再中断请求，让后端继续完成
   // 这样切换回来时可以看到完整的历史记录
 }, { immediate: true })
 
 onUnmounted(() => {
+  onBeforeUnloadPersist()
+  if (typeof window !== 'undefined') {
+    window.removeEventListener('beforeunload', onBeforeUnloadPersist)
+  }
   // 不再在卸载时 abort，避免切换页面时打断流式输出；页面关闭时浏览器会自动清理
   if (isRecording.value && recognition) {
     isRecording.value = false
@@ -2151,6 +2283,46 @@ onUnmounted(() => {
   font-weight: 700;
   margin-right: 2px;
 }
+
+/* 答对 / 遗漏 / 混淆点 / 错误：并列反馈块（统一标题行 + 圆点 + 列表） */
+.md-content :deep(.fb-sec) {
+  margin: 10px 0;
+  padding: 10px 12px;
+  background: rgba(248, 250, 252, 0.95);
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+}
+.md-content :deep(.fb-sec-head) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.md-content :deep(.fb-sec-mark) {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: #94a3b8;
+}
+/* 答对、遗漏、并列：统一样式（相同圆点颜色） */
+.md-content :deep(.fb-sec--correct .fb-sec-mark) { background: #64748b; }
+.md-content :deep(.fb-sec--miss .fb-sec-mark) { background: #64748b; }
+.md-content :deep(.fb-sec--confuse .fb-sec-mark) { background: #64748b; }
+.md-content :deep(.fb-sec--error .fb-sec-mark) { background: #ef4444; }
+.md-content :deep(.fb-sec-label) {
+  font-size: 13px;
+  font-weight: 600;
+  color: #334155;
+}
+.md-content :deep(.fb-sec-list) {
+  margin: 0;
+  padding-left: 20px;
+  color: #475569;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.md-content :deep(.fb-sec-list li) { margin: 4px 0; }
 
 /* 流式打字光标：单一、低调，不与其它样式冲突 */
 .stream-caret {

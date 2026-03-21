@@ -14,8 +14,7 @@ import os
 import subprocess
 import sys
 
-# 禁用 requests/urllib3 版本兼容性警告
-os.environ['PYTHONWARNINGS'] = 'ignore::requests.exceptions.RequestsDependencyWarning'
+# 注：requests 警告在 backend/main.py 中通过 filterwarnings 过滤，避免 PYTHONWARNINGS 的 invalid module name 报错
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("run")

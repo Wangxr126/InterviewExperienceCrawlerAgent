@@ -123,8 +123,15 @@ def main():
 
     questions_added = 0
     if do_process and discovered > 0:
-        from backend.services.scheduling.scheduler import _process_pending_tasks
-        questions_added = _process_pending_tasks(batch_size=discovered + 5)
+        from backend.services.crawler.task_executor import execute as task_execute_fn
+
+        _r = task_execute_fn(
+            "process_tasks",
+            "button",
+            batch_size=discovered + 5,
+            force_inline_process_tasks=True,
+        )
+        questions_added = int(_r.get("questions_added") or 0)
         logger.info(f"[小红书立即爬取] 处理完成: {questions_added} 道题入库")
 
     # 最后一行输出 JSON 供父进程读取结果

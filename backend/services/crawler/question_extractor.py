@@ -455,6 +455,13 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
     try:
         data = json.loads(text)
         if isinstance(data, dict):
+            _st = (data.get("status") or "").strip().lower()
+            if _st in ("foreign_language_source", "non_chinese_source", "foreign_language"):
+                logger.info(
+                    "LLM 声明原帖主体非中文，跳过后续重试: %s",
+                    (data.get("reason") or "")[:120],
+                )
+                return [], "foreign_language"
             if data.get("reason") == "帖子与面经无关":
                 return [], "unrelated"
             # 处理空对象 {} 的情况（LLM有时返回空对象表示无题目）
@@ -474,6 +481,13 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
         if isinstance(data, list):
             return (data, "ok") if data else ([], "empty")
         if isinstance(data, dict):
+            _st1 = (data.get("status") or "").strip().lower()
+            if _st1 in ("foreign_language_source", "non_chinese_source", "foreign_language"):
+                logger.info(
+                    "LLM 声明原帖主体非中文（嵌套 JSON）: %s",
+                    (data.get("reason") or "")[:120],
+                )
+                return [], "foreign_language"
             # 常见顶层 key 或嵌套 job.project_detail
             for key in ("questions", "items", "results", "data", "list", "output"):
                 if key in data and isinstance(data[key], list):
@@ -591,6 +605,38 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
     if user_prompt_for_debug:
         logger.debug("对应的提问（用户消息，不含系统提示词）: %s", user_prompt_for_debug[:1500])
     return [], "parse_error"
+
+
+def _apply_miner_chinese_locale_guard(
+    items: List[Dict],
+    status: str,
+    full_content: str,
+    source_url: str,
+) -> Tuple[List[Dict], str]:
+    """开启 miner_enforce_chinese_output 时：检查题干/答案/标签是否含明显乱码，失败则清空并返回 chinese_guard_failed 供 ReAct 重试。"""
+    if status != "ok" or not items:
+        return items, status
+    from backend.config.config import settings
+
+    if not getattr(settings, "miner_enforce_chinese_output", True):
+        return items, status
+    from backend.services.crawler.miner_output_locale_guard import validate_chinese_extraction
+
+    ok_cn, cn_reason = validate_chinese_extraction(items, full_content)
+    if ok_cn:
+        return items, status
+    logger.warning(
+        "乱码校验未通过，将触发 ReAct 重试: %s | url=%s",
+        cn_reason,
+        source_url,
+    )
+    try:
+        from backend.agents import two_stage_miner_agent as tsm
+
+        tsm._last_extraction_error = f"[乱码校验] {cn_reason}"
+    except Exception:
+        pass
+    return [], "chinese_guard_failed"
 
 
 def extract_questions_from_post(
@@ -721,6 +767,13 @@ def extract_questions_from_post(
         _append_llm_log_to_csv(user_prompt, raw or "", llm_response_time_sec, source=platform,
                                title=post_title, source_url=source_url)
 
+        if status == "foreign_language":
+            logger.info(
+                "原帖被判定为非中文主体，不按面经入库（避免英文整句题库）| url=%s",
+                source_url,
+            )
+            return [], "unrelated", agent_used_tool, True, trace_session_id
+
         if status == "unrelated":
             logger.info(f"LLM 判定帖子与面经无关: {source_url}")
             return [], "unrelated", agent_used_tool, True, trace_session_id
@@ -739,6 +792,9 @@ def extract_questions_from_post(
                 _direct_raw = _call_llm_direct(user_prompt)
                 if _direct_raw:
                     items, status = _parse_json_from_llm(_direct_raw, user_prompt_for_debug=user_prompt)
+                    items, status = _apply_miner_chinese_locale_guard(
+                        items, status, full_content, source_url
+                    )
                     if status == "ok" and items:
                         logger.info(f"直接 LLM 调用降级成功: {len(items)} 道题目（不写入 Graph）")
                         agent_succeeded = False
@@ -763,6 +819,9 @@ def extract_questions_from_post(
                     _direct_raw = _call_llm_direct(user_prompt)
                 if _direct_raw:
                     items, status = _parse_json_from_llm(_direct_raw, user_prompt_for_debug=user_prompt)
+                    items, status = _apply_miner_chinese_locale_guard(
+                        items, status, full_content, source_url
+                    )
                     if status == "ok" and items:
                         logger.info(f"手动 OCR + 直接 LLM 降级成功: {len(items)} 道题目（不写入 Graph）")
                         agent_succeeded = False
@@ -773,6 +832,8 @@ def extract_questions_from_post(
             if attempt < max_retries:
                 time.sleep(1)
             continue
+
+        items, status = _apply_miner_chinese_locale_guard(items, status, full_content, source_url)
 
         if status == "ok" and items:
             if attempt > 1:

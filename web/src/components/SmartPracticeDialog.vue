@@ -174,6 +174,7 @@
 import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { formatAnswerToHtml } from '../utils/formatAnswer.js'
+import { postprocessFeedbackHtml } from '../utils/question-renderer.js'
 import { api } from '../api.js'
 
 const props = defineProps({
@@ -232,7 +233,7 @@ const formattedAnswerHtml = computed(() =>
   formatAnswerToHtml(standardAnswer.value)
 )
 const formattedFeedbackHtml = computed(() =>
-  formatAnswerToHtml(evalResult.value?.feedback || '')
+  postprocessFeedbackHtml(formatAnswerToHtml(evalResult.value?.feedback || ''))
 )
 
 const hasPrev = computed(() => {
@@ -617,6 +618,54 @@ const handleNextClick = () => {
   line-height: 1.7;
   color: #374151;
 }
+.eval-feedback :deep(.score-badge) {
+  display: inline-block;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #fff;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-weight: 600;
+  font-size: 15px;
+  margin: 8px 0;
+  box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+}
+.eval-feedback :deep(.fb-sec) {
+  margin: 10px 0;
+  padding: 10px 12px;
+  background: rgba(248, 250, 252, 0.95);
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+}
+.eval-feedback :deep(.fb-sec-head) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.eval-feedback :deep(.fb-sec-mark) {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: #94a3b8;
+}
+.eval-feedback :deep(.fb-sec--correct .fb-sec-mark) { background: #22c55e; }
+.eval-feedback :deep(.fb-sec--miss .fb-sec-mark) { background: #f59e0b; }
+.eval-feedback :deep(.fb-sec--confuse .fb-sec-mark) { background: #64748b; }
+.eval-feedback :deep(.fb-sec--error .fb-sec-mark) { background: #ef4444; }
+.eval-feedback :deep(.fb-sec-label) {
+  font-size: 13px;
+  font-weight: 600;
+  color: #334155;
+}
+.eval-feedback :deep(.fb-sec-list) {
+  margin: 0;
+  padding-left: 20px;
+  color: #475569;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.eval-feedback :deep(.fb-sec-list li) { margin: 4px 0; }
 
 .eval-missing {
   margin-top: 10px;

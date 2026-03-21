@@ -281,7 +281,7 @@
                 </div>
               </div>
               <!-- 可编辑的 JSON 编辑器（语法高亮 + 查找替换） -->
-              <div class="panel-content json-editor-wrap">
+              <div class="panel-content json-editor-wrap" @paste="onEditAreaPaste">
                 <CodeMirror
                   v-model="editOutput"
                   :basic="true"
@@ -1006,7 +1006,17 @@ const getAbsoluteTop = (el) => {
 const scrollToEditorAnchor = () => {
   const anchorEl = postInfoRef.value || editorHeaderRef.value
   if (!anchorEl) return
-  // 先把每个可滚动父容器滚到锚点绝对位置（相对该容器内容区）
+  // 本应用主滚动条在 App.vue 的 main.content 上，不是 window
+  const mainEl = document.querySelector('main.content')
+  if (mainEl && typeof mainEl.scrollTo === 'function') {
+    const top =
+      anchorEl.getBoundingClientRect().top -
+      mainEl.getBoundingClientRect().top +
+      mainEl.scrollTop -
+      EDITOR_TOP_OFFSET
+    mainEl.scrollTo({ top: Math.max(0, top), behavior: 'auto' })
+    return
+  }
   const scrollParents = getScrollableAncestors(anchorEl)
   scrollParents.forEach((parent) => {
     const targetTop =
@@ -1019,13 +1029,28 @@ const scrollToEditorAnchor = () => {
       behavior: 'auto',
     })
   })
-
-  // 再兜底滚动 window/document
   const top = getAbsoluteTop(anchorEl) - EDITOR_TOP_OFFSET
   window.scrollTo({
     top: Math.max(0, top),
     behavior: 'auto',
   })
+}
+
+// 切换样本 / 复制后 CodeMirror 等会在下一帧抢焦点并 scrollIntoView，需延后补偿滚动
+const scheduleScrollToEditorAnchor = () => {
+  nextTick(() => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        scrollToEditorAnchor()
+        setTimeout(() => scrollToEditorAnchor(), 80)
+      })
+    })
+  })
+}
+
+// 从 Stage1 复制后粘贴到③时，编辑器常会 scrollIntoView 把主区域拉到底部
+const onEditAreaPaste = () => {
+  nextTick(() => scheduleScrollToEditorAnchor())
 }
 
 const onSampleSelectionChange = (selection) => {
@@ -1102,7 +1127,7 @@ const onSampleClick = async (row, column, event) => {
   const prefill = detail.final_output || detail.assist_output || detail.stage2_output || ''
   editOutput.value = prefill ? formatJson(prefill) : ''
   activeTab.value = 'editor'
-  nextTick(() => scrollToEditorAnchor())
+  scheduleScrollToEditorAnchor()
 }
 
 // 导航功能
@@ -1118,7 +1143,6 @@ const gotoNextSample = async () => {
   if (hasNextSample.value) {
     clearFindReplace()
     await onSampleClick(samples.value[currentSampleIndex.value + 1])
-    nextTick(() => scrollToEditorAnchor())
   }
 }
 
@@ -1126,7 +1150,6 @@ const gotoPrevSample = async () => {
   if (hasPrevSample.value) {
     clearFindReplace()
     await onSampleClick(samples.value[currentSampleIndex.value - 1])
-    nextTick(() => scrollToEditorAnchor())
   }
 }
 
@@ -1184,7 +1207,7 @@ const doReplace = () => {
   if (idx === -1) { ElMessage.info('未找到匹配内容'); return }
   editOutput.value = editOutput.value.replace(findText.value, replaceText.value)
   ElMessage.success('已替换 1 处')
-  scrollToEditorAnchor()
+  scheduleScrollToEditorAnchor()
 }
 
 const doReplaceAll = () => {
@@ -1194,7 +1217,7 @@ const doReplaceAll = () => {
   if (count === 0) { ElMessage.info('未找到匹配内容'); return }
   editOutput.value = parts.join(replaceText.value)
   ElMessage.success(`已全部替换 ${count} 处`)
-  scrollToEditorAnchor()
+  scheduleScrollToEditorAnchor()
 }
 
 const isModified = computed(() => {
@@ -1277,14 +1300,18 @@ const callAssist = async () => {
     if (res.error) { ElMessage.error('大模型调用失败：' + res.error); return }
     editOutput.value = formatJson(res.output)
     ElMessage.success(`大模型（${res.model}）生成完成`)
-    nextTick(() => scrollToEditorAnchor())
   } finally {
     assisting.value = false
+    scheduleScrollToEditorAnchor()
   }
 }
 
 const confirmLabel = async () => {
-  if (!editOutput.value.trim()) { ElMessage.warning('标注内容不能为空'); return }
+  if (!editOutput.value.trim()) {
+    ElMessage.warning('标注内容不能为空')
+    scheduleScrollToEditorAnchor()
+    return
+  }
   labeling.value = true
   try {
     const res = await api.post(`${BASE}/label`, {
@@ -1297,7 +1324,6 @@ const confirmLabel = async () => {
       currentSample.value.status = 'labeled'
       currentSample.value.labeled_at = res.labeled_at
       loadStats()
-      scrollToEditorAnchor()
       // 自动跳转到下一题
       if (hasNextSample.value) {
         setTimeout(() => gotoNextSample(), 500)
@@ -1305,19 +1331,27 @@ const confirmLabel = async () => {
     }
   } finally {
     labeling.value = false
+    scheduleScrollToEditorAnchor()
   }
 }
 
 const copyStage1 = () => {
   const text = currentSample.value?.stage1_output || ''
   if (!text) { ElMessage.warning('Stage1 无内容'); return }
-  navigator.clipboard.writeText(text).then(() => ElMessage.success('已复制')).catch(() => ElMessage.error('复制失败'))
+  navigator.clipboard.writeText(text).then(() => {
+    ElMessage.success('已复制')
+    scheduleScrollToEditorAnchor()
+  }).catch(() => ElMessage.error('复制失败'))
 }
 const confirmNoChange = async () => {
   // 使用 Stage2 豆包 或 Stage1 作为最终标注
   const llmOutput = currentSample.value?.stage2_output || currentSample.value?.stage1_output
-  if (!llmOutput) { ElMessage.warning('Stage1/Stage2 输出为空'); return }
-  
+  if (!llmOutput) {
+    ElMessage.warning('Stage1/Stage2 输出为空')
+    scheduleScrollToEditorAnchor()
+    return
+  }
+
   labeling.value = true
   try {
     const res = await api.post(`${BASE}/label`, {
@@ -1330,7 +1364,6 @@ const confirmNoChange = async () => {
       currentSample.value.status = 'labeled'
       currentSample.value.labeled_at = res.labeled_at
       loadStats()
-      scrollToEditorAnchor()
       // 自动跳转到下一题
       if (hasNextSample.value) {
         setTimeout(() => gotoNextSample(), 500)
@@ -1338,6 +1371,7 @@ const confirmNoChange = async () => {
     }
   } finally {
     labeling.value = false
+    scheduleScrollToEditorAnchor()
   }
 }
 

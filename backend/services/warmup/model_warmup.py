@@ -143,8 +143,28 @@ def _warmup_reranker_model(base_url: str, model: str, timeout: int) -> bool:
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            logger.debug(f"[预热] Reranker {model} 不支持（Ollama 版本过旧或未启用 /api/rerank）")
+        else:
+            logger.debug(f"[预热] Reranker {model} 预热失败: HTTP {e.code}")
+        return False
     except Exception as e:
         logger.debug(f"[预热] Reranker {model} 预热失败: {e}")
+        return False
+
+
+def _rerank_embedding_fallback_ok(timeout: int) -> bool:
+    """Ollama 无 /api/rerank 时，用当前配置的 Embedding 探测是否可做余弦重排。"""
+    try:
+        from backend.tools.knowledge_manager_tools import generate_embedding
+    except ImportError:
+        return False
+    try:
+        v = generate_embedding("rerank_embed_fallback_probe")
+        return bool(v)
+    except Exception as e:
+        logger.debug(f"[预热] Embedding 重排降级探测失败: {e}")
         return False
 
 
@@ -167,12 +187,12 @@ def warmup_embedding_rerank(timeout: int = WARMUP_TIMEOUT) -> dict:
         ocr_model = settings.ocr_model or "qwen3-vl:2b"
         ocr_url = "http://localhost:11434/v1"
         t0 = time.time()
-        logger.info("[预热] 预热 OCR 视觉模型: %s...", ocr_model)
+        logger.info(f"[预热] 预热 OCR 视觉模型: {ocr_model}...")
         if _warmup_ocr_model(ocr_url, ocr_model, timeout // 2):
-            logger.info("[预热] ✅ OCR %s 已加载（%.1fs）", ocr_model, time.time() - t0)
+            logger.info(f"[预热] ✅ OCR {ocr_model} 已加载（{time.time() - t0:.1f}s）")
             results["ocr"] = {"success": 1, "failed": 0}
         else:
-            logger.warning("[预热] ⚠️ OCR %s 加载失败", ocr_model)
+            logger.warning(f"[预热] ⚠️ OCR {ocr_model} 加载失败")
             results["ocr"] = {"success": 0, "failed": 1}
 
     # Embedding
@@ -180,30 +200,66 @@ def warmup_embedding_rerank(timeout: int = WARMUP_TIMEOUT) -> dict:
         embed_url = settings.embed_ollama_url or "http://localhost:11434"
         if "localhost" in embed_url or "127.0.0.1" in embed_url:
             t0 = time.time()
-            logger.info("[预热] 预热 Embedding: %s...", settings.embed_model_name)
+            logger.info(f"[预热] 预热 Embedding: {settings.embed_model_name}...")
             if _warmup_embedding_model(embed_url, settings.embed_model_name, timeout // 2):
-                logger.info("[预热] ✅ Embedding %s 已加载（%.1fs）", settings.embed_model_name, time.time() - t0)
+                logger.info(f"[预热] ✅ Embedding {settings.embed_model_name} 已加载（{time.time() - t0:.1f}s）")
                 results["embedding"]["success"] = 1
             else:
-                logger.warning("[预热] ⚠️ Embedding %s 加载失败", settings.embed_model_name)
+                logger.warning(f"[预热] ⚠️ Embedding {settings.embed_model_name} 加载失败")
                 results["embedding"]["failed"] = 1
 
     # Reranker
     if settings.rerank_enabled and settings.rerank_model:
-        rerank_url = settings.rerank_ollama_url or "http://localhost:11434"
-        if "localhost" in rerank_url or "127.0.0.1" in rerank_url:
+        rmode = getattr(settings, "rerank_mode", "ollama").lower().strip()
+        if rmode in ("remote", "dashscope", "bailian"):
             t0 = time.time()
-            logger.info("[预热] 预热 Reranker: %s...", settings.rerank_model)
-            if _warmup_reranker_model(rerank_url, settings.rerank_model, timeout // 2):
-                logger.info("[预热] ✅ Reranker %s 已加载（%.1fs）", settings.rerank_model, time.time() - t0)
-                results["reranker"]["success"] = 1
-            else:
-                logger.warning("[预热] ⚠️ Reranker %s 加载失败", settings.rerank_model)
+            logger.info(f"[预热] 预热远程 Reranker: {settings.rerank_model}...")
+            try:
+                from backend.services.rerank_service import probe_remote_rerank
+
+                if probe_remote_rerank(timeout // 2):
+                    logger.info(
+                        f"[预热] ✅ 远程 Reranker {settings.rerank_model} 可用（{time.time() - t0:.1f}s）"
+                    )
+                    results["reranker"]["success"] = 1
+                elif _rerank_embedding_fallback_ok(timeout // 2):
+                    logger.info(
+                        f"[预热] ✅ 远程 Rerank 不可用，运行时将使用 Embedding({settings.embed_model_name}) 余弦重排"
+                    )
+                    results["reranker"]["success"] = 1
+                else:
+                    logger.info(
+                        f"[预热] ℹ️ 远程 Reranker 不可用（将自动降级，不影响功能）"
+                    )
+                    results["reranker"]["failed"] = 1
+            except Exception as e:
+                logger.warning(f"[预热] 远程 Rerank 预热异常: {e}")
                 results["reranker"]["failed"] = 1
+        else:
+            rerank_url = settings.rerank_ollama_url or "http://localhost:11434"
+            if "localhost" in rerank_url or "127.0.0.1" in rerank_url:
+                t0 = time.time()
+                logger.info(f"[预热] 预热 Reranker: {settings.rerank_model}...")
+                if _warmup_reranker_model(rerank_url, settings.rerank_model, timeout // 2):
+                    logger.info(
+                        f"[预热] ✅ Reranker {settings.rerank_model} 已加载（{time.time() - t0:.1f}s）"
+                    )
+                    results["reranker"]["success"] = 1
+                elif _rerank_embedding_fallback_ok(timeout // 2):
+                    logger.info(
+                        f"[预热] ✅ 检索重排：当前 Ollama 无 /api/rerank，已使用 Embedding({settings.embed_model_name}) 余弦重排；"
+                        f"升级 Ollama 后可启用专用模型 {settings.rerank_model}"
+                    )
+                    results["reranker"]["success"] = 1
+                else:
+                    logger.info(
+                        f"[预热] ℹ️ Reranker {settings.rerank_model} 不可用（将自动降级，不影响功能）"
+                    )
+                    results["reranker"]["failed"] = 1
 
     elapsed = time.time() - start_time
     if results["embedding"]["success"] or results["reranker"]["success"] or results.get("ocr", {}).get("success"):
-        logger.info("[预热] Embedding/Reranker/OCR 预热完成，耗时 %.1fs", elapsed)
+        logger.info(f"[预热] Embedding/Reranker/OCR 预热完成，耗时 {elapsed:.1f}s")
     return results
 
 
@@ -313,20 +369,66 @@ def warmup_all_models(timeout: int = WARMUP_TIMEOUT) -> dict:
     logger.info("[预热] 开始预热 Reranker 模型...")
     
     if settings.rerank_enabled and settings.rerank_model:
-        rerank_url = settings.rerank_ollama_url or "http://localhost:11434"
-        
-        if "localhost" in rerank_url or "127.0.0.1" in rerank_url:
+        rmode = getattr(settings, "rerank_mode", "ollama").lower().strip()
+        if rmode in ("remote", "dashscope", "bailian"):
             t0 = time.time()
-            logger.info(f"[预热] 预热 Reranker: {settings.rerank_model}...")
-            
-            if _warmup_reranker_model(rerank_url, settings.rerank_model, timeout // 2):
-                elapsed = time.time() - t0
-                logger.info(f"[预热] ✅ Reranker {settings.rerank_model} 预热成功 ({elapsed:.1f}s)")
-                results["reranker"]["success"] += 1
-                results["reranker"]["models"].append(settings.rerank_model)
-            else:
-                logger.warning(f"[预热] ⚠️ Reranker {settings.rerank_model} 预热失败")
+            logger.info(f"[预热] 预热远程 Reranker: {settings.rerank_model}...")
+            try:
+                from backend.services.rerank_service import probe_remote_rerank
+
+                if probe_remote_rerank(timeout // 2):
+                    elapsed = time.time() - t0
+                    logger.info(
+                        f"[预热] ✅ 远程 Reranker {settings.rerank_model} 预热成功 ({elapsed:.1f}s)"
+                    )
+                    results["reranker"]["success"] += 1
+                    results["reranker"]["models"].append(settings.rerank_model)
+                elif _rerank_embedding_fallback_ok(timeout // 2):
+                    elapsed = time.time() - t0
+                    logger.info(
+                        f"[预热] ✅ 远程 Rerank 不可用，运行时将使用 Embedding({settings.embed_model_name}) 余弦重排（{elapsed:.1f}s）"
+                    )
+                    results["reranker"]["success"] += 1
+                    results["reranker"]["models"].append(
+                        f"embed_fallback:{settings.embed_model_name}"
+                    )
+                else:
+                    logger.info(
+                        f"[预热] ℹ️ 远程 Reranker 不可用（将自动降级，不影响功能）"
+                    )
+                    results["reranker"]["failed"] += 1
+            except Exception as e:
+                logger.warning(f"[预热] 远程 Rerank 预热异常: {e}")
                 results["reranker"]["failed"] += 1
+        else:
+            rerank_url = settings.rerank_ollama_url or "http://localhost:11434"
+
+            if "localhost" in rerank_url or "127.0.0.1" in rerank_url:
+                t0 = time.time()
+                logger.info(f"[预热] 预热 Reranker: {settings.rerank_model}...")
+
+                if _warmup_reranker_model(rerank_url, settings.rerank_model, timeout // 2):
+                    elapsed = time.time() - t0
+                    logger.info(
+                        f"[预热] ✅ Reranker {settings.rerank_model} 预热成功 ({elapsed:.1f}s)"
+                    )
+                    results["reranker"]["success"] += 1
+                    results["reranker"]["models"].append(settings.rerank_model)
+                elif _rerank_embedding_fallback_ok(timeout // 2):
+                    elapsed = time.time() - t0
+                    logger.info(
+                        f"[预热] ✅ 检索重排：Ollama 无 /api/rerank，已使用 Embedding({settings.embed_model_name}) 余弦重排（{elapsed:.1f}s）；"
+                        f"升级 Ollama 后可使用 {settings.rerank_model}"
+                    )
+                    results["reranker"]["success"] += 1
+                    results["reranker"]["models"].append(
+                        f"embed_fallback:{settings.embed_model_name}"
+                    )
+                else:
+                    logger.info(
+                        f"[预热] ℹ️ Reranker {settings.rerank_model} 不可用（将自动降级，不影响功能）"
+                    )
+                    results["reranker"]["failed"] += 1
     
     # ========== 统计 ==========
     results["total_time"] = time.time() - start_time

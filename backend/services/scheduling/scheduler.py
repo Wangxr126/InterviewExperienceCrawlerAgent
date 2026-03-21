@@ -304,10 +304,16 @@ def _process_pending_tasks(batch_size: int = None):
                 )
                 if questions or status == "unrelated":
                     break
-                if extract_attempt < extract_retries and (status in ("parse_error", "empty", "model_refused")):
+                if extract_attempt < extract_retries and (
+                    status in ("parse_error", "empty", "model_refused", "chinese_guard_failed")
+                ):
                     logger.warning(f"  提取失败（{status}），第 {extract_attempt + 1}/{extract_retries + 1} 次重试...")
                     time.sleep(2)
-            if not questions and extract_retries > 0 and status in ("parse_error", "empty"):
+            if not questions and extract_retries > 0 and status in (
+                "parse_error",
+                "empty",
+                "chinese_guard_failed",
+            ):
                 logger.warning(f"  ⚠️ 重试 {extract_retries} 次后仍提取失败: {url}")
 
             # 帖子与面经无关 → 标记 unrelated（专用状态，参与「清洗无关帖」操作）

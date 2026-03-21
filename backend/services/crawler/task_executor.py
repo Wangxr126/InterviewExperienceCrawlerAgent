@@ -49,9 +49,13 @@ def execute(
     headless: bool = True,
     batch_size: Optional[int] = None,
     process: bool = False,
+    force_inline_process_tasks: bool = False,
 ) -> Dict[str, Any]:
     """
     统一执行入口。所有按钮、定时任务均通过此方法调用。
+
+    force_inline_process_tasks:
+        为 True 时强制在当前进程执行队列处理（process_tasks 子进程 worker 入口必须传 True，避免递归拉起子进程）。
 
     Returns:
         dict 含 status, message, source_info，以及各 action 特有字段
@@ -84,6 +88,27 @@ def execute(
         }
 
     if action == "process_tasks":
+        _run_mode = getattr(settings, "crawler_background_run_mode", "process").lower()
+        if not force_inline_process_tasks and _run_mode == "process":
+            from backend.services.scheduling.process_tasks_spawn import spawn_process_tasks_worker
+
+            _reason = (
+                "scheduled-cron"
+                if trigger_source == "scheduled"
+                else f"task-execute-{trigger_source}"
+            )
+            spawn_process_tasks_worker(batch_size=_batch, reason=_reason)
+            stats = sqlite_service.get_crawl_stats()
+            return {
+                "status": "ok",
+                "questions_added": -1,
+                "queue_stats": stats,
+                "message": (
+                    f"已提交子进程处理队列（batch_size={_batch}），"
+                    f"详见日志目录下 process_tasks_worker.log"
+                ),
+                "source_info": source_info,
+            }
         from backend.services.scheduling.scheduler import crawl_scheduler
         cnt = crawl_scheduler.trigger_process_tasks(batch_size=_batch)
         stats = sqlite_service.get_crawl_stats()
@@ -96,13 +121,13 @@ def execute(
         }
 
     if action == "extract_pending":
-        return _execute_extract_pending(_batch, source_info)
+        return _execute_extract_pending(_batch, source_info, trigger_source)
 
     if action == "retry_errors":
-        return _execute_retry_errors(_batch, source_info)
+        return _execute_retry_errors(_batch, source_info, trigger_source)
 
     if action == "re_extract_all":
-        return _execute_re_extract_all(_batch, source_info)
+        return _execute_re_extract_all(_batch, source_info, trigger_source)
 
     if action == "clean_data":
         return _execute_clean_data(_batch, source_info)
@@ -140,8 +165,10 @@ def get_fetched_task_ids(batch_size: int) -> list[str]:
         return [r["task_id"] for r in rows if r["task_id"]]
 
 
-def _execute_extract_pending(batch_size: int, source_info: Dict[str, str]) -> Dict[str, Any]:
-    """仅提取 fetched 状态帖子（无 DB 变更，直接触发 process_tasks）"""
+def _execute_extract_pending(
+    batch_size: int, source_info: Dict[str, str], trigger_source: TriggerSource
+) -> Dict[str, Any]:
+    """仅提取 fetched 状态帖子（无 DB 变更，走 process_tasks 统一调度）"""
     pending, _ = prepare_extract_pending()
     if pending == 0:
         return {
@@ -150,13 +177,18 @@ def _execute_extract_pending(batch_size: int, source_info: Dict[str, str]) -> Di
             "pending": 0,
             "source_info": source_info,
         }
-    from backend.services.scheduling.scheduler import crawl_scheduler
-    cnt = crawl_scheduler.trigger_process_tasks(batch_size=batch_size)
+    r = execute(
+        "process_tasks",
+        trigger_source,
+        batch_size=batch_size,
+        force_inline_process_tasks=False,
+    )
     return {
         "status": "ok",
-        "message": f"提取完成，入库 {cnt} 道题目",
+        "message": r.get("message", ""),
         "pending": pending,
-        "questions_added": cnt,
+        "questions_added": r.get("questions_added", -1),
+        "queue_stats": r.get("queue_stats"),
         "source_info": source_info,
     }
 
@@ -199,7 +231,9 @@ def prepare_retry_errors() -> tuple[int, int, int, Dict[str, int]]:
     return to_extract, to_fetch, to_extract + to_fetch, initial
 
 
-def _execute_retry_errors(batch_size: int, source_info: Dict[str, str]) -> Dict[str, Any]:
+def _execute_retry_errors(
+    batch_size: int, source_info: Dict[str, str], trigger_source: TriggerSource
+) -> Dict[str, Any]:
     """重试失败项：重置 error→fetched/pending，再触发 process_tasks"""
     to_extract, to_fetch, total, _ = prepare_retry_errors()
     if total == 0:
@@ -209,17 +243,27 @@ def _execute_retry_errors(batch_size: int, source_info: Dict[str, str]) -> Dict[
             "reset": 0,
             "source_info": source_info,
         }
-    from backend.services.scheduling.scheduler import crawl_scheduler
-    cnt = crawl_scheduler.trigger_process_tasks(batch_size=batch_size)
-    stats = sqlite_service.get_crawl_stats()
+    r = execute(
+        "process_tasks",
+        trigger_source,
+        batch_size=batch_size,
+        force_inline_process_tasks=False,
+    )
+    stats = r.get("queue_stats") or sqlite_service.get_crawl_stats()
+    cnt = r.get("questions_added", -1)
     msg_parts = []
     if to_fetch:
         msg_parts.append(f"{to_fetch} 条待重新抓取")
     if to_extract:
         msg_parts.append(f"{to_extract} 条待重新提取")
+    tail = (
+        r.get("message", "")
+        if cnt < 0
+        else f"入库 {cnt} 道题目"
+    )
     return {
         "status": "ok",
-        "message": "已重置 " + "、".join(msg_parts) + f"，入库 {cnt} 道题目",
+        "message": "已重置 " + "、".join(msg_parts) + "；" + tail,
         "reset": total,
         "questions_added": cnt,
         "queue_stats": stats,
@@ -267,7 +311,9 @@ def prepare_re_extract_all() -> tuple[int, int, Dict[str, int]]:
     return len(rows), deleted_questions, initial
 
 
-def _execute_re_extract_all(batch_size: int, source_info: Dict[str, str]) -> Dict[str, Any]:
+def _execute_re_extract_all(
+    batch_size: int, source_info: Dict[str, str], trigger_source: TriggerSource
+) -> Dict[str, Any]:
     """重新提取所有：删除旧题目、将 done/error 重置为 fetched，再触发 process_tasks"""
     reset_count, deleted_questions, _ = prepare_re_extract_all()
     if reset_count == 0:
@@ -277,12 +323,22 @@ def _execute_re_extract_all(batch_size: int, source_info: Dict[str, str]) -> Dic
             "reset": 0,
             "source_info": source_info,
         }
-    from backend.services.scheduling.scheduler import crawl_scheduler
-    cnt = crawl_scheduler.trigger_process_tasks(batch_size=batch_size)
-    stats = sqlite_service.get_crawl_stats()
+    r = execute(
+        "process_tasks",
+        trigger_source,
+        batch_size=batch_size,
+        force_inline_process_tasks=False,
+    )
+    cnt = r.get("questions_added", -1)
+    stats = r.get("queue_stats") or sqlite_service.get_crawl_stats()
+    tail = (
+        r.get("message", "")
+        if cnt < 0
+        else f"重新提取完成，入库 {cnt} 道题目"
+    )
     return {
         "status": "ok",
-        "message": f"已重置 {reset_count} 条（删除 {deleted_questions} 道旧题），重新提取完成，入库 {cnt} 道题目",
+        "message": f"已重置 {reset_count} 条（删除 {deleted_questions} 道旧题），{tail}",
         "reset": reset_count,
         "questions_deleted": deleted_questions,
         "questions_added": cnt,

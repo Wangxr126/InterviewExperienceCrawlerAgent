@@ -292,6 +292,20 @@ class _Settings:
         return _get_int("INTERVIEWER_HISTORY_MAX_MESSAGES", 20)
 
     @property
+    def interviewer_streamable(self) -> bool:
+        """是否对 /api/chat/stream 做 token 级 SSE 推送。
+        为 false 时仍完整执行 arun_stream（推理链、工具、最终正文与 agent_finish 内 thinking 均不删减），
+        仅在整轮结束后按原事件顺序一次性下发 SSE。
+        支持环境变量：INTERVIEWER_STREAMABLE（推荐）或 INTERVIEWER_STREAMBLE（兼容拼写 streamble）。
+        """
+        raw = (_get("INTERVIEWER_STREAMABLE") or _get("INTERVIEWER_STREAMBLE")).lower()
+        if raw in ("0", "false", "no"):
+            return False
+        if raw in ("1", "true", "yes"):
+            return True
+        return True
+
+    @property
     def enable_smart_compression(self) -> bool:
         """是否启用智能摘要（需额外 LLM 调用），默认 False"""
         return _get_bool("ENABLE_SMART_COMPRESSION", False)
@@ -456,6 +470,11 @@ class _Settings:
         return _get_int("MINER_REFUSAL_RETRIES", 3)
 
     @property
+    def miner_enforce_chinese_output(self) -> bool:
+        """原帖含中文时，若题干/答案/标签英文主导则触发 ReAct 重试；设为 false 可关闭。"""
+        return _get("MINER_ENFORCE_CHINESE_OUTPUT", "true").lower() in ("1", "true", "yes")
+
+    @property
     def miner_max_steps(self) -> int:
         """Miner Agent 最大步数（含 OCR、TodoWrite、Finish 等工具调用）"""
         return _get_int("MINER_MAX_STEPS", 100)
@@ -484,9 +503,22 @@ class _Settings:
         return _get_float("MINER_STAGE2_TEMPERATURE", 0.3)
 
     @property
+    def miner_stage2_max_tokens_cap(self) -> int:
+        """Stage2 输出 token 硬上限；<=0 表示不限制。默认 12288（火山 Ark 多数 lite 端点上限）。"""
+        return _get_int("MINER_STAGE2_MAX_TOKENS_CAP", 12288)
+
+    @property
     def miner_stage2_max_tokens(self) -> int:
-        """Stage 2 精加工最大输出 token，默认 65536 避免长答案被截断导致 JSON 解析失败"""
-        return _get_int("MINER_STAGE2_MAX_TOKENS", 0) or 65536
+        """Stage 2 精加工最大输出 token。
+
+        火山 Ark 上部分模型（如 doubao-*-lite）要求 max_tokens <= 12288，超出会 400。
+        实际生效：min(配置值, miner_stage2_max_tokens_cap)；cap<=0 时不做上限。
+        """
+        raw = _get_int("MINER_STAGE2_MAX_TOKENS", 0) or 8192
+        cap = self.miner_stage2_max_tokens_cap
+        if cap <= 0:
+            return raw
+        return min(raw, cap)
 
     @property
     def miner_stage2_use_batch(self) -> bool:
@@ -593,18 +625,46 @@ class _Settings:
     # ── 5.5 检索与重排 ─────────────────────────────────────────────
     @property
     def rerank_enabled(self) -> bool:
-        """是否启用检索后重排（Ollama Qwen3-Reranker）"""
+        """是否启用检索后重排"""
         return _get_bool("RERANK_ENABLED", True)
 
     @property
+    def rerank_mode(self) -> str:
+        """
+        重排后端：ollama（本地 POST /api/rerank）或 remote / dashscope / bailian
+        （阿里云百炼 compatible-api/v1/reranks，文档见 text-rerank-api）。
+        """
+        return _get("RERANK_MODE", "ollama").lower().strip()
+
+    @property
     def rerank_model(self) -> str:
-        """重排模型，如 dengcao/Qwen3-Reranker-8B:Q4_K_M"""
-        return _get("RERANK_MODEL", "dengcao/Qwen3-Reranker-8B:Q4_K_M")
+        """重排模型：ollama 如 dengcao/Qwen3-Reranker-8B:Q4_K_M；remote 如 qwen3-rerank"""
+        raw = _get("RERANK_MODEL", "dengcao/Qwen3-Reranker-8B:Q4_K_M")
+        # 常见笔误：Qwen3--Reranker（双连字符）会导致 Ollama 找不到模型
+        return raw.replace("Qwen3--Reranker", "Qwen3-Reranker")
 
     @property
     def rerank_ollama_url(self) -> str:
-        """重排服务 Ollama 地址"""
+        """重排服务 Ollama 地址（RERANK_MODE=ollama 时）"""
         return _get("RERANK_OLLAMA_URL", "http://localhost:11434")
+
+    @property
+    def rerank_remote_api_key(self) -> str:
+        """远程重排 API Key；未设置时复用 EMBED_API_KEY（百炼同账号）"""
+        return _get("RERANK_API_KEY") or _get("EMBED_API_KEY")
+
+    @property
+    def rerank_remote_base_url(self) -> str:
+        """百炼文本重排 compatible 根 URL（不含 /reranks）"""
+        return _get(
+            "RERANK_REMOTE_BASE_URL",
+            "https://dashscope.aliyuncs.com/compatible-api/v1",
+        ).rstrip("/")
+
+    @property
+    def rerank_instruct(self) -> str:
+        """qwen3-rerank 可选任务说明（英文）；空则使用服务端默认策略"""
+        return _get("RERANK_INSTRUCT", "")
 
     @property
     def rerank_top_n(self) -> int:
@@ -744,8 +804,10 @@ class _Settings:
     # ── OCR 配置 ──────────────────────────────────────────────
     @property
     def ocr_method(self) -> str:
-        """OCR 方法：ollama_vl（本地 Ollama）/ qwen_vl（阿里云百炼）/ claude_vision / mcp"""
-        return _get("OCR_METHOD", "ollama_vl")
+        """OCR 方法：remote（云端视觉，OCR_REMOTE_* 独立配置）/ ollama_vl / qwen_vl / claude_vision / mcp"""
+        m = _get("OCR_METHOD", "ollama_vl").lower()
+        # 旧名 volcengine_vl 已合并为 remote
+        return "remote" if m == "volcengine_vl" else m
 
     @property
     def mcp_ocr_server(self) -> str:
@@ -782,6 +844,57 @@ class _Settings:
     def ocr_retries(self) -> int:
         """单张图片 OCR 失败或乱码时的重试次数"""
         return _get_int("OCR_RETRIES", 3)
+
+    @property
+    def ocr_remote_api_key(self) -> str:
+        """远程 OCR API Key（仅 OCR_REMOTE_API_KEY，不复用 MINER/LLM）"""
+        return _get("OCR_REMOTE_API_KEY")
+
+    @property
+    def ocr_remote_base_url(self) -> str:
+        """远程 OCR OpenAI 兼容 Base（仅 OCR_REMOTE_BASE_URL）"""
+        return _get("OCR_REMOTE_BASE_URL")
+
+    @property
+    def ocr_remote_max_tokens(self) -> int:
+        """远程视觉 OCR max_tokens，默认 8192"""
+        return _get_int("OCR_REMOTE_MAX_TOKENS", 0) or 8192
+
+    @property
+    def ocr_remote_models(self) -> List[Dict[str, Any]]:
+        """
+        远程 OCR 模型链（按顺序尝试）。OCR_REMOTE_MODELS 为 JSON 数组，格式同 MINER_STAGE2_FALLBACK_MODELS：
+        [{"model":"doubao-xxx"},{"model":"yyy","api_key":"可选","base_url":"可选"}]
+        省略的 api_key、base_url 使用 OCR_REMOTE_API_KEY / OCR_REMOTE_BASE_URL。
+        若 JSON 为空但 OCR_REMOTE_MODEL 与密钥、BASE_URL 均已配置，则退化为单模型。
+        """
+        default_key = (self.ocr_remote_api_key or "").strip()
+        default_base = (self.ocr_remote_base_url or "").strip()
+        result: List[Dict[str, Any]] = []
+        raw = _get("OCR_REMOTE_MODELS", "").strip()
+        if raw:
+            try:
+                items = json.loads(raw)
+                if isinstance(items, list):
+                    for item in items:
+                        if not isinstance(item, dict) or not item.get("model"):
+                            continue
+                        result.append({
+                            "model": str(item["model"]).strip(),
+                            "api_key": str(item.get("api_key") or default_key).strip(),
+                            "base_url": str(item.get("base_url") or default_base).strip(),
+                        })
+            except json.JSONDecodeError:
+                pass
+        if not result:
+            single = _get("OCR_REMOTE_MODEL", "").strip()
+            if single and default_key and default_base:
+                result.append({
+                    "model": single,
+                    "api_key": default_key,
+                    "base_url": default_base,
+                })
+        return result
 
     @property
     def nowcoder_output_dir(self) -> Path:
@@ -905,7 +1018,7 @@ class _Settings:
 
     @property
     def crawler_background_run_mode(self) -> str:
-        """后台任务执行模式：process(子进程) / thread(线程)"""
+        """后台任务执行模式：process(子进程) / thread(线程)。process 时凡经 task_executor 触发的 process_tasks（定时、API、extract/retry/re-extract 等）均走子进程，避免主进程阻塞与刷屏。"""
         mode = _get("CRAWLER_BACKGROUND_RUN_MODE", "process").lower()
         return mode if mode in ("process", "thread") else "process"
 
@@ -913,6 +1026,11 @@ class _Settings:
     def crawler_auto_resume_fetched_on_startup(self) -> bool:
         """后端重启时是否自动恢复 fetched 遗留任务（子进程续跑）"""
         return _get_bool("CRAWLER_AUTO_RESUME_FETCHED_ON_STARTUP", True)
+
+    @property
+    def crawler_auto_resume_batch_extract_on_startup(self) -> bool:
+        """后端重启时若存在 shutdown 保存的未完成批量提取，是否自动拉起 batch_extract 子进程续跑"""
+        return _get_bool("CRAWLER_AUTO_RESUME_BATCH_EXTRACT_ON_STARTUP", True)
 
     @property
     def crawler_recursive_retry_max(self) -> int:
