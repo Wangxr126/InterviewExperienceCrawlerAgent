@@ -1,7 +1,7 @@
 """
 批量提取子进程入口
 
-用于将耗时的 TwoStageExtractor（OCR + LLM 2-5 分钟/条）放到独立子进程中执行，
+用于将耗时的 TwoStageExtractor（OCR 仍可能本地 + Stage1 远程 LLM，约 1–5 分钟/条）放到独立子进程中执行，
 避免阻塞主进程的 API 请求（如 loadTasks、loadStats、提交作答等）。
 
 使用方式：
@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 if _env_loaded:
     import os as _os
     _miner_mode   = _os.environ.get("MINER_MODE", "(未设置)")
+    _stage1_mode  = _os.environ.get("MINER_STAGE1_MODE", "(未设置)")
     _miner_model  = _os.environ.get("MINER_LOCAL_MODEL", "(未设置)")
     _stage2_model = _os.environ.get("MINER_STAGE2_MODEL", "(未设置)")
     _stage2_key   = _os.environ.get("MINER_STAGE2_API_KEY", "")
@@ -44,6 +45,13 @@ if _env_loaded:
     logger.info("[BatchExtractWorker] 配置确认：")
     logger.info("  LLM_MODE         = %s", _llm_mode)
     logger.info("  MINER_MODE       = %s", _miner_mode)
+    logger.info("  MINER_STAGE1_MODE= %s", _stage1_mode)
+    _s1r = (_os.environ.get("MINER_STAGE1_REMOTE_MODEL") or "").strip()
+    _s1b = (_os.environ.get("MINER_STAGE1_REMOTE_BASE_URL") or "").strip()
+    logger.info(
+        "  MINER_STAGE1_REMOTE 显式= %s（未注释时才有值；否则进程内用 MINER_REMOTE_* 回退）",
+        "是" if (_s1r or _s1b or (_os.environ.get("MINER_STAGE1_REMOTE_API_KEY") or "").strip()) else "否",
+    )
     logger.info("  MINER_LOCAL_MODEL= %s", _miner_model)
     logger.info("  MINER_STAGE2_MODEL=%s", _stage2_model)
     logger.info("  MINER_STAGE2_KEY  = %s", _stage2_key_masked)

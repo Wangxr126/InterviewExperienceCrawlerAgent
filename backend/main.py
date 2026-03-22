@@ -469,12 +469,26 @@ def _print_agent_llm_config():
 
     logger.info("  " + "─" * 56)
 
-    # Miner Agent（two_stage 时 Stage1 用本地模型，Stage2 用专项配置）
+    # Miner Agent（two_stage：Stage1 由 MINER_STAGE1_MODE + MINER_STAGE1_*；Stage2 用 MINER_STAGE2_*）
     if s.miner_mode == "two_stage":
-        mm_stage1 = s.miner_local_model or s.llm_local_model or "(未设置)"
         mm_stage2 = s.miner_stage2_model or "(未设置)"
         logger.info(f"  [Miner Agent] mode=two_stage")
-        logger.info(f"    Stage1(本地): model={mm_stage1}, base={s.miner_local_base_url or s.llm_local_base_url}")
+        s1m = getattr(s, "miner_stage1_mode", "remote")
+        n_ep = len(getattr(s, "miner_stage1_models", []) or [])
+        if s1m == "local":
+            logger.info(
+                f"    Stage1(本地): model={s.miner_stage1_local_model or '(未设置)'}, "
+                f"base={s.miner_stage1_local_base_url or '(未设置)'}, timeout={s.miner_stage1_local_timeout}s"
+            )
+        else:
+            _src = "显式 MINER_STAGE1_REMOTE_*" if getattr(s, "miner_stage1_remote_explicit_in_env", False) else "回退 MINER_REMOTE_*（# 注释的变量不会进入进程）"
+            logger.info(f"    Stage1(远程) 来源: {_src}")
+            logger.info(
+                f"    Stage1(远程): primary={s.miner_stage1_remote_model or '(未设置)'}, "
+                f"base={s.miner_stage1_remote_base_url or '(未设置)'}, "
+                f"timeout={s.miner_stage1_remote_timeout}s, 端点链={n_ep}, "
+                f"MINER_STAGE1_FALLBACK_MODELS={'已设' if getattr(s, 'miner_stage1_fallback_models_in_env', False) else '未设'}"
+            )
         logger.info(f"    Stage2(精加工): model={mm_stage2}, base={s.miner_stage2_base_url or '(未设置)'}")
     else:
         mm = s.miner_model or s.llm_model_id or "(未设置)"
@@ -2382,6 +2396,8 @@ async def retry_error_posts(batch_size: int | None = Query(default=None, ge=1, l
         "status": "ok",
         "message": "；".join(msg_parts),
         "reset": total,
+        # 供前端进度条：重置后各平台「待提取」基数（与 _extraction_initial_by_platform 一致）
+        "initial_by_platform": initial_by_platform,
         "source_info": task_get_source_info(),
     }
 
@@ -2448,6 +2464,7 @@ async def re_extract_all_posts(batch_size: int | None = Query(default=None, ge=1
         "message": f"已重置 {reset_count} 条帖子（删除 {deleted_questions} 道旧题），开始重新提取",
         "reset": reset_count,
         "questions_deleted": deleted_questions,
+        "initial_by_platform": initial_by_platform,
         "source_info": task_get_source_info(),
     }
 
@@ -3672,11 +3689,55 @@ async def finetune_list_runs(limit: int = 50):
 
 @app.post("/api/finetune/generate-training")
 async def finetune_generate_training(body: dict = None):
-    """根据配置生成训练脚本并转换数据，body.sample_ids 可选指定训练样本"""
+    """根据配置生成训练脚本并转换数据；默认在后台启动训练（body.run_training=false 则仅生成脚本）"""
     body = body or {}
     config = body.get("config")
     sample_ids = body.get("sample_ids")
-    return _ft.generate_training_script(config=config, sample_ids=sample_ids)
+    run_training = body.get("run_training", True)
+    if not isinstance(run_training, bool):
+        run_training = bool(run_training)
+    return _ft.generate_training_script(
+        config=config, sample_ids=sample_ids, run_training=run_training
+    )
+
+
+@app.get("/api/finetune/compare-presets")
+async def finetune_compare_presets():
+    """模型对比页：可选预设列表（与微调辅助相同的提取提示，不同 endpoint/model）"""
+    return _ft.list_model_compare_presets()
+
+
+@app.post("/api/finetune/compare")
+async def finetune_compare(body: dict = None):
+    """
+    并行对比多个模型/端点在同一面经上的结构化提取结果。
+    body: { preset_ids: [str, ...], content?, title?, sample_id? }
+    """
+    import asyncio
+
+    body = body or {}
+    preset_ids = body.get("preset_ids") or []
+    if not isinstance(preset_ids, list):
+        raise HTTPException(status_code=400, detail="preset_ids 须为数组")
+    if len(preset_ids) < 2:
+        raise HTTPException(status_code=400, detail="至少选择 2 个模型对比")
+    if len(preset_ids) > 4:
+        raise HTTPException(status_code=400, detail="最多同时对比 4 个模型")
+    content = (body.get("content") or "").strip()
+    title = (body.get("title") or "").strip()
+    sample_id = body.get("sample_id")
+    if sample_id is not None:
+        s = _ft.get_sample(int(sample_id))
+        if not s:
+            raise HTTPException(status_code=404, detail="样本不存在")
+        content = (s.get("content") or "").strip()
+        title = (s.get("title") or title or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="content 不能为空")
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, lambda: _ft.compare_models_parallel(preset_ids, content, title)
+    )
 
 
 @app.delete("/api/finetune/samples/{sample_id}")

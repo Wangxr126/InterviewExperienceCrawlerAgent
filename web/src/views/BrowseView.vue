@@ -30,8 +30,12 @@
       <!-- 操作行：搜索 | 智能练习 | 重置 -->
       <div class="action-row">
         <el-button type="primary" @click="onSearch" :loading="loading">🔍 搜索</el-button>
-        <el-button class="btn-smart-practice" @click="loadSmartPractice">
-          <Aim />
+        <el-button
+          class="btn-smart-practice"
+          :loading="smartPracticeLoading"
+          @click="loadSmartPractice"
+        >
+          <span v-if="!smartPracticeLoading" class="btn-sp-icon" aria-hidden="true">✨</span>
           <span>智能练习</span>
         </el-button>
         <el-button @click="resetFilters">重置</el-button>
@@ -72,8 +76,9 @@
         </button>
       </div>
 
-      <!-- 题目网格 -->
-      <div v-if="questions.length > 0" class="question-grid">
+      <!-- 题目网格（列表加载时仅搜索按钮转圈，不再占满屏大号 Loading） -->
+      <div v-if="loading && questions.length === 0" class="browse-list-hint">正在加载题目…</div>
+      <div v-else-if="questions.length > 0" class="question-grid">
         <div v-for="q in questions" :key="q.q_id" class="q-card" @click="openDialog(q)">
           <div v-if="q.last_score != null" class="answered-ribbon"></div>
           <div class="q-card-header">
@@ -98,12 +103,9 @@
           </div>
         </div>
       </div>
-      <div v-else-if="!loading" class="empty-state">
+      <div v-else class="empty-state">
         <div class="empty-icon">📭</div>
         <div>暂无题目，先去「收录面经」或「数据采集」添加内容吧</div>
-      </div>
-      <div v-if="loading" class="loading-center">
-        <Loading class="is-loading" style="font-size:32px;color:var(--primary)" />
       </div>
 
       <!-- 分页控件 -->
@@ -160,7 +162,6 @@
 <script setup>
 import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Loading, Aim } from '@element-plus/icons-vue'
 import { api } from '../api.js'
 import QuestionDialog from '../components/QuestionDialog.vue'
 import SmartPracticeDialog from '../components/SmartPracticeDialog.vue'
@@ -196,7 +197,8 @@ const toggleSort = (colKey) => {
   loadQuestions(1)
 }
 const questions = ref([])
-const loading   = ref(false)
+const loading = ref(false)
+const smartPracticeLoading = ref(false)
 const dialogVisible = ref(false)           // 普通题目弹窗
 const selectedQ     = ref(null)
 
@@ -271,7 +273,7 @@ const currentPracticeQuestion = computed(() => {
 })
 
 const loadSmartPractice = async () => {
-  loading.value = true
+  smartPracticeLoading.value = true
   try {
     const d = await api.getSmartPracticeQuestions({
       user_id: props.userId || undefined,
@@ -301,7 +303,7 @@ const loadSmartPractice = async () => {
   } catch {
     ElMessage.error('智能练习取题失败')
   } finally {
-    loading.value = false
+    smartPracticeLoading.value = false
   }
 }
 
@@ -408,8 +410,10 @@ watch(() => props.isActive, (newVal, oldVal) => {
 .btn-smart-practice:active {
   transform: translateY(0);
 }
-.btn-smart-practice .el-icon {
-  font-size: 16px;
+.btn-smart-practice .btn-sp-icon {
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0.95;
 }
 .stats-bar {
   display: flex;
@@ -527,7 +531,12 @@ watch(() => props.isActive, (newVal, oldVal) => {
              padding: 2px 8px; border-radius: 10px; }
 .empty-state { text-align: center; padding: 60px 20px; color: var(--text-sub); }
 .empty-icon  { font-size: 48px; margin-bottom: 16px; }
-.loading-center { text-align: center; padding: 40px; }
+.browse-list-hint {
+  text-align: center;
+  padding: 48px 20px;
+  font-size: 14px;
+  color: var(--text-sub, #6b7280);
+}
 .pagination-bar {
   display: flex;
   flex-direction: column;

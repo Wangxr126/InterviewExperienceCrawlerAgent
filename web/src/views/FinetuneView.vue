@@ -206,10 +206,10 @@
               </div>
             </div>
 
-            <!-- 中栏：Stage1 本地 Qwen3（Stage2 内容默认填入③编辑区） -->
+            <!-- 中栏：Stage1 粗提取（MINER_REMOTE，如火山 qwen）（Stage2 内容默认填入③编辑区） -->
             <div class="editor-panel">
               <div class="panel-header">
-                <span class="panel-title">② Stage1 本地 Qwen3</span>
+                <span class="panel-title">② Stage1 粗提取（远程）</span>
                 <span class="panel-subtitle">（{{ stage1QuestionCount }} 道题）</span>
                 <el-button @click="copyStage1" size="small" style="margin-left: auto;">
                   📋 复制
@@ -232,7 +232,7 @@
                   <el-tag
                     :type="currentSample?.final_output ? 'warning' : 'info'"
                     size="small"
-                  >{{ currentSample?.final_output ? '已修改内容' : (currentSample?.stage2_output ? 'Stage2 豆包生成' : 'Stage1 本地生成') }}</el-tag>
+                  >{{ currentSample?.final_output ? '已修改内容' : (currentSample?.stage2_output ? 'Stage2 豆包生成' : 'Stage1 粗提取') }}</el-tag>
                   <span class="panel-subtitle">（{{ editQuestionCount }} 道题）</span>
                 </span>
                 <el-button 
@@ -421,138 +421,162 @@
           </span>
         </template>
         <div class="oneclick-container">
-          <el-form :model="runConfig" label-width="160px" label-position="left" class="one-click-form">
-            <el-divider content-position="left">基础配置</el-divider>
-            <el-form-item>
+          <!-- 顶部标签：避免左侧窄列导致换行错乱、问号与文字重叠 -->
+          <el-form :model="runConfig" label-position="top" class="one-click-form">
+            <section class="oneclick-section">
+              <h3 class="oneclick-section-title">基础配置</h3>
+            <div class="oneclick-fields-grid oneclick-fields-grid--2">
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">基座模型<el-tooltip content="Ollama 本地模型名或 HuggingFace 模型 ID。训练时 Unsloth 会使用 unsloth/Qwen3-4B 作为基座，与 Ollama 的 qwen3:4b 架构一致。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-input v-model="runConfig.base_model" placeholder="qwen3:4b" />
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">输出名称<el-tooltip content="训练完成后 LoRA 适配器的保存目录名，将保存在 微调/lora_output/ 下。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-input v-model="runConfig.output_name" placeholder="qwen3-4b-miner-lora" />
+              </el-form-item>
+            </div>
+            <el-form-item class="oneclick-form-item--full oneclick-form-item--radio">
               <template #label>
-                <span class="label-with-help">基座模型<el-tooltip content="Ollama 本地模型名或 HuggingFace 模型 ID。训练时 Unsloth 会使用 unsloth/Qwen3-4B 作为基座，与 Ollama 的 qwen3:4b 架构一致。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
+                <span class="label-with-help">微调方式<el-tooltip content="LoRA 使用 16bit 精度，效果更好但显存约 10GB；QLoRA 使用 4bit 量化，省显存但略慢。Qwen3 推荐 LoRA。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
               </template>
-              <el-input v-model="runConfig.base_model" placeholder="qwen3:4b" />
-            </el-form-item>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">微调方式<el-tooltip content="LoRA 使用 16bit 精度，效果更好但显存约 10GB；QLoRA 使用 4bit 量化，省显存但略慢。Qwen3 推荐 LoRA。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-radio-group v-model="runConfig.method">
+              <el-radio-group v-model="runConfig.method" class="oneclick-radio-group">
                 <el-radio value="lora">LoRA（16bit，更准，显存约 10GB）</el-radio>
                 <el-radio value="qlora">QLoRA（4bit，省显存，略慢）</el-radio>
               </el-radio-group>
             </el-form-item>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">输出名称<el-tooltip content="训练完成后 LoRA 适配器的保存目录名，将保存在 微调/lora_output/ 下。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-input v-model="runConfig.output_name" placeholder="qwen3-4b-miner-lora" />
-            </el-form-item>
+            </section>
 
-            <el-divider content-position="left">LoRA 参数</el-divider>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">LoRA Rank (r)<el-tooltip content="低秩矩阵的秩。越大表达能力越强但显存越高、训练越慢。推荐 8 或 16。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-input-number v-model="runConfig.lora_r" :min="4" :max="128" :step="4" />
-            </el-form-item>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">LoRA Alpha<el-tooltip content="LoRA 更新的缩放因子。建议设为 rank 的 2 倍，如 r=16 则 alpha=32。影响学习强度。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-input-number v-model="runConfig.lora_alpha" :min="4" :max="256" :step="4" />
-            </el-form-item>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">LoRA Dropout<el-tooltip content="训练时随机丢弃 LoRA 激活的比例，用于防止过拟合。0 可加速训练，0.05 可提升泛化。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-input-number v-model="runConfig.lora_dropout" :min="0" :max="0.5" :step="0.01" />
-            </el-form-item>
-            <el-form-item>
+            <section class="oneclick-section">
+              <h3 class="oneclick-section-title">LoRA 参数</h3>
+            <div class="oneclick-fields-grid oneclick-fields-grid--2">
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">LoRA Rank (r)<el-tooltip content="低秩矩阵的秩。越大表达能力越强但显存越高、训练越慢。推荐 8 或 16。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-input-number v-model="runConfig.lora_r" :min="4" :max="128" :step="4" class="oneclick-input-number" controls-position="right" />
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">LoRA Alpha<el-tooltip content="LoRA 更新的缩放因子。建议设为 rank 的 2 倍，如 r=16 则 alpha=32。影响学习强度。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-input-number v-model="runConfig.lora_alpha" :min="4" :max="256" :step="4" class="oneclick-input-number" controls-position="right" />
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">LoRA Dropout<el-tooltip content="训练时随机丢弃 LoRA 激活的比例，用于防止过拟合。0 可加速训练，0.05 可提升泛化。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-input-number v-model="runConfig.lora_dropout" :min="0" :max="0.5" :step="0.01" class="oneclick-input-number" controls-position="right" />
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">rsLoRA<el-tooltip content="Rank-Stabilized LoRA，使用 alpha/sqrt(r) 缩放，可提升高 rank 时的稳定性。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <div class="oneclick-switch-row">
+                  <el-switch v-model="runConfig.use_rslora" />
+                  <span class="form-tip-inline oneclick-switch-hint">启用可提升稳定性</span>
+                </div>
+              </el-form-item>
+            </div>
+            <el-form-item class="oneclick-form-item--full oneclick-form-item--modules">
               <template #label>
                 <span class="label-with-help">目标模块</span>
               </template>
               <div class="module-select-wrapper">
-                <div class="module-dropdown-explanation">
-                  q_proj/k_proj/v_proj 为注意力层，o_proj 为输出投影，gate_proj/up_proj/down_proj 为 FFN 层。全选可获最佳效果；减少模块可省显存但会降低质量。
-                </div>
-                <el-select v-model="runConfig.lora_target_modules_arr" multiple placeholder="选择要注入 LoRA 的模块" style="width:100%">
-                  <el-option v-for="m in TARGET_MODULE_OPTIONS" :key="m.value" :label="m.label" :value="m.value">
-                    <div class="module-option">
-                      <span class="module-name">{{ m.label }}</span>
-                      <span class="module-desc">{{ m.desc }}</span>
-                    </div>
-                  </el-option>
+                <el-select
+                  v-model="runConfig.lora_target_modules_arr"
+                  class="oneclick-module-select"
+                  popper-class="oneclick-module-grey-popper"
+                  multiple
+                  collapse-tags
+                  :max-collapse-tags="6"
+                  collapse-tags-tooltip
+                  placeholder="选择模块（可多选）"
+                >
+                  <el-option
+                    v-for="m in TARGET_MODULE_OPTIONS"
+                    :key="m.value"
+                    :label="`${m.value}（${m.shortTitle}）`"
+                    :value="m.value"
+                  />
                 </el-select>
+                <p class="module-hint-after">
+                  注意力：<code>q_proj</code> / <code>k_proj</code> / <code>v_proj</code>；输出：<code>o_proj</code>；FFN：<code>gate_proj</code> / <code>up_proj</code> / <code>down_proj</code>。全选效果通常最好；减少模块可省显存。
+                </p>
                 <div class="module-expression-footer">
                   <el-input
                     v-model="targetModuleExpr"
-                    size="small"
-                    placeholder="表达式: all | attention | ffn | q_proj,k_proj,..."
+                    placeholder="批量表达式：all · attention · ffn · 或 q_proj,k_proj,..."
+                    clearable
                     @keyup.enter="applyTargetModuleExpr"
                   />
-                  <el-button size="small" type="primary" @click="applyTargetModuleExpr">应用</el-button>
+                  <el-button type="primary" class="oneclick-apply-modules" @click="applyTargetModuleExpr">应用到选择</el-button>
                 </div>
               </div>
             </el-form-item>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">rsLoRA<el-tooltip content="Rank-Stabilized LoRA，使用 alpha/sqrt(r) 缩放，可提升高 rank 时的稳定性。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-switch v-model="runConfig.use_rslora" />
-              <span class="form-tip-inline">启用可提升稳定性</span>
-            </el-form-item>
+            </section>
 
-            <el-divider content-position="left">训练参数</el-divider>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">学习率<el-tooltip content="梯度更新步长。LoRA 推荐 2e-4，DPO/RL 等推荐 5e-6。过大易发散，过小收敛慢。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-input v-model="runConfig.learning_rate" placeholder="2e-4" />
-            </el-form-item>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">训练轮数<el-tooltip content="完整遍历数据集的次数。1-3 轮通常足够，过多易过拟合、记忆训练集。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-input-number v-model="runConfig.num_epochs" :min="1" :max="10" />
-            </el-form-item>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">Batch Size<el-tooltip content="每步处理的样本数。越大显存越高，通常设为 1-4。配合梯度累积达到有效 batch size。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-input-number v-model="runConfig.per_device_train_batch_size" :min="1" :max="16" />
-            </el-form-item>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">梯度累积步数<el-tooltip content="累积多少步再更新权重。有效 batch = batch_size × 梯度累积。推荐 8-16 达到稳定训练。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-input-number v-model="runConfig.gradient_accumulation_steps" :min="1" :max="64" />
-            </el-form-item>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">最大序列长度<el-tooltip content="单条样本的最大 token 数。越长显存越高。面经提取 2048 通常足够。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-input-number v-model="runConfig.max_seq_length" :min="256" :max="8192" :step="256" />
-            </el-form-item>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">Warmup 比例<el-tooltip content="训练初期学习率从 0 线性升到目标值的步数占比。0.1 表示前 10% 步数 warmup。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-input-number v-model="runConfig.warmup_ratio" :min="0" :max="0.5" :step="0.05" />
-            </el-form-item>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">Weight Decay<el-tooltip content="L2 正则化系数，防止权重过大。0.01 为常用值。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-input-number v-model="runConfig.weight_decay" :min="0" :max="0.2" :step="0.01" />
-            </el-form-item>
-            <el-form-item>
-              <template #label>
-                <span class="label-with-help">训练精度<el-tooltip content="BF16：BFloat16，省约 50% 显存，推荐。FP16：半精度，兼容性好。4bit：仅 QLoRA 时可用，最省显存。FP32：全精度，显存最高、最慢。" placement="top"><QuestionFilled class="param-help" /></el-tooltip></span>
-              </template>
-              <el-select v-model="runConfig.precision" placeholder="选择训练精度" style="width:200px">
-                <el-option label="BF16（推荐，省显存）" value="bf16" />
-                <el-option label="FP16（兼容性好）" value="fp16" />
-                <el-option label="4bit（仅 QLoRA）" value="4bit" :disabled="runConfig.method !== 'qlora'" />
-                <el-option label="FP32（全精度）" value="fp32" />
-              </el-select>
-            </el-form-item>
+            <section class="oneclick-section">
+              <h3 class="oneclick-section-title">训练参数</h3>
+            <div class="oneclick-fields-grid oneclick-fields-grid--2">
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">学习率<el-tooltip content="梯度更新步长。LoRA 推荐 2e-4，DPO/RL 等推荐 5e-6。过大易发散，过小收敛慢。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-input v-model="runConfig.learning_rate" placeholder="2e-4" />
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">训练轮数<el-tooltip content="完整遍历数据集的次数。1-3 轮通常足够，过多易过拟合、记忆训练集。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-input-number v-model="runConfig.num_epochs" :min="1" :max="10" class="oneclick-input-number" controls-position="right" />
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">Batch Size<el-tooltip content="每步处理的样本数。越大显存越高，通常设为 1-4。配合梯度累积达到有效 batch size。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-input-number v-model="runConfig.per_device_train_batch_size" :min="1" :max="16" class="oneclick-input-number" controls-position="right" />
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">梯度累积步数<el-tooltip content="累积多少步再更新权重。有效 batch = batch_size × 梯度累积。推荐 8-16 达到稳定训练。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-input-number v-model="runConfig.gradient_accumulation_steps" :min="1" :max="64" class="oneclick-input-number" controls-position="right" />
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">最大序列长度<el-tooltip content="单条样本截断/填充的上限（token），本页最高 8192。越长越吃显存；长 JSON 输出建议 4096 起，仍截断可 8192 并减小每卡 batch。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-input-number v-model="runConfig.max_seq_length" :min="256" :max="8192" :step="256" class="oneclick-input-number" controls-position="right" />
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">Warmup 比例<el-tooltip content="训练初期学习率从 0 线性升到目标值的步数占比。0.1 表示前 10% 步数 warmup。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-input-number v-model="runConfig.warmup_ratio" :min="0" :max="0.5" :step="0.05" class="oneclick-input-number" controls-position="right" />
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">Weight Decay<el-tooltip content="L2 正则化系数，防止权重过大。0.01 为常用值。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-input-number v-model="runConfig.weight_decay" :min="0" :max="0.2" :step="0.01" class="oneclick-input-number" controls-position="right" />
+              </el-form-item>
+              <el-form-item>
+                <template #label>
+                  <span class="label-with-help">训练精度<el-tooltip content="BF16：BFloat16，省约 50% 显存，推荐。FP16：半精度，兼容性好。4bit：仅 QLoRA 时可用，最省显存。FP32：全精度，显存最高、最慢。" placement="bottom"><QuestionFilled class="param-help" /></el-tooltip></span>
+                </template>
+                <el-select v-model="runConfig.precision" placeholder="选择训练精度" class="oneclick-select-block">
+                  <el-option label="BF16（推荐，省显存）" value="bf16" />
+                  <el-option label="FP16（兼容性好）" value="fp16" />
+                  <el-option label="4bit（仅 QLoRA）" value="4bit" :disabled="runConfig.method !== 'qlora'" />
+                  <el-option label="FP32（全精度）" value="fp32" />
+                </el-select>
+              </el-form-item>
+            </div>
+            </section>
           </el-form>
 
           <div class="oneclick-data-tip" v-if="selectedSampleIds.length > 0">
@@ -566,8 +590,11 @@
           <div class="oneclick-actions">
             <el-button @click="saveRunConfig">保存配置</el-button>
             <el-button type="primary" @click="generateTraining" :loading="generating">
-              {{ generating ? '生成中...' : '生成训练脚本' }}
+              {{ generating ? '准备训练…' : '生成并训练' }}
             </el-button>
+            <el-checkbox v-model="onlyGenerateScript" class="only-script-checkbox">
+              仅生成脚本（不启动训练）
+            </el-checkbox>
           </div>
 
           <!-- 训练记录 -->
@@ -581,8 +608,21 @@
               <el-table-column label="创建时间" prop="created_at" width="170" />
               <el-table-column label="状态" width="90" align="center">
                 <template #default="{ row }">
-                  <el-tag :type="row.status === 'generated' ? 'info' : row.status === 'completed' ? 'success' : 'warning'" size="small">
-                    {{ row.status === 'generated' ? '已生成' : row.status === 'completed' ? '已完成' : row.status === 'running' ? '训练中' : row.status || '-' }}
+                  <el-tag
+                    :type="row.status === 'generated' ? 'info' : row.status === 'completed' ? 'success' : row.status === 'failed' ? 'danger' : 'warning'"
+                    size="small"
+                  >
+                    {{
+                      row.status === 'generated'
+                        ? '已生成'
+                        : row.status === 'completed'
+                          ? '已完成'
+                          : row.status === 'running'
+                            ? '训练中'
+                            : row.status === 'failed'
+                              ? '失败'
+                              : row.status || '-'
+                    }}
                   </el-tag>
                 </template>
               </el-table-column>
@@ -590,30 +630,6 @@
               <el-table-column label="输出目录" prop="output_dir" min-width="200" show-overflow-tooltip />
               <el-table-column label="脚本路径" prop="script_path" min-width="180" show-overflow-tooltip />
             </el-table>
-          </div>
-
-          <!-- 训练状态/进度 -->
-          <div v-if="generateResult" class="train-status-card">
-            <div class="train-status-header">
-              <CircleCheckFilled class="status-icon" />
-              <span>训练脚本已生成</span>
-            </div>
-            <el-steps direction="vertical" :active="2" finish-status="success">
-              <el-step title="导出标注数据" description="已完成" />
-              <el-step title="生成训练脚本" description="已完成" />
-              <el-step title="执行训练">
-                <template #description>
-                  <div class="step-desc">在终端执行以下命令开始训练：</div>
-                  <div class="train-cmd">
-                    <code>cd 微调 && pip install unsloth datasets trl transformers && python train_lora.py</code>
-                  </div>
-                  <div class="train-meta">
-                    <span>样本数：{{ generateResult.sample_count }}</span>
-                    <span>输出目录：{{ generateResult.output_dir }}</span>
-                  </div>
-                </template>
-              </el-step>
-            </el-steps>
           </div>
         </div>
       </el-tab-pane>
@@ -660,7 +676,7 @@
           
           <div class="preview-section" v-if="sample.llm_raw_obj">
             <div class="preview-section-title">
-              Stage1 本地 Qwen3
+              Stage1 粗提取（远程）
               <span class="preview-question-count" v-if="Array.isArray(sample.llm_raw_obj)">
                 （{{ sample.llm_raw_obj.length }} 道题）
               </span>
@@ -702,7 +718,7 @@
 
 <script setup>
 import { ref, computed, watch, nextTick, onMounted, onActivated } from 'vue'
-import { Refresh, Loading, UploadFilled, QuestionFilled, CircleCheckFilled, InfoFilled } from '@element-plus/icons-vue'
+import { Refresh, Loading, UploadFilled, QuestionFilled, InfoFilled } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import VueJsonPretty from 'vue-json-pretty'
 import 'vue-json-pretty/lib/styles.css'
@@ -1386,14 +1402,15 @@ const exportLabeled = async () => {
   }
 }
 
+/** 目标模块：value 供训练脚本/API；展示为 id（功能简述） */
 const TARGET_MODULE_OPTIONS = [
-  { value: 'q_proj', label: 'q_proj', desc: 'Query 投影，注意力查询向量' },
-  { value: 'k_proj', label: 'k_proj', desc: 'Key 投影，注意力键向量' },
-  { value: 'v_proj', label: 'v_proj', desc: 'Value 投影，注意力值向量' },
-  { value: 'o_proj', label: 'o_proj', desc: '输出投影，注意力层输出' },
-  { value: 'gate_proj', label: 'gate_proj', desc: 'FFN 门控投影' },
-  { value: 'up_proj', label: 'up_proj', desc: 'FFN 上投影' },
-  { value: 'down_proj', label: 'down_proj', desc: 'FFN 下投影' },
+  { value: 'q_proj', shortTitle: 'Query 投影，注意力查询' },
+  { value: 'k_proj', shortTitle: 'Key 投影，注意力键' },
+  { value: 'v_proj', shortTitle: 'Value 投影，注意力值' },
+  { value: 'o_proj', shortTitle: '注意力输出线性层' },
+  { value: 'gate_proj', shortTitle: 'FFN 门控分支' },
+  { value: 'up_proj', shortTitle: 'FFN 上投影、升维' },
+  { value: 'down_proj', shortTitle: 'FFN 下投影、回残差' },
 ]
 
 const ALL_MODULES = TARGET_MODULE_OPTIONS.map(m => m.value)
@@ -1435,7 +1452,8 @@ const onTabChange = (tab) => {
 
 // 一键微调
 const generating = ref(false)
-const generateResult = ref(null)
+/** 勾选后只写 train_lora.py，不由后端拉起训练进程 */
+const onlyGenerateScript = ref(false)
 const runConfig = ref({
   base_model: 'qwen3:4b',
   method: 'lora',
@@ -1449,7 +1467,7 @@ const runConfig = ref({
   num_epochs: 3,
   per_device_train_batch_size: 2,
   gradient_accumulation_steps: 8,
-  max_seq_length: 2048,
+  max_seq_length: 4096,
   warmup_ratio: 0.1,
   weight_decay: 0.01,
   use_rslora: true,
@@ -1510,18 +1528,23 @@ const saveRunConfig = async () => {
 
 const generateTraining = async () => {
   generating.value = true
-  generateResult.value = null
   try {
-    const body = { config: getConfigForApi() }
+    const body = {
+      config: getConfigForApi(),
+      run_training: !onlyGenerateScript.value,
+    }
     if (selectedSampleIds.value.length > 0) body.sample_ids = selectedSampleIds.value
     const res = await api.post(`${BASE}/generate-training`, body)
     if (res.status === 'error') {
       ElMessage.warning(res.message)
       return
     }
-    generateResult.value = res
     await loadTrainRuns()
-    ElMessage.success('训练脚本已生成')
+    if (res.training_error && !res.training_started) {
+      ElMessage.warning(res.message || '脚本已生成，但未启动训练')
+    } else {
+      ElMessage.success(res.message || '操作完成')
+    }
   } catch (e) {
     ElMessage.error('生成失败：' + (e.message || e))
   } finally {
@@ -2451,91 +2474,287 @@ onActivated(async () => {
   object-fit: contain;
   vertical-align: middle;
 }
-.module-option { display: flex; flex-direction: column; gap: 2px; }
-.module-option .module-name { font-weight: 500; }
-.module-option .module-desc { font-size: 12px; color: #6b7280; }
-.module-select-wrapper { display: flex; flex-direction: column; gap: 8px; width: 100%; }
-.module-dropdown-explanation {
-  padding: 8px 12px;
-  font-size: 12px;
+.module-select-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+}
+.module-hint-after {
+  margin: 0;
+  font-size: 13px;
   color: #64748b;
-  line-height: 1.5;
+  line-height: 1.6;
+  padding: 10px 14px;
   background: #f8fafc;
-  border-radius: 6px;
+  border-radius: 8px;
   border: 1px solid #e2e8f0;
+}
+.module-hint-after code {
+  font-family: ui-monospace, 'Cascadia Code', 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: #475569;
+  background: #e2e8f0;
+  padding: 1px 6px;
+  border-radius: 4px;
 }
 .module-expression-footer {
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 10px;
 }
-.module-expression-footer .el-input { flex: 1; }
+.module-expression-footer .el-input {
+  flex: 1;
+  min-width: 200px;
+}
+.oneclick-apply-modules {
+  flex-shrink: 0;
+  padding-left: 20px;
+  padding-right: 20px;
+}
 .oneclick-container {
   background: white;
   border-radius: 16px;
-  padding: 32px;
+  padding: 28px 32px 36px;
   box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
 }
-.one-click-form .el-divider { margin: 20px 0 16px; }
+.oneclick-section {
+  margin-bottom: 28px;
+  padding-bottom: 8px;
+}
+.oneclick-section:last-of-type {
+  margin-bottom: 0;
+}
+.oneclick-section-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #0f172a;
+  margin: 0 0 18px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #e2e8f0;
+  letter-spacing: 0.02em;
+}
+/* 顶部标签：表单项间距与标签行对齐 */
+.one-click-form :deep(.el-form-item) {
+  margin-bottom: 20px;
+}
+.one-click-form :deep(.el-form-item__label) {
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0;
+  line-height: 1.60;
+  padding-bottom: 8px;
+  height: auto !important;
+  word-break: keep-all;
+  white-space: normal;
+  font-weight: 600;
+  color: #334155;
+}
+.one-click-form :deep(.el-form-item__content) {
+  line-height: 1.5;
+}
+.oneclick-fields-grid {
+  display: grid;
+  row-gap: 22px;
+  column-gap: 28px;
+  align-items: stretch;
+  margin-bottom: 8px;
+}
+/* 基础配置首行网格与下一表单项之间略增底距（与 .oneclick-form-item--radio 上边距叠加） */
+.oneclick-section:first-of-type > .oneclick-fields-grid {
+  margin-bottom: 16px;
+}
+.oneclick-fields-grid--2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.oneclick-fields-grid :deep(.el-form-item) {
+  margin-bottom: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  width: 100%;
+  min-width: 0;
+}
+.oneclick-fields-grid :deep(.el-form-item__content) {
+  width: 100%;
+  flex: 1;
+}
+.oneclick-fields-grid :deep(.el-input),
+.oneclick-fields-grid :deep(.el-input-number),
+.oneclick-fields-grid :deep(.el-select) {
+  width: 100%;
+}
+.oneclick-fields-grid :deep(.el-input-number .el-input__wrapper) {
+  width: 100%;
+}
+.oneclick-form-item--full {
+  width: 100%;
+}
+/* 基础配置：两列表单项与下方「微调方式」之间留足纵向呼吸空间 */
+.oneclick-form-item--radio {
+  margin-top: 36px;
+  padding-top: 8px;
+}
+.oneclick-form-item--radio :deep(.el-form-item__content) {
+  width: 100%;
+}
+.oneclick-form-item--modules {
+  margin-top: 20px;
+}
+.oneclick-form-item--modules :deep(.el-form-item__content) {
+  width: 100%;
+}
+.oneclick-input-number {
+  width: 100%;
+}
+.oneclick-select-block {
+  width: 100%;
+}
+.oneclick-module-select {
+  width: 100%;
+}
+.oneclick-module-select :deep(.el-select__tags) {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+/* 已选标签与框内文案：中性灰，不用高亮蓝 */
+.oneclick-module-select :deep(.el-tag) {
+  --el-tag-text-color: #4b5563;
+  color: #4b5563;
+  background-color: #f3f4f6;
+  border-color: #e5e7eb;
+}
+.oneclick-module-select :deep(.el-tag .el-tag__content) {
+  color: #4b5563;
+}
+.oneclick-module-select :deep(.el-select__placeholder) {
+  color: #9ca3af;
+}
+.oneclick-module-select :deep(.el-select__selected-item) {
+  color: #4b5563;
+}
+.oneclick-radio-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 24px;
+  align-items: center;
+  width: 100%;
+  padding: 14px 18px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  box-sizing: border-box;
+}
+.oneclick-radio-group :deep(.el-radio) {
+  margin-right: 0;
+  height: auto;
+  align-items: flex-start;
+}
+.oneclick-radio-group :deep(.el-radio__label) {
+  line-height: 1.45;
+  white-space: normal;
+}
+.oneclick-switch-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  min-height: 36px;
+  padding: 8px 0;
+}
+.oneclick-switch-hint {
+  margin-left: 0;
+  color: #64748b;
+  font-size: 13px;
+}
+@media (max-width: 640px) {
+  .oneclick-fields-grid--2 {
+    grid-template-columns: 1fr;
+  }
+}
 .form-tip { font-size: 12px; color: #6b7280; margin-top: 4px; }
 .form-tip-inline { font-size: 12px; color: #6b7280; margin-left: 8px; }
 .label-with-help {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: nowrap;
+  max-width: 100%;
+  word-break: keep-all;
 }
 .label-with-help .param-help {
+  flex-shrink: 0;
   margin-left: 0;
   color: #9ca3af;
   cursor: help;
-  font-size: 14px;
+  font-size: 15px;
+  width: 1em;
+  height: 1em;
   vertical-align: middle;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
 }
 .label-with-help .param-help:hover { color: #3b82f6; }
 .oneclick-actions {
-  margin-top: 24px;
-  padding-top: 20px;
+  margin-top: 28px;
+  padding-top: 22px;
   border-top: 1px solid #e5e7eb;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
 }
-.train-status-card {
-  margin-top: 32px;
-  padding: 24px;
-  background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+.oneclick-actions .el-button {
+  min-width: 132px;
+}
+.only-script-checkbox :deep(.el-checkbox__label) {
+  font-size: 13px;
+  color: #64748b;
+}
+.train-runs-section {
+  margin-top: 28px;
+  padding: 20px 22px 22px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
   border-radius: 12px;
-  border: 1px solid #86efac;
+  box-sizing: border-box;
 }
-.train-status-header {
+.train-runs-header {
   display: flex;
   align-items: center;
-  gap: 10px;
-  font-size: 18px;
-  font-weight: 600;
-  color: #166534;
-  margin-bottom: 20px;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  font-weight: 700;
+  font-size: 15px;
+  color: #0f172a;
 }
-.train-status-header .status-icon { font-size: 24px; width: 24px; height: 24px; }
-.step-desc { margin-bottom: 8px; color: #374151; }
-.train-cmd {
-  padding: 12px 16px;
-  background: #166534;
-  color: white;
-  border-radius: 8px;
-  font-family: monospace;
-  font-size: 13px;
-  margin: 8px 0;
-  overflow-x: auto;
-}
-.train-cmd code { color: #fff; }
-.train-meta { font-size: 13px; color: #6b7280; margin-top: 12px; }
-.train-meta span { display: block; margin: 4px 0; }
-.train-runs-section { margin-top: 24px; padding-top: 20px; border-top: 1px solid #e5e7eb; }
-.train-runs-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; font-weight: 600; }
 .train-runs-table { font-size: 13px; }
 .selected-tip { margin-left: 12px; color: #16a34a; font-size: 14px; }
 .selected-tip strong { color: #15803d; }
-.oneclick-data-tip { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; padding: 12px; background: #f0fdf4; border-radius: 8px; font-size: 13px; color: #166534; }
-.oneclick-data-tip.muted { background: #f8fafc; color: #64748b; }
+.oneclick-data-tip {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 18px;
+  padding: 14px 16px;
+  background: #f0fdf4;
+  border-radius: 10px;
+  font-size: 14px;
+  line-height: 1.55;
+  color: #166534;
+  border: 1px solid #bbf7d0;
+}
+.oneclick-data-tip.muted {
+  background: #f1f5f9;
+  color: #475569;
+  border-color: #e2e8f0;
+}
 .oneclick-data-tip svg { font-size: 18px; flex-shrink: 0; width: 18px; height: 18px; }
 
 /* 原文链接徽章 */
@@ -2578,5 +2797,29 @@ onActivated(async () => {
   to {
     transform: rotate(360deg);
   }
+}
+</style>
+
+<!-- 目标模块下拉挂到 body，用 popper-class 统一为灰色文案 -->
+<style>
+.oneclick-module-grey-popper .el-select-dropdown__item {
+  color: #6b7280 !important;
+}
+.oneclick-module-grey-popper .el-select-dropdown__item.is-hovering,
+.oneclick-module-grey-popper .el-select-dropdown__item:hover {
+  color: #374151 !important;
+  background-color: #f9fafb !important;
+}
+.oneclick-module-grey-popper .el-select-dropdown__item.is-selected {
+  color: #4b5563 !important;
+  font-weight: 500;
+  background-color: #f3f4f6 !important;
+}
+.oneclick-module-grey-popper li[role='option'] {
+  color: #6b7280 !important;
+}
+.oneclick-module-grey-popper li[role='option'].is-hovering,
+.oneclick-module-grey-popper li[role='option']:hover {
+  color: #374151 !important;
 }
 </style>

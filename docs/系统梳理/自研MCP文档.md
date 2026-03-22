@@ -3,6 +3,8 @@
 > 本文专门讲你自己封装并在本项目实际使用的 MCP。  
 > 当前业务主 MCP 为：`mcp-content-extractor`。
 
+**仓库目录总览**（`mcp/` 与 `backend/` 等）：[`docs/README.md`](../README.md)。
+
 ---
 
 ## 目录

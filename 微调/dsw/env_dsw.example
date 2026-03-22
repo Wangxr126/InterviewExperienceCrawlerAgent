@@ -1,0 +1,24 @@
+# 复制为 env_dsw.sh 后按需修改，在训练前执行: source env_dsw.sh
+# （不要把含真实 Token 的文件提交到 Git）
+#
+# pip 连不上时可换镜像（在 source 前也可直接 export）：
+# export PIP_INDEX=https://mirrors.aliyun.com/pypi/simple/
+# export PIP_INDEX=https://mirrors.cloud.tencent.com/pypi/simple
+
+# 国内拉模型（与 train_lora.py 默认一致，可省略）
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-300}"
+
+# 私有模型或限速时可能需要（可选）
+# export HF_TOKEN="hf_xxxxxxxx"
+
+# 冒烟测试：只跑少量步验证环境（可选，正式训练请注释或删掉）
+# export FINETUNE_MAX_STEPS=30
+# export FINETUNE_LOGGING_STEPS=1
+
+# 训练日志上报（可选）
+# export FINETUNE_REPORT_TO=tensorboard
+
+# Unsloth：Linux 上一般不必设；若编译异常可尝试
+# export UNSLOTH_COMPILE_DISABLE=1
+export TOKENIZERS_PARALLELISM=false

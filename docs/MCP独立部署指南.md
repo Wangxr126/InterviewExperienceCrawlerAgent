@@ -2,6 +2,8 @@
 
 本文档详细说明如何将 `mcp-content-fetcher` 和 `mcp-image-extractor` 从主项目中独立出来，作为单独的 Git 项目和 npm 包。
 
+在主仓库内，TypeScript MCP 通常位于 `mcp/<服务名>/`（与 `backend/`、`web/` 并列）；整体目录见 [`docs/README.md`](README.md)。
+
 ---
 
 ## 📋 前置条件

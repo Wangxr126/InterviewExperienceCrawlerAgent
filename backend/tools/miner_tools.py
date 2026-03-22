@@ -46,7 +46,10 @@ class OcrImagesTool(Tool):
 
         logger.info(f"[OcrTool] 开始 OCR，共 {len(self._image_paths)} 张图片")
         try:
-            from backend.services.crawler.ocr_service_mcp import ocr_images_to_text
+            from backend.services.crawler.ocr_service_mcp import (
+                is_remote_ocr_unconfigured,
+                ocr_images_to_text,
+            )
             result = ocr_images_to_text(self._image_paths, self._task_id)
             if result:
                 logger.info(f"[OcrTool] OCR 成功，识别字符数: {len(result)}")
@@ -55,7 +58,12 @@ class OcrImagesTool(Tool):
                     data={"image_count": len(self._image_paths), "char_count": len(result), "ocr_called": True}
                 )
             else:
-                logger.warning("[OcrTool] OCR 未识别到文字")
+                if is_remote_ocr_unconfigured():
+                    logger.error(
+                        "[OcrTool] remote OCR 不可用（缺少 OCR_REMOTE_* 配置），未识别到文字"
+                    )
+                else:
+                    logger.warning("[OcrTool] OCR 未识别到文字")
                 # 有图但无文字：业务上常记 warning，统计上应计为「未成功产出 OCR 内容」
                 return ToolResponse.partial(
                     text="未从图片中识别到有效文字，请结合正文判断或考虑标记无关。",

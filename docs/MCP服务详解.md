@@ -61,9 +61,9 @@ python mcp/mcp-content-extractor/server.py
     "content-extractor": {
       "command": "python",
       "args": ["mcp/mcp-content-extractor/server.py"],
-      "cwd": "e:/Agent/AgentProject/wxr_agent",
+      "cwd": "/path/to/wxr_agent",
       "env": {
-        "XHS_USER_DATA_DIR": "e:/Agent/AgentProject/wxr_agent/backend/data/xhs_user_data"
+        "XHS_USER_DATA_DIR": "/path/to/wxr_agent/backend/data/xhs_user_data"
       }
     }
   }
@@ -94,7 +94,7 @@ python mcp/mcp-content-extractor/server.py
 ### 架构
 
 ```
-mcp-content-fetcher/
+mcp/mcp-content-fetcher/
 ├── src/
 │   ├── index.ts              # MCP 服务入口
 │   └── content-fetcher.ts    # 爬取逻辑
@@ -170,7 +170,7 @@ npm start
 ### 架构
 
 ```
-mcp-image-extractor/
+mcp/mcp-image-extractor/
 ├── src/
 │   ├── index.ts           # MCP 服务入口
 │   └── image-utils.ts     # 图片处理逻辑
@@ -338,7 +338,7 @@ docker push <registry>/mcp-image-extractor
     "content-extractor": {
       "command": "python",
       "args": ["mcp/mcp-content-extractor/server.py"],
-      "cwd": "e:/Agent/AgentProject/wxr_agent"
+      "cwd": "/path/to/wxr_agent"
     },
     "content-fetcher": {
       "command": "node",
@@ -377,7 +377,7 @@ docker push <registry>/mcp-image-extractor
     "content-extractor": {
       "command": "python",
       "args": ["mcp/mcp-content-extractor/server.py"],
-      "cwd": "e:/Agent/AgentProject/wxr_agent"
+      "cwd": "/path/to/wxr_agent"
     },
     "content-fetcher": {
       "url": "https://content-fetcher.smithery.ai/mcp",

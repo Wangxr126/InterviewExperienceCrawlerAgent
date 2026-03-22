@@ -32,7 +32,8 @@ hello-agents==1.0.0       # hello_agents 框架（SimpleAgent / ReActAgent / Pla
 # ── 向量 & NLP ───────────────────────────────────────────────
 sentence-transformers==5.2.3
 transformers==4.57.6
-torch==2.10.0             # CPU 版；如有 GPU 可替换为对应 cuda 版本
+# torch：勿在此 pin 死版本。CPU 环境可事后执行 pip install torch==2.10.0。
+# Windows + GPU + Unsloth 微调：须先安装 2.5.1+cu124（2.6 与 triton-windows 不兼容，会无法 import Unsloth），见项目说明与同目录下注释「GPU 微调」。
 accelerate==1.12.0
 huggingface_hub==0.36.2
 scikit-learn==1.8.0
@@ -58,3 +59,12 @@ python-dotenv==1.2.1
 
 # ── MCP 服务器（content-extractor 等）──────────────────────
 fastmcp>=2.0.0
+
+# ── 可选：Unsloth 本地 LoRA 微调（与「生成并训练」后台脚本一致）────────────
+# 1) 需要 NVIDIA GPU + CUDA 版 PyTorch。Windows 请用 PyTorch 2.5.1+cu124（不要用 2.6+，与 triton-windows 冲突）。
+# 2) 国内用阿里云（先装 torch 三件套，再装 unsloth；勿再 pip 安装 torchao；xformers 无匹配 win 轮时可不装）：
+#      pip install torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 -i https://mirrors.aliyun.com/pypi/simple/ -f https://mirrors.aliyun.com/pytorch-wheels/cu124/ --default-timeout 300
+#      pip install unsloth -i https://mirrors.aliyun.com/pypi/simple/
+# 3) 拉取 HuggingFace 基座模型：训练脚本默认 HF_ENDPOINT=https://hf-mirror.com；可改环境变量或设官方源。
+# 4) 首次下载模型体积大、耗时长；验证链路可设环境变量 FINETUNE_MAX_STEPS=10 只跑少量步。
+# 5) 官方源： https://pytorch.org/get-started/locally/

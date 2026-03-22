@@ -59,6 +59,8 @@ class MinerReActAgent(ReActAgent):
 
         current_step = 0
         total_tokens = 0
+        # LLM 调用异常时 break 出循环，不能与「达到最大步数」混为一谈
+        llm_invoke_error: Exception | None = None
 
         if self.trace_logger:
             self.trace_logger.log_event(
@@ -68,9 +70,25 @@ class MinerReActAgent(ReActAgent):
 
         _ilog = logging.getLogger(__name__)
         _n = len(input_text)
-        _prev = input_text[:400] + ("…" if _n > 400 else "")
-        _ilog.info("🤖 %s 开始处理问题（%d 字，预览前 400 字）: %s", self.name, _n, _prev)
-        _ilog.debug("%s 完整 user 输入:\n%s", self.name, input_text)
+        try:
+            from backend.config.config import settings as _settings
+
+            _cap = int(getattr(_settings, "miner_log_input_preview_chars", 0) or 0)
+        except Exception:
+            _cap = 0
+        if _cap <= 0:
+            _prev = input_text
+            _ilog.info("🤖 %s 开始处理问题（完整日志 %d 字）: %s", self.name, _n, _prev)
+        else:
+            _prev = input_text[:_cap] + ("…" if _n > _cap else "")
+            _ilog.info(
+                "🤖 %s 开始处理问题（%d 字，预览前 %d 字，MINER_LOG_INPUT_PREVIEW_CHARS）: %s",
+                self.name,
+                _n,
+                _cap,
+                _prev,
+            )
+            _ilog.debug("%s 完整 user 输入:\n%s", self.name, input_text)
 
         while current_step < self.max_steps:
             current_step += 1
@@ -86,6 +104,7 @@ class MinerReActAgent(ReActAgent):
                     **kwargs
                 )
             except Exception as e:
+                llm_invoke_error = e
                 print(f"❌ LLM 调用失败: {e}")
                 if self.trace_logger:
                     self.trace_logger.log_event(
@@ -371,6 +390,25 @@ class MinerReActAgent(ReActAgent):
                     # 终止工具：调用后立即返回，不再执行后续步骤
                     if tool_name in TERMINATING_TOOLS and TERMINATING_SIGNAL in result:
                         return result
+
+        if llm_invoke_error is not None:
+            final_answer = f"抱歉，Stage1 模型调用失败：{llm_invoke_error}"
+            _ilog.error("%s %s", self.name, final_answer)
+            self.add_message(Message(input_text, "user"))
+            self.add_message(Message(final_answer, "assistant"))
+            if self.trace_logger:
+                duration = (datetime.now() - session_start_time).total_seconds()
+                self.trace_logger.log_event(
+                    "session_end",
+                    {
+                        "duration": duration,
+                        "total_steps": current_step,
+                        "final_answer": final_answer,
+                        "status": "llm_error",
+                    },
+                )
+                self.trace_logger.finalize()
+            return final_answer
 
         print("⏰ 已达到最大步数，流程终止。")
         final_answer = "抱歉，我无法在限定步数内完成这个任务。"

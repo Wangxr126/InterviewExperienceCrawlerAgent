@@ -23,6 +23,12 @@ def _get(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
 
 
+def _env_nonempty(key: str) -> bool:
+    """环境变量存在且非空白（# 注释行不会被 dotenv 加载，等价于「未设置」）。"""
+    v = os.environ.get(key)
+    return bool(v and str(v).strip())
+
+
 def _get_float(key: str, default: float) -> float:
     try:
         return float(os.environ.get(key, ""))
@@ -381,11 +387,17 @@ class _Settings:
     def finetune_llm_max_tokens(self) -> int:
         return _get_int("FINETUNE_LLM_MAX_TOKENS", 0) or self.llm_max_tokens
 
+    @property
+    def compare_finetuned_ollama_model(self) -> str:
+        """模型对比页「本地微调」槽位：Ollama 中已导入的模型名（如合并 LoRA 后的 GGUF），留空则该预设未就绪"""
+        return (_get("COMPARE_FINETUNED_OLLAMA_MODEL") or "").strip()
+
     # ── 4.6 Miner Agent（题目提取器）──────────────────────────────────
     @property
     def miner_mode(self) -> str:
-        """Miner使用模式：local/remote/two_stage，留空则使用全局LLM_MODE
-        two_stage=Stage1本地粗提取+Stage2豆包精加工（补充完整标准答案）"""
+        """Miner使用模式：local/remote/two_stage，留空则使用全局LLM_MODE。
+        two_stage：Stage1 粗提取由 MINER_STAGE1_MODE（local/remote）与 MINER_STAGE1_* 决定；
+        Stage2 精加工仍用 MINER_STAGE2_*。"""
         return _get("MINER_MODE") or self.llm_mode
 
     # 本地配置
@@ -416,7 +428,12 @@ class _Settings:
 
     @property
     def miner_remote_base_url(self) -> str:
-        return _get("MINER_REMOTE_BASE_URL") or self.llm_remote_base_url
+        # two_stage Stage1 可与 Stage2 共用火山 Ark：未单独配 MINER_REMOTE_BASE_URL 时回退 Stage2
+        return (
+            _get("MINER_REMOTE_BASE_URL")
+            or self.llm_remote_base_url
+            or _get("MINER_STAGE2_BASE_URL")
+        )
 
     @property
     def miner_remote_timeout(self) -> int:
@@ -424,7 +441,161 @@ class _Settings:
 
     @property
     def miner_remote_api_key(self) -> str:
-        return _get("MINER_REMOTE_API_KEY") or self.llm_remote_api_key
+        # 未单独配 MINER_REMOTE_API_KEY 时可用 Stage2 / 全局远程 Key（同一 Ark 账号时常共用）
+        return _get("MINER_REMOTE_API_KEY") or self.llm_remote_api_key or _get("MINER_STAGE2_API_KEY")
+
+    @property
+    def miner_remote_enable_thinking(self) -> bool:
+        """
+        通义 DashScope 等：非流式 chat.completions + tools 时若默认开启思考链会报
+        enable_thinking must be set to false for non-streaming calls。
+        默认 false：在 Stage1 请求 extra_body 中传 enable_thinking=false。
+        设为 true 则不传该字段（对接严格 OpenAI 官方、未知参数即报错时可试）。
+        """
+        return _get_bool("MINER_REMOTE_ENABLE_THINKING", False)
+
+    @property
+    def miner_remote_extra_body_json(self) -> Dict[str, Any]:
+        """可选 JSON，合并进 Stage1 的 chat.completions extra_body（后者覆盖同名键）"""
+        raw = _get("MINER_REMOTE_EXTRA_BODY_JSON")
+        if not raw:
+            return {}
+        try:
+            o = json.loads(raw)
+            return o if isinstance(o, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    @property
+    def miner_remote_stage1_extra_body(self) -> Dict[str, Any]:
+        """two_stage Stage1（Miner ReAct 非流式工具调用）附加给 OpenAI SDK 的 extra_body"""
+        body: Dict[str, Any] = {}
+        if not self.miner_remote_enable_thinking:
+            body["enable_thinking"] = False
+        body.update(self.miner_remote_extra_body_json)
+        return body
+
+    # ── two_stage：Stage1 与 Stage2 解耦（粗提取单独选本地或远程 + 远程多 Key）────────
+    @property
+    def miner_stage1_mode(self) -> str:
+        """仅 MINER_MODE=two_stage 时生效：Stage1 走 local 还是 remote。
+        未设置时默认 remote（与旧版「Stage1 用 MINER_REMOTE_*」一致）。"""
+        raw = (_get("MINER_STAGE1_MODE") or "").strip().lower()
+        if raw in ("local", "remote"):
+            return raw
+        return "remote"
+
+    @property
+    def miner_stage1_local_model(self) -> str:
+        return (_get("MINER_STAGE1_LOCAL_MODEL") or self.miner_local_model or "").strip()
+
+    @property
+    def miner_stage1_local_base_url(self) -> str:
+        return (_get("MINER_STAGE1_LOCAL_BASE_URL") or self.miner_local_base_url or "").strip().rstrip("/")
+
+    @property
+    def miner_stage1_local_api_key(self) -> str:
+        return (_get("MINER_STAGE1_LOCAL_API_KEY") or _get("MINER_LOCAL_API_KEY") or self.llm_local_api_key or "").strip()
+
+    @property
+    def miner_stage1_local_timeout(self) -> int:
+        v = _get_int("MINER_STAGE1_LOCAL_TIMEOUT", 0)
+        return v if v > 0 else self.miner_local_timeout
+
+    @property
+    def miner_stage1_remote_model(self) -> str:
+        """Stage1 远程主端点模型；未单独配置时回退 MINER_REMOTE_MODEL。"""
+        return (_get("MINER_STAGE1_REMOTE_MODEL") or self.miner_remote_model or "").strip()
+
+    @property
+    def miner_stage1_remote_base_url(self) -> str:
+        """Stage1 远程主端点 base；未单独配置时回退 MINER_REMOTE_BASE_URL（含 Stage2 回退链）。"""
+        explicit = (_get("MINER_STAGE1_REMOTE_BASE_URL") or "").strip().rstrip("/")
+        return explicit or self.miner_remote_base_url
+
+    @property
+    def miner_stage1_remote_api_key(self) -> str:
+        """Stage1 远程主端点 Key；未单独配置时回退 MINER_REMOTE_API_KEY。"""
+        return (_get("MINER_STAGE1_REMOTE_API_KEY") or self.miner_remote_api_key or "").strip()
+
+    @property
+    def miner_stage1_remote_timeout(self) -> int:
+        v = _get_int("MINER_STAGE1_REMOTE_TIMEOUT", 0)
+        return v if v > 0 else self.miner_remote_timeout
+
+    @property
+    def miner_stage1_remote_explicit_in_env(self) -> bool:
+        """是否有 MINER_STAGE1_REMOTE_MODEL/API_KEY/BASE_URL 任一在环境中显式设置（非注释）。"""
+        return any(
+            _env_nonempty(k)
+            for k in (
+                "MINER_STAGE1_REMOTE_MODEL",
+                "MINER_STAGE1_REMOTE_API_KEY",
+                "MINER_STAGE1_REMOTE_BASE_URL",
+            )
+        )
+
+    @property
+    def miner_stage1_fallback_models_in_env(self) -> bool:
+        return _env_nonempty("MINER_STAGE1_FALLBACK_MODELS")
+
+    @property
+    def miner_stage1_models(self) -> List[Dict[str, Any]]:
+        """two_stage 时 Stage1 端点链：local 仅 1 个；remote 为主 + MINER_STAGE1_FALLBACK_MODELS。
+        每项含 model, api_key, base_url, kind(local|remote), timeout。"""
+        if (self.miner_mode or "").lower() != "two_stage":
+            return []
+        if self.miner_stage1_mode == "local":
+            m, b = self.miner_stage1_local_model, self.miner_stage1_local_base_url
+            if not m or not b:
+                return []
+            return [
+                {
+                    "model": m,
+                    "api_key": self.miner_stage1_local_api_key or "ollama",
+                    "base_url": b,
+                    "kind": "local",
+                    "timeout": self.miner_stage1_local_timeout,
+                }
+            ]
+        pm = self.miner_stage1_remote_model
+        pb = self.miner_stage1_remote_base_url
+        pk = self.miner_stage1_remote_api_key
+        if not pm or not pb:
+            return []
+        to = self.miner_stage1_remote_timeout
+        result: List[Dict[str, Any]] = [
+            {"model": pm, "api_key": pk or "sk-dummy", "base_url": pb.rstrip("/"), "kind": "remote", "timeout": to}
+        ]
+        raw = _get("MINER_STAGE1_FALLBACK_MODELS", "").strip()
+        if not raw:
+            return result
+        try:
+            fallbacks = json.loads(raw)
+            if not isinstance(fallbacks, list):
+                return result
+            for item in fallbacks:
+                if not isinstance(item, dict) or not item.get("model"):
+                    continue
+                item_base = str(item.get("base_url") or pb).strip().rstrip("/")
+                item_to = to
+                if item.get("timeout") is not None:
+                    try:
+                        item_to = int(item["timeout"])
+                    except (TypeError, ValueError):
+                        pass
+                result.append(
+                    {
+                        "model": str(item["model"]),
+                        "api_key": str(item.get("api_key") or pk or "sk-dummy"),
+                        "base_url": item_base,
+                        "kind": "remote",
+                        "timeout": item_to,
+                    }
+                )
+        except json.JSONDecodeError:
+            pass
+        return result
 
     # 当前使用的配置（根据mode选择）
     @property
@@ -460,6 +631,34 @@ class _Settings:
         return _get_int("MINER_MAX_TOKENS", 0) or self.llm_max_tokens
 
     @property
+    def miner_remote_max_tokens_cap(self) -> int:
+        """
+        two_stage Stage1 远程「期望」的 max_tokens 上限（省配额时可调小）。
+        设为 0 或未设置时使用 16384。实际请求还会与 miner_stage1_api_max_tokens 取 min，
+        避免通义等网关报 max_tokens 超范围。
+        """
+        v = _get_int("MINER_REMOTE_MAX_TOKENS", 0)
+        return v if v > 0 else 16384
+
+    @property
+    def miner_stage1_api_max_tokens(self) -> int:
+        """
+        Stage1 所用 OpenAI 兼容网关对 completion 的 max_tokens 硬上限。
+        部分通义模型报 [1, 8192]，部分为 [1, 16384]；默认取 8192 以兼容较严的模型。
+        若你确认当前模型允许更大输出，可在 .env 设置 MINER_STAGE1_API_MAX_TOKENS=16384。
+        """
+        v = _get_int("MINER_STAGE1_API_MAX_TOKENS", 0)
+        return v if v > 0 else 8192
+
+    @property
+    def miner_stage1_max_tokens(self) -> int:
+        """Stage1 实际 max_tokens：min(MINER_MAX_TOKENS, 配置上限, 网关硬上限)，至少 1。"""
+        remote = self.miner_remote_max_tokens_cap
+        api_cap = self.miner_stage1_api_max_tokens
+        cap = min(remote, api_cap)
+        return max(1, min(self.miner_max_tokens, cap))
+
+    @property
     def miner_max_retries(self) -> int:
         """题目提取失败时的最大重试次数（返回空或格式错误时重试）"""
         return _get_int("MINER_MAX_RETRIES", 3)
@@ -478,6 +677,11 @@ class _Settings:
     def miner_max_steps(self) -> int:
         """Miner Agent 最大步数（含 OCR、TodoWrite、Finish 等工具调用）"""
         return _get_int("MINER_MAX_STEPS", 100)
+
+    @property
+    def miner_log_input_preview_chars(self) -> int:
+        """Miner ReAct INFO 日志中用户输入截断长度。0=不截断（完整写入，长文日志会很大）；>0 则截断并加省略号。"""
+        return _get_int("MINER_LOG_INPUT_PREVIEW_CHARS", 0)
 
     # ── 两阶段 Miner：Stage 2 豆包配置（精加工阶段）────────────────────────
     @property
@@ -914,7 +1118,7 @@ class _Settings:
 
     @property
     def miner_two_stage_log_path(self) -> str:
-        """两阶段提取日志路径（Stage1 本地 + Stage2 豆包 对比，用于微调）"""
+        """两阶段提取日志路径（Stage1 MINER_REMOTE + Stage2 豆包 对比，用于微调）"""
         p = _get("MINER_TWO_STAGE_LOG", "").strip()
         if p:
             return _resolve_data_path(p)

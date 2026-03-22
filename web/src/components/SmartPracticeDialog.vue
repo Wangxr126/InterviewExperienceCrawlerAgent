@@ -1,7 +1,7 @@
 <template>
   <el-dialog
     v-model="visible"
-    width="640px"
+    width="720px"
     align-center
     destroy-on-close
     :show-close="false"
@@ -52,13 +52,24 @@
                 {{ question.position }}
               </el-tag>
               <el-tag
-                v-for="t in (question.topic_tags || [])"
+                v-for="t in (question.topic_tags || []).slice(0, 8)"
                 :key="t"
                 size="small"
                 class="meta-tag"
               >
                 {{ t }}
               </el-tag>
+            </div>
+            <!-- 推荐题：展示 Rerank 后相关性分 + 多路召回融合分（重排前） -->
+            <div v-if="showSmartRankLine" class="sp-rank-line">
+              <template v-if="rerankScoreDisplay != null">
+                <span class="sp-rank-item">重排后得分 <strong>{{ rerankScoreDisplay }}</strong></span>
+              </template>
+              <template v-if="preRerankScoreDisplay != null">
+                <span class="sp-rank-sep" v-if="rerankScoreDisplay != null">·</span>
+                <span class="sp-rank-item">重排前融合分 <strong>{{ preRerankScoreDisplay }}</strong></span>
+              </template>
+              <span v-if="rerankScoreDisplay == null && preRerankScoreDisplay == null" class="sp-rank-muted">（本次未记录排序分数）</span>
             </div>
           </div>
 
@@ -72,17 +83,18 @@
             <el-input
               v-model="myAnswer"
               type="textarea"
-              :rows="4"
-              :autosize="{ minRows: 4, maxRows: 8 }"
+              :rows="5"
+              :autosize="{ minRows: 5, maxRows: 10 }"
               placeholder="输入你的回答..."
               class="answer-input"
             />
           </div>
 
-          <div class="sp-score-card" :class="scoreClass">
-            <span class="score-label">得分</span>
-            <span class="score-value">{{ typeof displayScore === 'number' ? displayScore.toFixed(1) : displayScore }}/5</span>
-            <span v-if="displayScore !== '—'" class="score-emoji">{{ displayScoreEmoji }}</span>
+          <div class="sp-score-strip" :class="scoreClass">
+            <span class="score-strip-label">得分</span>
+            <span class="score-strip-value">{{ typeof displayScore === 'number' ? displayScore.toFixed(1) : displayScore }}</span>
+            <span class="score-strip-denom">/ 5</span>
+            <span v-if="displayScore !== '—'" class="score-strip-emoji" aria-hidden="true">{{ displayScoreEmoji }}</span>
           </div>
 
           <div
@@ -140,7 +152,7 @@
                 placement="top"
               >
                 <el-button
-                  class="btn-answer"
+                  plain
                   :disabled="!standardAnswer"
                   @click="showAnswer = !showAnswer"
                 >
@@ -149,17 +161,13 @@
               </el-tooltip>
               <el-button
                 v-if="question?.source_url"
-                class="btn-source"
+                plain
                 @click="openSourceUrl"
               >
                 查看原帖
               </el-button>
-              <el-button class="btn-chat" @click.stop="handleSendToChat">去对话练习</el-button>
-              <el-button
-                class="btn-submit"
-                :loading="submitting"
-                @click="submit"
-              >
+              <el-button link type="primary" @click.stop="handleSendToChat">去对话练习</el-button>
+              <el-button type="primary" :loading="submitting" @click="submit">
                 提交作答
               </el-button>
             </div>
@@ -172,6 +180,18 @@
 
 <script setup>
 import { ref, computed, watch } from 'vue'
+
+/** 展示召回/重排分数：模型尺度不一，统一保留有效数字 */
+function formatRankScore(v) {
+  if (v == null || v === '') return null
+  const n = Number(v)
+  if (!Number.isFinite(n)) return null
+  const a = Math.abs(n)
+  if (a >= 100) return n.toFixed(2)
+  if (a >= 10) return n.toFixed(3)
+  if (a >= 1) return n.toFixed(4)
+  return n.toFixed(5)
+}
 import { ElMessage } from 'element-plus'
 import { formatAnswerToHtml } from '../utils/formatAnswer.js'
 import { postprocessFeedbackHtml } from '../utils/question-renderer.js'
@@ -191,6 +211,18 @@ const visible = computed({
   get: () => props.modelValue,
   set: (v) => emit('update:modelValue', v),
 })
+
+const showSmartRankLine = computed(
+  () => props.question?.smart_type === 'recommend'
+)
+
+const rerankScoreDisplay = computed(() =>
+  formatRankScore(props.question?.rerank_score)
+)
+
+const preRerankScoreDisplay = computed(() =>
+  formatRankScore(props.question?.recall_score)
+)
 
 const myAnswer = ref('')
 const submitting = ref(false)
@@ -315,20 +347,22 @@ const handleNextClick = () => {
 
 <style scoped>
 .smart-practice-dialog :deep(.el-dialog) {
-  border-radius: 16px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+  width: min(720px, 96vw) !important;
+  border-radius: var(--radius, 12px);
+  box-shadow: var(--shadow, 0 8px 32px rgba(0, 0, 0, 0.12));
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  border: 1px solid var(--border, #e5e7eb);
 }
 
 .smart-practice-dialog :deep(.el-overlay) {
-  background-color: rgba(0, 0, 0, 0.4);
+  background-color: rgba(0, 0, 0, 0.45);
 }
 
 .smart-practice-dialog :deep(.el-dialog__header) {
   padding: 0;
-  border-bottom: 1px solid #e5e7eb;
+  border-bottom: 1px solid var(--border, #e5e7eb);
   flex-shrink: 0;
 }
 
@@ -350,7 +384,7 @@ const handleNextClick = () => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  max-height: 70vh;
+  max-height: min(78vh, 820px);
 }
 
 .sp-body {
@@ -358,46 +392,46 @@ const handleNextClick = () => {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 20px 24px;
+  gap: 28px;
+  padding: 26px 28px 30px;
 }
 
 .sp-footer-fixed {
   flex-shrink: 0;
-  border-top: 1px solid #e5e7eb;
-  background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%);
-  padding: 14px 24px;
+  border-top: 1px solid var(--border, #e5e7eb);
+  background: var(--card-bg, #fff);
+  padding: 16px 24px 18px;
 }
 
 .sp-header-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 24px 28px;
-  background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+  padding: 18px 24px;
+  background: var(--card-bg, #fff);
 }
 
 .sp-header-title {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
 }
 
 .sp-title {
-  font-size: 20px;
-  font-weight: 800;
-  color: #4F46E5;
-  letter-spacing: -0.5px;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text-main, #1a1a2e);
+  letter-spacing: 0.02em;
 }
 
 .sp-progress-badge {
   font-size: 12px;
-  font-weight: 700;
-  color: #4F46E5;
-  background: linear-gradient(135deg, #eef2ff 0%, #f3f4f6 100%);
-  padding: 6px 12px;
-  border-radius: 20px;
-  border: 1px solid #e0e7ff;
+  font-weight: 600;
+  color: var(--primary, #5b6ef5);
+  background: var(--primary-light, #eef0fe);
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(91, 110, 245, 0.2);
   display: inline-block;
 }
 
@@ -427,24 +461,53 @@ const handleNextClick = () => {
 .sp-question-section {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 18px;
-  background: linear-gradient(135deg, #f8fafc 0%, #f0f4ff 100%);
-  border: 1px solid #e0e7ff;
-  border-radius: 12px;
+  gap: 16px;
+  padding: 22px 22px 20px;
+  background: #fafbfc;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: var(--radius, 12px);
 }
 
 .q-full-text {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
-  line-height: 1.6;
-  color: #1f2937;
+  line-height: 1.72;
+  color: var(--text-main, #1a1a2e);
 }
 
 .meta-row {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  padding-top: 2px;
+}
+
+.sp-rank-line {
+  font-size: 13px;
+  color: var(--text-sub, #64748b);
+  line-height: 1.6;
+  padding-top: 12px;
+  margin-top: 4px;
+  border-top: 1px dashed #e2e8f0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.sp-rank-item strong {
+  color: var(--text-main, #334155);
+  font-weight: 600;
+}
+
+.sp-rank-sep {
+  color: #cbd5e1;
+  user-select: none;
+}
+
+.sp-rank-muted {
+  color: #94a3b8;
+  font-size: 12px;
 }
 
 .meta-tag {
@@ -464,11 +527,11 @@ const handleNextClick = () => {
 }
 
 .section-title {
-  font-size: 12px;
-  font-weight: 800;
-  color: #374151;
-  text-transform: uppercase;
-  letter-spacing: 0.8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-sub, #6b7280);
+  letter-spacing: 0.02em;
+  margin-bottom: 2px;
 }
 
 .ref-answer {
@@ -498,118 +561,109 @@ const handleNextClick = () => {
 .sp-input-section {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 14px;
 }
 
 .answer-input :deep(.el-textarea__inner) {
   font-size: 14px;
-  line-height: 1.7;
-  border-radius: 8px;
-  border: 1.5px solid #d1d5db;
-  background: white;
-  transition: all 0.25s ease;
-  min-height: 100px;
+  line-height: 1.65;
+  border-radius: 10px;
+  border: 1px solid var(--border, #e5e7eb);
+  background: #fff;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  min-height: 120px;
   resize: vertical;
+  padding: 14px 16px;
 }
 
 .answer-input :deep(.el-textarea__inner::placeholder) {
-  color: #d1d5db;
+  color: #9ca3af;
 }
 
 .answer-input :deep(.el-textarea__inner:focus) {
-  border-color: #4F46E5;
-  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+  border-color: var(--primary, #5b6ef5);
+  box-shadow: 0 0 0 2px rgba(91, 110, 245, 0.12);
   outline: none;
 }
 
-.sp-score-card {
+/* 得分：单行轻量条，不再用大色块卡片 */
+.sp-score-strip {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 14px;
-  padding: 18px;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  padding: 12px 16px;
   background: #f3f4f6;
   border-radius: 10px;
-  border: 1px solid #e5e7eb;
-  transition: all 0.3s ease;
+  border: 1px solid var(--border, #e5e7eb);
 }
 
-.sp-score-card.score-high {
-  background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%);
-  border-color: #86efac;
+.sp-score-strip.score-high {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
 }
 
-.sp-score-card.score-medium {
-  background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
-  border-color: #fcd34d;
+.sp-score-strip.score-medium {
+  background: #fffbeb;
+  border-color: #fde68a;
 }
 
-.sp-score-card.score-low {
-  background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
-  border-color: #fca5a5;
+.sp-score-strip.score-low {
+  background: #fef2f2;
+  border-color: #fecaca;
 }
 
-.score-label {
-  font-size: 12px;
+.score-strip-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-sub, #6b7280);
+}
+
+.score-strip-value {
+  font-size: 20px;
   font-weight: 700;
-  color: #6b7280;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
+  color: var(--primary, #5b6ef5);
+  line-height: 1;
 }
 
-.score-value {
-  font-size: 28px;
-  font-weight: 900;
-  color: #4F46E5;
+.score-strip-denom {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-sub, #6b7280);
 }
 
-.sp-score-card.score-high .score-value {
-  color: #22c55e;
+.sp-score-strip.score-high .score-strip-value {
+  color: #16a34a;
 }
 
-.sp-score-card.score-medium .score-value {
-  color: #f59e0b;
+.sp-score-strip.score-medium .score-strip-value {
+  color: #d97706;
 }
 
-.sp-score-card.score-low .score-value {
-  color: #ef4444;
+.sp-score-strip.score-low .score-strip-value {
+  color: #dc2626;
 }
 
-.score-emoji {
-  font-size: 28px;
-  animation: bounce 0.6s cubic-bezier(0.68, -0.55, 0.265, 1.55);
-}
-
-@keyframes bounce {
-  0%, 100% { transform: scale(1); }
-  50% { transform: scale(1.25); }
+.score-strip-emoji {
+  font-size: 18px;
+  margin-left: 4px;
+  line-height: 1;
 }
 
 .eval-result {
-  padding: 14px;
+  padding: 16px 18px;
   border-radius: 10px;
-  border-left: 4px solid;
-  animation: slideIn 0.3s ease-out;
-}
-
-@keyframes slideIn {
-  from {
-    opacity: 0;
-    transform: translateY(-10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  border: 1px solid var(--border, #e5e7eb);
+  border-left-width: 3px;
 }
 
 .eval-result.good {
-  background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%);
+  background: #f8fafc;
   border-left-color: #22c55e;
 }
 
 .eval-result.bad {
-  background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
+  background: #fafafa;
   border-left-color: #ef4444;
 }
 
@@ -678,7 +732,8 @@ const handleNextClick = () => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 20px;
+  flex-wrap: wrap;
 }
 
 .footer-nav {
@@ -708,11 +763,9 @@ const handleNextClick = () => {
 }
 
 .btn-nav:hover:not(:disabled) {
-  border-color: #4F46E5;
-  color: #4F46E5;
-  background: #eef2ff;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(79, 70, 229, 0.15);
+  border-color: var(--primary, #5b6ef5);
+  color: var(--primary, #5b6ef5);
+  background: var(--primary-light, #eef0fe);
 }
 
 .btn-nav:disabled {
@@ -730,82 +783,24 @@ const handleNextClick = () => {
 
 .footer-buttons {
   display: flex;
-  gap: 8px;
-  flex-wrap: nowrap;
+  gap: 10px;
+  flex-wrap: wrap;
   justify-content: flex-end;
+  align-items: center;
   flex-shrink: 0;
 }
 
 .footer-buttons :deep(.el-button) {
-  height: 36px;
   border-radius: 8px;
   font-weight: 600;
   font-size: 13px;
-  transition: all 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
-  border: none;
-  padding: 0 14px;
+  padding: 8px 16px;
   white-space: nowrap;
 }
 
-.btn-answer {
-  border: 1.5px solid #22c55e !important;
-  color: #22c55e !important;
-  background: white !important;
-}
-
-.btn-answer:hover {
-  background: #f0fdf4 !important;
-  border-color: #16a34a !important;
-  color: #16a34a !important;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(34, 197, 94, 0.15);
-}
-
-.btn-answer:disabled {
-  border-color: #d1d5db !important;
-  color: #d1d5db !important;
-  opacity: 0.5;
-}
-
-.btn-source {
-  border: 1.5px solid #d1d5db !important;
-  color: #6b7280 !important;
-  background: white !important;
-}
-
-.btn-source:hover {
-  border-color: #9ca3af !important;
-  color: #374151 !important;
-  background: #f9fafb !important;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
-}
-
-.btn-chat {
-  background: #f3f4f6 !important;
-  color: #374151 !important;
-  border: none !important;
-}
-
-.btn-chat:hover {
-  background: #e5e7eb !important;
-  color: #1f2937 !important;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
-}
-
-.btn-submit {
-  background: linear-gradient(135deg, #4F46E5 0%, #6366f1 100%) !important;
-  color: white !important;
-  border: none !important;
-  box-shadow: 0 4px 15px rgba(79, 70, 229, 0.3);
-  font-weight: 700;
-}
-
-.btn-submit:hover {
-  background: linear-gradient(135deg, #4338ca 0%, #4f46e5 100%) !important;
-  transform: translateY(-2px);
-  box-shadow: 0 8px 25px rgba(79, 70, 229, 0.4);
+.footer-buttons :deep(.el-button--primary) {
+  padding-left: 18px;
+  padding-right: 18px;
 }
 
 .sp-body::-webkit-scrollbar {

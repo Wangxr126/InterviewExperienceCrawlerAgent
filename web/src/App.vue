@@ -49,6 +49,7 @@
         <GraphRagView v-show="currentView === 'graph_rag'"
                       :user-id="userId"
                       :is-active="currentView === 'graph_rag'" />
+        <ModelCompareView v-show="currentView === 'model_compare'" />
       </main>
     </div>
 
@@ -73,6 +74,7 @@ import ReportView   from './views/ReportView.vue'
 import FinetuneView from './views/FinetuneView.vue'
 import ToolUsageView from './views/ToolUsageView.vue'
 import GraphRagView from './views/GraphRagView.vue'
+import ModelCompareView from './views/ModelCompareView.vue'
 import MasteryDialog from './components/MasteryDialog.vue'
 
 const chatStore   = useChatStore()
@@ -101,6 +103,7 @@ const navItems = [
   { key: 'finetune', icon: '🧪', label: '微调标注' },
   { key: 'tool_usage', icon: '🧰', label: '工具统计' },
   { key: 'graph_rag', icon: '🕸️', label: 'GraphRAG' },
+  { key: 'model_compare', icon: '⚖️', label: '模型对比' },
 ]
 
 const loadMeta = async () => {

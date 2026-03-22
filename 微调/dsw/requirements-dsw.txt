@@ -1,0 +1,22 @@
+# =============================================================================
+# 与仓库根目录 requirements.txt 中「GPU 微调 / Unsloth」说明对齐的版本
+# （本地 NewCoderAgent：先按 requirements.txt 装全栈；微调再按该文件第 63–67 行注释执行）
+#
+# Linux / DSW：PyTorch 用 cu121 官方轮子（等价于本地的 cu124，仅 CUDA 构建不同）
+# 勿在系统 Python 里 pip install -r；请仅用 install_venv_dsw.sh 创建的 venv。
+# =============================================================================
+
+# —— 与 requirements.txt 完全一致 ——
+transformers==4.57.6
+accelerate==1.12.0
+huggingface_hub==0.36.2
+
+# —— 训练脚本直接用到 ——
+datasets>=3.0.0
+trl>=0.12.0
+bitsandbytes>=0.44.0
+sentencepiece>=0.2.0
+peft>=0.14.0
+
+# Unsloth（与本地「pip install unsloth」同语义；下限避免过旧 wheel）
+unsloth>=2024.12.2

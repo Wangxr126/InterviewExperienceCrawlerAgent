@@ -92,7 +92,12 @@ def _save_two_stage_log(content: str, stage1_output: str, stage2_output: str, st
             "content_preview": (content or "")[:500] + ("..." if len(content or "") > 500 else ""),
             "stage1_output": stage1_output,
             "stage2_output": stage2_output,
-            "stage1_model": settings.miner_local_model,
+            "stage1_model": (
+                (settings.miner_stage1_remote_model if settings.miner_stage1_mode == "remote" else settings.miner_stage1_local_model)
+                or settings.miner_remote_model
+                or settings.miner_local_model
+                or ""
+            ).strip(),
             "stage2_model": stage2_model,
         }
         with open(log_path, "a", encoding="utf-8") as f:
@@ -113,14 +118,24 @@ def _process_single_item(
             rough_questions = []
         enrich_clean = _extract_json_from_stage2(enrich_result)
         try:
-            stage1_str = item.get("stage1_output") or json.dumps(rough_questions, ensure_ascii=False)
+            # 优先 rough_questions：含 Stage1 预分配 q_id；旧数据仅有 stage1_output
+            rq = (item.get("rough_questions") or "").strip()
+            stage1_str = rq if rq else (item.get("stage1_output") or "[]")
             merged = _merge_stage2_with_stage1(enrich_clean, stage1_str)
         except Exception:
             # Stage2 解析失败，降级用 Stage1 结果
-            merged = json.dumps([
-                {**q, "answer_text": q.get("answer_text", ""), "raw_answer": q.get("answer_text", "")}
-                for q in rough_questions if isinstance(q, dict) and q.get("question_text")
-            ], ensure_ascii=False)
+            merged = json.dumps(
+                [
+                    {
+                        **q,
+                        "answer_text": q.get("answer_text", ""),
+                        "raw_answer": q.get("raw_answer") or q.get("answer_text", ""),
+                    }
+                    for q in rough_questions
+                    if isinstance(q, dict) and q.get("question_text")
+                ],
+                ensure_ascii=False,
+            )
         # 允许 answer_text 中保留 Markdown 换行等控制字符（不做清洗）
         # 只要求整体结构是 JSON 数组对象：[{...}, {...}]
         questions = json.loads(merged, strict=False)
@@ -131,50 +146,141 @@ def _process_single_item(
         stage1_output = item.get("stage1_output") or ""
         source_url = item.get("source_url") or ""
 
-        # 写 questions 表（与 scheduler._save_questions 一致）
+        # 写 questions：若合并结果含 q_id（Stage1 已入库）则 UPDATE；否则降级为删 url 后 INSERT（旧队列）
         company = item.get("company") or ""
         position = item.get("position") or ""
         crawl_task_id = None
+        listed = [
+            q for q in questions
+            if isinstance(q, dict) and (q.get("question_text") or "").strip()
+        ]
+        all_have_qid = bool(listed) and all((str(q.get("q_id") or "").strip()) for q in listed)
+        extraction_src = "image" if bool(item.get("ocr_called")) else "content"
+
         with sqlite_service._get_conn() as conn:
-            r = conn.execute("SELECT id FROM crawl_tasks WHERE task_id=?", (task_id,)).fetchone()
+            r = conn.execute(
+                "SELECT id, source_platform FROM crawl_tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
             if r:
                 crawl_task_id = r["id"]
-            # 幂等：同一条 crawl_task 可能因崩溃/重试被重复消费
-            # 先清空 questions，避免生成随机 q_id 造成重复数据。
-            if source_url:
-                conn.execute("DELETE FROM questions WHERE source_url=?", (source_url,))
-            for q in questions:
-                if not isinstance(q, dict) or not q.get("question_text"):
-                    continue
-                q_id = str(uuid.uuid4())
-                tags = q.get("topic_tags") or []
-                if isinstance(tags, str):
-                    try:
-                        tags = json.loads(tags)
-                    except Exception:
+            plat = (r["source_platform"] if r else "") or ""
+
+            if all_have_qid and source_url:
+                for q in listed:
+                    q_id = str(q["q_id"]).strip()
+                    tags = q.get("topic_tags") or []
+                    if isinstance(tags, str):
+                        try:
+                            tags = json.loads(tags)
+                        except Exception:
+                            tags = []
+                    if not isinstance(tags, list):
                         tags = []
-                conn.execute("""
-                    INSERT OR IGNORE INTO questions
-                        (q_id, question_text, answer_text, raw_answer, difficulty, question_type,
-                         source_platform, source_url, company, position, business_line,
-                         topic_tags, extraction_source, crawl_task_id, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """, (
-                    q_id, q.get("question_text", ""), q.get("answer_text", ""), q.get("raw_answer", ""),
-                    q.get("difficulty", "medium"), q.get("question_type", "技术题"),
-                    "", source_url, company, position, "",
-                    json.dumps(tags, ensure_ascii=False),
-                    "image" if item.get("ocr_called") else "content",
-                    crawl_task_id,
-                ))
+                    _bl = q.get("business_line")
+                    business_line = (_bl if isinstance(_bl, str) else str(_bl or ""))[:500]
+                    _co = (q.get("company") or company) or ""
+                    _po = (q.get("position") or position) or ""
+                    cur = conn.execute(
+                        """
+                        UPDATE questions SET
+                            question_text=?, answer_text=?, raw_answer=?, difficulty=?, question_type=?,
+                            source_platform=?, source_url=?, company=?, position=?, business_line=?,
+                            topic_tags=?, extraction_source=?, crawl_task_id=?, updated_at=CURRENT_TIMESTAMP
+                        WHERE q_id=?
+                        """,
+                        (
+                            q.get("question_text", ""),
+                            q.get("answer_text", ""),
+                            q.get("raw_answer", ""),
+                            q.get("difficulty", "medium"),
+                            q.get("question_type", "技术题"),
+                            plat,
+                            source_url,
+                            _co[:500],
+                            _po[:500],
+                            business_line,
+                            json.dumps(tags, ensure_ascii=False),
+                            extraction_src,
+                            crawl_task_id,
+                            q_id,
+                        ),
+                    )
+                    if cur.rowcount == 0:
+                        conn.execute(
+                            """
+                            INSERT INTO questions
+                                (q_id, question_text, answer_text, raw_answer, difficulty, question_type,
+                                 source_platform, source_url, company, position, business_line,
+                                 topic_tags, extraction_source, crawl_task_id, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                            """,
+                            (
+                                q_id,
+                                q.get("question_text", ""),
+                                q.get("answer_text", ""),
+                                q.get("raw_answer", ""),
+                                q.get("difficulty", "medium"),
+                                q.get("question_type", "技术题"),
+                                plat,
+                                source_url,
+                                _co[:500],
+                                _po[:500],
+                                business_line,
+                                json.dumps(tags, ensure_ascii=False),
+                                extraction_src,
+                                crawl_task_id,
+                            ),
+                        )
+            else:
+                if source_url:
+                    conn.execute("DELETE FROM questions WHERE source_url=?", (source_url,))
+                for q in listed:
+                    q_id = str(q.get("q_id") or uuid.uuid4())
+                    tags = q.get("topic_tags") or []
+                    if isinstance(tags, str):
+                        try:
+                            tags = json.loads(tags)
+                        except Exception:
+                            tags = []
+                    if not isinstance(tags, list):
+                        tags = []
+                    _bl = q.get("business_line")
+                    business_line = (_bl if isinstance(_bl, str) else str(_bl or ""))[:500]
+                    _co = (q.get("company") or company) or ""
+                    _po = (q.get("position") or position) or ""
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO questions
+                            (q_id, question_text, answer_text, raw_answer, difficulty, question_type,
+                             source_platform, source_url, company, position, business_line,
+                             topic_tags, extraction_source, crawl_task_id, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            q_id,
+                            q.get("question_text", ""),
+                            q.get("answer_text", ""),
+                            q.get("raw_answer", ""),
+                            q.get("difficulty", "medium"),
+                            q.get("question_type", "技术题"),
+                            plat,
+                            source_url,
+                            _co[:500],
+                            _po[:500],
+                            business_line,
+                            json.dumps(tags, ensure_ascii=False),
+                            extraction_src,
+                            crawl_task_id,
+                        ),
+                    )
             conn.commit()
 
         # 更新 crawl_tasks（须写入 extraction_source，否则默认空串会变成 NULL，列表「来源」一直为 --）
-        extraction_src = "image" if bool(item.get("agent_used_tool")) else "content"
         sqlite_service.update_task_status(
             task_id,
             "done",
-            questions_count=len(questions),
+            questions_count=len(listed),
             extraction_source=extraction_src,
             agent_used_tool=bool(item.get("agent_used_tool")),
             trace_session_id=item.get("trace_session_id") or None,
@@ -183,7 +289,7 @@ def _process_single_item(
         # 保存两阶段日志
         _save_two_stage_log(content, stage1_output, merged, model_used)
 
-        logger.info("[Stage2Processor] 完成 task_id=%s 题目数=%d", task_id, len(questions))
+        logger.info("[Stage2Processor] 完成 task_id=%s 题目数=%d", task_id, len(listed))
         try:
             sqlite_service.mark_stage2_pending_done(task_id)
         except Exception:
@@ -208,9 +314,20 @@ def _process_single_item(
 
 
 def _is_retryable_api_error(e: Exception) -> bool:
-    """429/503 等可重试的 API 错误，应切换备用模型"""
+    """应放弃当前模型、改试模型链下一项的情况（非「彻底不可用」类错误）。"""
     msg = str(e).lower()
-    return "429" in msg or "503" in msg or "setlimit" in msg or "toomanyrequests" in msg
+    if "429" in msg or "503" in msg or "setlimit" in msg or "toomanyrequests" in msg:
+        return True
+    # 404：该接入点未开通、模型 ID 与方舟控制台不一致、或账号无权限 —— 应换备用模型而非整条任务判死
+    if "status=404" in msg or "invalidendpoint" in msg or "notfound" in msg:
+        return True
+    # 400：接入点绑定了非 Chat 类模型（如 Seedream 仅支持生图 API），应换下一个 ep
+    if "status=400" in msg and (
+        "does not support this api" in msg
+        or "invalidparameter" in msg and "not valid" in msg
+    ):
+        return True
+    return False
 
 
 def _execute_stage2_on_leased_items(items: List[Dict]) -> None:
@@ -312,7 +429,12 @@ def _execute_stage2_on_leased_items(items: List[Dict]) -> None:
                             except Exception as e:
                                 item_err = e
                                 if _is_retryable_api_error(e) and models.index(m_cfg) + 1 < len(models):
-                                    logger.warning("[Stage2Processor] task_id=%s model=%s 失败: %s，尝试备用", item.get("task_id"), m_name, str(e)[:100])
+                                    logger.warning(
+                                        "[Stage2Processor] task_id=%s model=%s 失败: %s，尝试备用",
+                                        item.get("task_id"),
+                                        m_name,
+                                        str(e)[:400],
+                                    )
                                 else:
                                     logger.error("[Stage2Processor] task_id=%s 所有模型失败: %s", item.get("task_id"), e)
                                     break

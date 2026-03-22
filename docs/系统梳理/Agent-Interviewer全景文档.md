@@ -1,6 +1,7 @@
 # InterviewerAgent 全景文档
 
-对应代码：`backend/agents/interviewer_agent.py`。
+对应代码：`backend/agents/interviewer_agent.py`。  
+仓库顶层目录与前端视图索引见 [`docs/README.md`](../README.md)。
 
 ## 1. Agent 定位
 

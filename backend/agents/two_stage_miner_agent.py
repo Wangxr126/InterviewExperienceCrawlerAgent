@@ -1,11 +1,14 @@
 """
 两阶段提取 Agent
-- Stage 1：使用 miner_prompt.py（原始 Prompt，含内嵌 Few-shot + verify_extraction_count）
-- Stage 2：豆包 API，使用 two_stage_prompts.py 精加工
+- Stage 1：miner_prompt.py（Few-shot + verify_extraction_count）；端点由 MINER_STAGE1_MODE 决定：
+  - local：MINER_STAGE1_LOCAL_*（或回退 MINER_LOCAL_*）
+  - remote：MINER_STAGE1_REMOTE_*（或回退 MINER_REMOTE_*）+ MINER_STAGE1_FALLBACK_MODELS 故障转移
+- Stage 2：MINER_STAGE2_* 豆包精加工（two_stage_prompts.py）
 - 保存两阶段结果用于后续本地模型微调
 """
 import json
 import logging
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
@@ -29,6 +32,51 @@ logger = logging.getLogger(__name__)
 
 UNRELATED_SIGNAL = "__UNRELATED__"
 
+
+class _Stage1HelloAgentsLLM(HelloAgentsLLM):
+    """
+    two_stage Stage1 使用非流式 invoke_with_tools；通义等需在 extra_body 中声明 enable_thinking=false。
+    本地 Ollama 等勿传未知字段：use_remote_extra_body=False 时不合并 miner_remote_stage1_extra_body。
+    """
+
+    def __init__(self, *args, use_remote_extra_body: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._use_remote_extra_body = use_remote_extra_body
+
+    def invoke_with_tools(self, messages, tools, tool_choice="auto", **kwargs):
+        eb: dict = {}
+        if self._use_remote_extra_body:
+            eb = dict(settings.miner_remote_stage1_extra_body)
+        if isinstance(kwargs.get("extra_body"), dict):
+            eb.update(kwargs["extra_body"])
+        if eb:
+            kwargs = {**kwargs, "extra_body": eb}
+        # 始终显式传入合法 max_tokens。hello_agents 的 HelloAgentsLLM.invoke_with_tools 在
+        # self.max_tokens 为假时不会 pop 默认值；且 kwargs.pop("max_tokens", default) 在键存在且为
+        # None 时会得到 None，部分网关会报 Range of max_tokens should be [1, 8192]。
+        api_cap = settings.miner_stage1_api_max_tokens
+        cap = max(1, int(settings.miner_stage1_max_tokens))
+        if api_cap > 0:
+            cap = min(cap, api_cap)
+        if "max_tokens" in kwargs and kwargs["max_tokens"] is not None:
+            try:
+                cap = max(1, min(int(kwargs["max_tokens"]), cap))
+            except (TypeError, ValueError):
+                pass
+        kwargs.pop("max_tokens", None)
+        kwargs["max_tokens"] = cap
+        self.max_tokens = cap
+        return super().invoke_with_tools(messages, tools, tool_choice, **kwargs)
+
+# MinerReActAgent 在超时、步数用尽、LLM 异常时的自然语言兜底（无法当 JSON 解析）
+_STAGE1_FAILURE_MARKERS = (
+    "抱歉，Stage1 模型调用失败",
+    "抱歉，本地模型调用失败",  # 兼容旧版 MinerReActAgent 文案
+    "OpenAI Function Calling调用失败",  # 部分网关错误文案无「Stage1」前缀
+    "抱歉，我无法在限定步数内完成这个任务",
+    "抱歉，我无法回答这个问题",
+)
+
 # 模型输出非 JSON 时，重试注入的纠错指令
 _JSON_RETRY_INSTRUCTION = """
 
@@ -40,10 +88,12 @@ _JSON_RETRY_INSTRUCTION = """
 - **严禁** 任何解释、说明、总结、洞察等自然语言
 - **仅 answer_text 字段内**允许 **加粗**、1.2.3. 分条、换行等格式
 - 直接输出题目列表，不要任何前缀或后缀
+- **JSON 对象边界只能是单反花括号**：每个题目用 `{"question_text":...}` 包裹，**禁止**写成 `{{"question_text":...}}`（双双花括号会导致解析失败）
 """
 
 # 上次提取失败时的错误信息，供重试时注入 prompt
 _last_extraction_error: str | None = None
+
 
 def _is_quota_or_rate_limit_error(err: Exception) -> bool:
     """判断是否为额度超限或限流错误，应切换备用模型"""
@@ -51,33 +101,67 @@ def _is_quota_or_rate_limit_error(err: Exception) -> bool:
     return any(kw in msg for kw in ("429", "quota", "ratelimitexceeded", "quotaexceeded", "额度", "限流"))
 
 
+def _stage1_failure_suggests_try_next_endpoint(rough_result: str) -> bool:
+    """401/额度/限流/连接类失败时尝试下一远程端点；步数用尽等不换端点。"""
+    if not rough_result:
+        return False
+    if "限定步数内完成" in rough_result or "我无法在限定步数" in rough_result:
+        return False
+    if "我无法回答这个问题" in rough_result:
+        return False
+    t = rough_result.lower()
+    return any(
+        kw in t
+        for kw in (
+            "401",
+            "403",
+            "429",
+            "invalid_api_key",
+            "incorrect api key",
+            "insufficient_quota",
+            "quota",
+            "ratelimit",
+            "rate_limit",
+            "allocationquota",
+            "freetier",
+            "free tier",
+            "exhausted",
+            "connection refused",
+            "connection reset",
+            "remote end closed",
+            "timed out",
+            "timeout",
+        )
+    )
+
+
 class TwoStageExtractor:
-    """两阶段提取器：Stage1 本地粗提取 + Stage2 豆包精加工"""
+    """两阶段提取器：Stage1 粗提取（MINER_STAGE1_*）+ Stage2 豆包精加工"""
 
     def __init__(self, image_paths: List[str] = None, task_id: str = ""):
         self._image_paths = image_paths or []
         self._task_id = task_id
         self._ocr_called = False
+        self._stage1_model_used = ""
+        self._stage1_models: List[dict] = list(settings.miner_stage1_models)
+        self._s1_mt = settings.miner_stage1_max_tokens
+        if settings.miner_max_tokens > settings.miner_remote_max_tokens_cap:
+            logger.debug(
+                "[TwoStageExtractor] Stage1 max_tokens 已从 %s 钳制为 %s（远程上限 %s）",
+                settings.miner_max_tokens,
+                self._s1_mt,
+                settings.miner_remote_max_tokens_cap,
+            )
 
-        # Stage 1：强制使用本地模型（Ollama）
-        self.rough_llm = HelloAgentsLLM(
-            model=settings.miner_local_model,
-            api_key=_get_miner_local_api_key(),
-            base_url=settings.miner_local_base_url,
-            temperature=0.3,
-            timeout=settings.miner_local_timeout,
-            max_tokens=settings.miner_max_tokens,
-        )
-
-        # 注册工具（仅 Stage 1 需要）
-        registry = ToolRegistry()
-        registry.register_tool(OcrImagesTool(image_paths=self._image_paths, task_id=self._task_id))
-        registry.register_tool(MarkUnrelatedTool())
-        registry.register_tool(VerifyExtractionCountTool())
+        # 工具与 Agent 配置（Stage1 每次换端点时重建 MinerReActAgent）
+        self._registry = ToolRegistry()
+        self._registry.register_tool(OcrImagesTool(image_paths=self._image_paths, task_id=self._task_id))
+        self._registry.register_tool(MarkUnrelatedTool())
+        self._registry.register_tool(VerifyExtractionCountTool())
 
         _data_dir = str(settings.backend_data_dir / "memory")
         _skills_dir = str(settings.backend_data_dir.parent.parent / ".claude" / "skills")
-        _agent_config = HelloAgentsConfig(
+        self._agent_config = HelloAgentsConfig(
             trace_enabled=True,
             trace_dir=f"{_data_dir}/traces",
             trace_sanitize=True,
@@ -100,21 +184,87 @@ class TwoStageExtractor:
             max_concurrent_tools=2,
         )
 
-        self.rough_agent = MinerReActAgent(
-            name="Rough Extractor",
-            llm=self.rough_llm,
-            tool_registry=registry,
-            system_prompt=get_miner_prompt(),
-            max_steps=settings.miner_max_steps,
-            config=_agent_config,
-        )
+        if not self._stage1_models:
+            sm = settings.miner_stage1_mode
+            logger.error(
+                "[TwoStageExtractor] Stage1 未配置可用端点：MINER_STAGE1_MODE=%s "
+                "（local 需 MINER_STAGE1_LOCAL_MODEL+BASE_URL；remote 需 MINER_STAGE1_REMOTE_* 或 MINER_REMOTE_*）",
+                sm,
+            )
+            self._build_stage1_placeholder()
+        else:
+            self._build_stage1_agent(self._stage1_models[0])
 
         # Stage 2：模型列表（主 + 备用），额度超限时按序切换
         self._stage2_models = settings.miner_stage2_models
         _stage2_names = [m["model"] for m in self._stage2_models] if self._stage2_models else []
+        _s1_desc = (
+            f"{settings.miner_stage1_mode}({len(self._stage1_models)} ep)"
+            if self._stage1_models
+            else f"{settings.miner_stage1_mode}(未配置)"
+        )
         logger.info(
-            "[TwoStageExtractor] 初始化完成 "
-            f"stage1=local({settings.miner_local_model}) stage2={_stage2_names or '未配置'}"
+            "[TwoStageExtractor] 初始化完成 stage1=%s stage2=%s",
+            _s1_desc,
+            _stage2_names or "未配置",
+        )
+        if (
+            settings.miner_stage1_mode == "remote"
+            and getattr(settings, "miner_stage1_fallback_models_in_env", False)
+            and len(self._stage1_models) <= 1
+        ):
+            logger.warning(
+                "[TwoStageExtractor] 环境变量中有 MINER_STAGE1_FALLBACK_MODELS，但解析后 Stage1 仍仅 %d 个端点："
+                "请检查是否为单行合法 JSON 数组、每项至少含 model，且勿与 MINER_STAGE2_FALLBACK_MODELS 混用。",
+                len(self._stage1_models),
+            )
+
+    def _build_stage1_placeholder(self) -> None:
+        """未配置 Stage1 时占位，避免 import 即崩。"""
+        self._stage1_model_used = "(unconfigured)"
+        self.rough_llm = _Stage1HelloAgentsLLM(
+            model="miner-stage1-unconfigured",
+            api_key="miner-stage1-missing",
+            base_url="http://127.0.0.1:1/v1",
+            temperature=float(settings.miner_temperature),
+            timeout=60,
+            max_tokens=max(1, int(self._s1_mt)),
+            use_remote_extra_body=True,
+        )
+        self.rough_agent = MinerReActAgent(
+            name="Rough Extractor",
+            llm=self.rough_llm,
+            tool_registry=self._registry,
+            system_prompt=get_miner_prompt(),
+            max_steps=settings.miner_max_steps,
+            config=self._agent_config,
+        )
+
+    def _build_stage1_agent(self, cfg: dict) -> None:
+        """按单条端点配置重建 Stage1 LLM + ReAct Agent。"""
+        kind = (cfg.get("kind") or "remote").lower()
+        use_extra = kind == "remote"
+        timeout = int(cfg.get("timeout") or settings.miner_stage1_remote_timeout)
+        model = (cfg.get("model") or "").strip()
+        base = (cfg.get("base_url") or "").strip().rstrip("/")
+        key = (cfg.get("api_key") or "").strip() or ("ollama" if kind == "local" else "sk-dummy")
+        self._stage1_model_used = model
+        self.rough_llm = _Stage1HelloAgentsLLM(
+            model=model,
+            api_key=key,
+            base_url=base,
+            temperature=float(settings.miner_temperature),
+            timeout=timeout,
+            max_tokens=max(1, int(self._s1_mt)),
+            use_remote_extra_body=use_extra,
+        )
+        self.rough_agent = MinerReActAgent(
+            name="Rough Extractor",
+            llm=self.rough_llm,
+            tool_registry=self._registry,
+            system_prompt=get_miner_prompt(),
+            max_steps=settings.miner_max_steps,
+            config=self._agent_config,
         )
 
     def extract(
@@ -144,10 +294,14 @@ class TwoStageExtractor:
         global _last_extraction_error
         _last_extraction_error = None
 
-        # ========== Stage 1：粗提取（本地） ==========
-        logger.info("[TwoStageExtractor] 开始 Stage 1：粗提取（本地）")
+        # ========== Stage 1：粗提取 ==========
         logger.info(
-            "[TwoStageExtractor] 预计 2-5 分钟（OCR ~1 分钟 + 模型生成 1-3 分钟），请勿中断"
+            "[TwoStageExtractor] 开始 Stage 1：粗提取（MINER_STAGE1_MODE=%s，端点数=%d）",
+            settings.miner_stage1_mode,
+            len(self._stage1_models),
+        )
+        logger.info(
+            "[TwoStageExtractor] 预计 1-4 分钟（OCR 仍可能本地 + LLM 生成），请勿中断"
         )
 
         user_input = user_input_override or format_miner_user_prompt(
@@ -158,8 +312,86 @@ class TwoStageExtractor:
         )
 
         try:
-            rough_result = self.rough_agent.run(user_input)
-            rough_result = self._strip_think_tags(rough_result)
+            from backend.services.crawler.question_extractor import (
+                MinerFatalApiError,
+                _is_miner_fatal_upstream_error,
+            )
+
+            rough_result = ""
+            if not self._stage1_models:
+                logger.error("[TwoStageExtractor] Stage1 端点未配置，跳过")
+                return "", self._ocr_called, False
+
+            stage1_got_valid_reply = False
+            n_ep = len(self._stage1_models)
+            for ep_idx, cfg in enumerate(self._stage1_models):
+                self._build_stage1_agent(cfg)
+                logger.info(
+                    "[TwoStageExtractor] Stage1 端点 %d/%d model=%s base=%s",
+                    ep_idx + 1,
+                    n_ep,
+                    cfg.get("model"),
+                    (cfg.get("base_url") or "")[:72] + ("…" if len(cfg.get("base_url") or "") > 72 else ""),
+                )
+                rough_result = self.rough_agent.run(user_input)
+                rough_result = self._strip_think_tags(rough_result or "")
+
+                has_fail_msg = bool(rough_result) and any(m in rough_result for m in _STAGE1_FAILURE_MARKERS)
+
+                if has_fail_msg:
+                    suggest_next = _stage1_failure_suggests_try_next_endpoint(rough_result)
+                    can_next = (ep_idx + 1 < n_ep) and suggest_next
+                    if can_next:
+                        logger.warning(
+                            "[TwoStageExtractor] Stage1 端点失败，尝试下一备用 | 预览=%s",
+                            (rough_result[:220] + "…") if len(rough_result) > 220 else rough_result,
+                        )
+                        continue
+                    if _is_miner_fatal_upstream_error(rough_result):
+                        logger.critical(
+                            "[TwoStageExtractor] Stage1 上游致命错误，中止批处理 | 预览=%s",
+                            (rough_result[:400] + "…") if len(rough_result) > 400 else rough_result,
+                        )
+                        raise MinerFatalApiError((rough_result or "")[:2000])
+                    # 未切换备用：要么是链上只有 1 个端点，要么是错误类型不允许换端点
+                    if suggest_next and ep_idx + 1 >= n_ep:
+                        logger.warning(
+                            "[TwoStageExtractor] 当前错误（如 403/额度）本应换备用，但 Stage1 端点链仅有 %d 条。"
+                            "备用须配在 .env 的 MINER_STAGE1_FALLBACK_MODELS（单行 JSON），"
+                            "不是 MINER_STAGE2_FALLBACK_MODELS。",
+                            n_ep,
+                        )
+                    elif not suggest_next:
+                        logger.warning(
+                            "[TwoStageExtractor] Stage1 失败且未匹配「换端点」关键词（步数用尽等不切换）| n_ep=%d idx=%d | 预览=%s",
+                            n_ep,
+                            ep_idx + 1,
+                            (rough_result[:180] + "…") if len(rough_result) > 180 else rough_result,
+                        )
+                    logger.warning(
+                        "[TwoStageExtractor] Stage1 本端点失败且不再切换 | 预览=%s",
+                        (rough_result[:200] + "…") if len(rough_result) > 200 else rough_result,
+                    )
+                    return "", self._ocr_called, False
+
+                # 修复：原先在「无失败文案」时无条件 break，导致空输出也会跳出 for，后续端点永不尝试
+                if not (rough_result or "").strip():
+                    if ep_idx + 1 < n_ep:
+                        logger.warning(
+                            "[TwoStageExtractor] Stage1 返回空输出，尝试下一端点 (%d/%d)",
+                            ep_idx + 1,
+                            n_ep,
+                        )
+                        continue
+                    logger.warning("[TwoStageExtractor] Stage1 最后一端点仍返回空输出，本帖失败")
+                    return "", self._ocr_called, False
+
+                stage1_got_valid_reply = True
+                break
+
+            if not stage1_got_valid_reply:
+                logger.error("[TwoStageExtractor] Stage1 端点链未得到有效回复（逻辑异常）")
+                return "", self._ocr_called, False
 
             self._check_ocr_called()
 
@@ -235,6 +467,18 @@ class TwoStageExtractor:
 
         # ========== 异步模式：入队 stage2_pending，达到 batch_size 触发 ==========
         if settings.miner_stage2_async_enabled and self._stage2_models:
+            # 稳定 q_id：Stage1 结束即入库；Stage2 仅 UPDATE 同一 q_id 的 answer_text 等字段
+            for v in valid_questions:
+                if not v.get("q_id"):
+                    v["q_id"] = str(uuid.uuid4())
+                if company and not (str(v.get("company") or "").strip()):
+                    v["company"] = company
+                if position and not (str(v.get("position") or "").strip()):
+                    v["position"] = position
+                _at = v.get("answer_text")
+                _ans = (_at if isinstance(_at, str) else str(_at or "")).strip()
+                v["raw_answer"] = _ans
+            rough_with_ids = json.dumps(valid_questions, ensure_ascii=False)
             questions_text = "\n".join(
                 f"{i+1}. {q.get('question_text', '')}"
                 for i, q in enumerate(valid_questions)
@@ -250,11 +494,23 @@ class TwoStageExtractor:
                 trace_session_id = _get_latest_trace_session_id() or ""
             except Exception:
                 pass
+            if task_id and (source_url or "").strip():
+                _n = sqlite_service.persist_stage1_questions_rough(
+                    task_id=task_id,
+                    source_url=(source_url or "").strip(),
+                    question_items=valid_questions,
+                    ocr_called=self._ocr_called,
+                )
+                if _n > 0:
+                    logger.info(
+                        "[TwoStageExtractor] Stage1 粗题已入库 %d 道（Stage2 将按 q_id 更新精答案）",
+                        _n,
+                    )
             ok = sqlite_service.add_stage2_pending(
                 task_id=task_id,
                 content=content,
-                stage1_output=rough_result,
-                rough_questions=json.dumps(valid_questions, ensure_ascii=False),
+                stage1_output=rough_with_ids,
+                rough_questions=rough_with_ids,
                 enrich_input=enrich_input,
                 company=company or "",
                 position=position or "",
@@ -371,7 +627,7 @@ class TwoStageExtractor:
                 "source_url": source_url or "",
                 "stage1_output": stage1_output,
                 "stage2_output": stage2_output,
-                "stage1_model": settings.miner_local_model,
+                "stage1_model": (getattr(self, "_stage1_model_used", "") or settings.miner_stage1_remote_model or settings.miner_stage1_local_model or "").strip(),
                 "stage2_model": stage2_model_used or settings.miner_stage2_model,
             }
 
@@ -584,6 +840,13 @@ class TwoStageExtractor:
         """修复 LLM 输出的常见 JSON 错误"""
         import re
         s = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+        # 模型曾仿照错误 Prompt 示例输出 {{ / }} 作为对象定界符；收拢为合法 JSON（仅常见缩进形态，避免全局 replace 破坏嵌套对象）
+        if "{{" in s and s.lstrip().startswith("["):
+            t = s.replace("{{\n", "{\n")
+            t = t.replace("\n  }},", "\n  },")
+            t = t.replace("\n  }}\n]", "\n  }\n]")
+            if t != s:
+                s = t
         # 修复 "raw:answer" -> "raw_answer"（常见 LLM 笔误）
         s = re.sub(r'"raw\s*:\s*answer"', '"raw_answer"', s, flags=re.IGNORECASE)
         # 修复 "question:type" -> "question_type" 等键名中的冒号
@@ -662,8 +925,3 @@ class TwoStageExtractor:
         return text.strip()
 
 
-def _get_miner_local_api_key() -> str:
-    """Stage 1 本地模型 API Key（Ollama 通常为 ollama）"""
-    import os
-
-    return os.environ.get("MINER_LOCAL_API_KEY", "").strip() or settings.llm_local_api_key

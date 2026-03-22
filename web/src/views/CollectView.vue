@@ -176,6 +176,9 @@
         <div v-if="extractProgressByPlatform.length === 0" class="extract-progress-item">
           <span class="extract-progress-text">处理中...</span>
         </div>
+        <p v-if="extractProgressByPlatform.length > 0" class="extract-progress-hint">
+          分母为各平台「待提取」队列在任务开始时的条数（含此前已在队列中的帖子）。与操作提示里的「重置 N 条」含义不同：后者仅为本次从失败等状态恢复的行数，且可能含需重新抓取、不计入待提取的条目。
+        </p>
         <div class="extract-trace-box">
           <div class="extract-trace-title">🧠 实时推理过程</div>
           <div v-if="extractTraceSteps.length > 0" class="extract-trace-steps">
@@ -557,17 +560,22 @@ const fetchedByPlatform = computed(() => {
   return v && typeof v === 'object' ? v : {}
 })
 const PLATFORM_LABELS = { nowcoder: '牛客', xiaohongshu: '小红书' }
+const _platformOrder = ['nowcoder', 'xiaohongshu']
 const extractProgressByPlatform = computed(() => {
   if (!extractPolling.value) return []
   const initial = extractInitialByPlatform.value || {}
   const current = fetchedByPlatform.value || {}
-  const platforms = ['nowcoder', 'xiaohongshu']
+  const keySet = new Set([...Object.keys(initial), ...Object.keys(current)])
+  const platforms = [
+    ..._platformOrder.filter((p) => keySet.has(p)),
+    ...[...keySet].filter((p) => !_platformOrder.includes(p)).sort(),
+  ]
   return platforms
-    .filter(p => (initial[p] ?? 0) > 0)
-    .map(p => {
+    .filter((p) => (initial[p] ?? 0) > 0)
+    .map((p) => {
       const init = initial[p] ?? 0
       const cur = current[p] ?? 0
-      const done = init - cur
+      const done = Math.max(0, init - cur)
       const pct = init > 0 ? Math.min(100, Math.round((done / init) * 100)) : 0
       return {
         platform: p,
@@ -869,6 +877,28 @@ const processQueue = async () => {
   }
 }
 
+/** 与后端 _extraction_initial_by_platform 对齐，供分平台进度条；接口无数据时用当前统计兜底 */
+const syncExtractBaselineFromBackend = async () => {
+  try {
+    const st = await api.getExtractionStatus()
+    const ibp = st?.initial_by_platform
+    if (ibp && typeof ibp === 'object' && Object.keys(ibp).length > 0) {
+      extractInitialByPlatform.value = { ...ibp }
+      return
+    }
+  } catch { /* ignore */ }
+  extractInitialByPlatform.value = { ...(rawStats.value['fetched_by_platform'] || {}) }
+}
+
+const applyInitialByPlatformFromApi = async (d) => {
+  const ibp = d?.initial_by_platform
+  if (ibp && typeof ibp === 'object' && Object.keys(ibp).length > 0) {
+    extractInitialByPlatform.value = { ...ibp }
+    return
+  }
+  await syncExtractBaselineFromBackend()
+}
+
 const extractPending = async () => {
   extractLoading.value = true
   extractMsg.value = null
@@ -954,7 +984,9 @@ const retryErrors = async () => {
     const d = await api.retryErrors()
     extractMsg.value = { ok: true, text: `🔄 ${d.message}` }
     if ((d.reset ?? 0) > 0) {
-      extractPolling.value = true  // 后台处理中，轮询刷新帖子列表
+      await loadStats(true)
+      await applyInitialByPlatformFromApi(d)
+      extractPolling.value = true // 后台处理中：进度条 + 轮询
     }
     await loadTasks()
   } catch {
@@ -980,6 +1012,8 @@ const reExtractAll = async () => {
     const d = await api.reExtractAll(50)
     extractMsg.value = { ok: true, text: `🔄 ${d.message}` }
     if ((d.reset ?? 0) > 0) {
+      await loadStats(true)
+      await applyInitialByPlatformFromApi(d)
       extractPolling.value = true
     }
     await loadStats()
@@ -1001,6 +1035,8 @@ const confirmReExtractAll = async () => {
     showReExtractDialog.value = false
     extractMsg.value = { ok: true, text: `🔄 ${d.message}` }
     if ((d.reset ?? 0) > 0) {
+      await loadStats(true)
+      await applyInitialByPlatformFromApi(d)
       extractPolling.value = true
     }
     await loadStats()
@@ -1171,7 +1207,17 @@ onMounted(async () => {
     const d = await api.getExtractionStatus()
     if (d?.running) {
       extractPolling.value = true
-      extractInitialByPlatform.value = d.initial_by_platform || (fetchedCount.value > 0 ? { nowcoder: fetchedCount.value, xiaohongshu: 0 } : {})
+      const ibp = d.initial_by_platform
+      const fbp = rawStats.value['fetched_by_platform']
+      if (ibp && typeof ibp === 'object' && Object.keys(ibp).length > 0) {
+        extractInitialByPlatform.value = { ...ibp }
+      } else if (fbp && typeof fbp === 'object' && Object.keys(fbp).length > 0) {
+        extractInitialByPlatform.value = { ...fbp }
+      } else if (fetchedCount.value > 0) {
+        extractInitialByPlatform.value = { nowcoder: fetchedCount.value, xiaohongshu: 0 }
+      } else {
+        extractInitialByPlatform.value = {}
+      }
     }
   } catch {
     // 忽略
@@ -1200,9 +1246,22 @@ watch(extractPolling, (polling) => {
   if (polling) {
     extractPollTimer = setInterval(async () => {
       await loadStats(true)
-      const allDone = extractProgressByPlatform.value.length === 0 || extractProgressByPlatform.value.every(p => p.pct >= 100)
-      if (fetchedCount.value <= 0 || allDone) {
+      let running = false
+      try {
+        const st = await api.getExtractionStatus()
+        running = !!st?.running
+      } catch {
+        running = true
+      }
+      const bars = extractProgressByPlatform.value
+      const hasBars = bars.length > 0
+      const barsAllDone = hasBars && bars.every(p => p.pct >= 100)
+      if (!running) {
         stopExtractPolling()
+        await loadTasks()
+      } else if (hasBars && barsAllDone && fetchedCount.value <= 0) {
+        stopExtractPolling()
+        await loadTasks()
       }
     }, 5000)
     // 连接 SSE 流式获取推理过程（实时展示）
@@ -1533,6 +1592,7 @@ watch(crawlPolling, (polling) => {
 }
 .extract-progress-bar { flex: 1; min-width: 0; }
 .extract-progress-track {
+  width: 100%;
   height: 10px;
   background: rgba(0, 0, 0, 0.06);
   border-radius: 10px;
@@ -1540,9 +1600,16 @@ watch(crawlPolling, (polling) => {
 }
 .extract-progress-fill {
   height: 100%;
+  max-width: 100%;
   background: linear-gradient(90deg, #5b6ef5 0%, #7c8ff7 100%);
   border-radius: 10px;
   transition: width 0.35s ease;
+}
+.extract-progress-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-sub, #909399);
 }
 .extract-progress-text {
   font-size: 14px;

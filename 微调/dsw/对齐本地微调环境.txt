@@ -1,0 +1,28 @@
+本地（Windows + NewCoderAgent）到底用啥？
+=====================================
+
+以仓库根目录 requirements.txt 为准：
+
+1) 全项目依赖：
+   pip install -r requirements.txt
+
+2) GPU 微调（与 train_lora.py 一致）——见 requirements.txt 第 63–67 行注释原文：
+   • PyTorch：2.5.1 + cu124（Windows 不要用 2.6+，与 triton-windows 冲突）
+   • 先装 torch 三件套，再 pip install unsloth
+   • 勿再 pip install torchao（避免多余量化栈）
+   • xformers：Windows 上可无匹配轮子时跳过；Linux/DSW 建议装（unsloth 常用）
+
+3) 与微调强相关的 pin（在 requirements.txt 里已写明）：
+   transformers==4.57.6
+   accelerate==1.12.0
+   huggingface_hub==0.36.2
+
+DSW（Linux）怎么对齐？
+======================
+• 版本与上面一致；仅把 PyTorch 从「cu124」换成官方 Linux 轮子「cu121」（或你机器对应的 cu12x）。
+• 使用 微调/dsw/install_venv_dsw.sh：会安装 torch==2.5.1 + transformers==4.57.6 等，与本地说明一致，
+  而不是镜像里自带的 2.3.x + 随意解析出来的依赖。
+
+若你本机实际版本与 requirements.txt 不一致，以你本机为准：
+  pip freeze > 本机freeze.txt
+把 freeze 里 torch / transformers / unsloth 几行贴到 issue 里再对齐。

@@ -18,6 +18,8 @@ CREDENTIALS.md
 # ━━━ 后端数据（不提交到仓库）━━━
 backend/data/
 backend/logs/
+# 面试官 Agent 运行时日志（chat/thinking/tools 的 jsonl）
+backend/interviewer_logs/
 backend/*.db
 *.db
 *.db-journal
@@ -36,7 +38,8 @@ test_nowcoder_output/
 # 本地参考与思路（不上传）
 参考项目/
 思路/
-微调\llm_logs
+# 微调流水线 LLM 日志（jsonl）
+微调/llm_logs/
 # ━━━ 前端构建与依赖 ━━━
 node_modules/
 frontend/dist/
@@ -70,6 +73,7 @@ ENV/
 
 # ━━━ 调试与临时文件 ━━━
 *.log
+*.log.*
 *.tmp
 debug_*.txt
 debug_*.html
@@ -77,6 +81,16 @@ debug_*.html
 *_stdout.log
 uvicorn_*.txt
 xhs_link_cache.txt
+# 根目录或子目录里散落的运行日志
+logs/
+**/logs/*.log
+
+# 前端 / Node 调试日志
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+web/*.log
 
 # 临时脚本和归档
 scripts/temp/
@@ -85,6 +99,11 @@ docs/archive/
 # ━━━ HelloAgents 源码（项目使用 pip 安装的 hello-agents 包）━━━
 HelloAgents/
 HelloAgents-1.0.0/
+
+# ━━━ PAI-DSW 本机打包产物（可重复生成）━━━
+微调/dsw/finetune_dsw_bundle.zip
+微调/dsw/_pack_staging/
+微调/.venv_finetune/
 
 # ━━━ 系统文件 ━━━
 .DS_Store

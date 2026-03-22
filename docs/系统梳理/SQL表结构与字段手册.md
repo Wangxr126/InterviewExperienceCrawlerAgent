@@ -1,7 +1,8 @@
 # SQL 表结构与字段手册
 
 数据源：`backend/services/storage/sqlite_service.py`。  
-说明：以下字段包含“建表字段 + 迁移补充字段”。
+说明：以下字段包含“建表字段 + 迁移补充字段”。  
+仓库结构索引：[`docs/README.md`](../README.md)。
 
 ## 1. `questions`（题库主表）
 
@@ -193,7 +194,7 @@
 
 ## 12. `finetune_runs`（训练运行记录）
 
-**功能**：每次训练生成、启动、完成状态追踪。
+**功能**：每次「生成并训练」写入一条记录；后台线程执行 `train_lora.py` 时更新时间与状态。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -203,8 +204,10 @@
 | script_path | TEXT | 脚本路径 |
 | data_path | TEXT | 数据路径 |
 | sample_count | INTEGER | 样本数 |
-| status | TEXT | 状态 |
+| status | TEXT | `generated`（仅生成脚本）/ `running` / `completed` / `failed` |
 | created_at / started_at / ended_at | DATETIME | 时间字段 |
+
+训练进程标准输出日志文件路径（非 DB 字段）：`微调/logs/train_run_{id}.log`。
 
 ## 13. `crawl_tasks`（采集任务队列）
 
@@ -259,5 +262,5 @@
 
 - 题库主链路：`crawl_tasks -> questions -> study_records -> user_tag_mastery`。
 - 会话与记忆：`interview_sessions`（工作记忆）+ `episodic_log`（情景记忆）+ `user_profiles`（语义记忆）。
-- 微调链路：`finetune_samples -> finetune_runs`。
+- 微调链路：`finetune_samples -> finetune_runs`；效果对比见前端「模型对比」页（`GET/POST /api/finetune/compare*`）。
 - 推荐链路：`user_tag_mastery + study_records + knowledge_resources`。

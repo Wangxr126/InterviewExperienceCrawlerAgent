@@ -27,7 +27,7 @@ curl.exe -s -o NUL -w "HTTP %{http_code}`n" http://localhost:8000/docs
 | Qdrant | `http://localhost:6333` | `docker compose` 中的 `qdrant`；向量记忆依赖 |
 | Ollama（可选） | `http://localhost:11434` | `LLM_MODE=local` 时使用 |
 | 后端 | `http://localhost:8000` | `python run.py` |
-| 前端开发 | `http://localhost:5173` | `cd web && npm run dev` |
+| 前端开发 | `http://localhost:5173`（端口被占用时 Vite 会顺延，如 `5174`，以终端输出为准） | `cd web && npm run dev` |
 
 ---
 
@@ -156,5 +156,6 @@ WARMUP_EMBEDDING_RERANK_OCR=false
 ## 文档与接口
 
 - OpenAPI：`http://localhost:8000/docs`
+- **文档总索引**：`docs/README.md`（仓库目录与全部 Markdown 地图）
 - 接口分组说明：`docs/系统梳理/API全量文档.md`
 - 子进程与恢复：`docs/系统梳理/进程与子进程架构文档.md`

@@ -17,6 +17,7 @@
   scheduler.stop()           # 停止
 """
 from backend.utils.time_utils import now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
+from backend.services.crawler.question_extractor import MinerFatalApiError
 import logging
 import json
 import time
@@ -172,11 +173,12 @@ def _process_pending_tasks(batch_size: int = None):
     # 注意：MCP 抓取仅在「有 pending 牛客任务」时执行；0 条则跳过
     if not pending:
         logger.info("⏭️  无 pending 牛客任务，跳过 Step1（MCP/本地抓取）")
+    _step1_total = len(pending)
     if pending:
         _bsep = '═' * 20
         logger.info(f"{_bsep}>>> Step1: 抓取详情 开始 <<<{_bsep}")
-        logger.info(f"📥 开始抓取详情，本批 {len(pending)} 条 pending 任务 | 获取来源={crawler_source}")
-    for task in pending:
+        logger.info(f"📥 开始抓取详情，本批 {_step1_total} 条 pending 任务 | 获取来源={crawler_source}")
+    for idx, task in enumerate(pending, start=1):
         task_id = task["task_id"]
         url = task["source_url"]
         title = (task.get("post_title") or "").strip() or "(无标题)"
@@ -232,6 +234,15 @@ def _process_pending_tasks(batch_size: int = None):
             sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200])
             logger.error(f"❌保存抓取结果失败 [{title[:40]}]: {e}")
 
+        _t1 = (title[:52] + "…") if len(title) > 52 else title
+        logger.info(
+            "📌 [进度 Step1 %d/%d] 本帖抓取阶段结束 | %s | task_id=%s",
+            idx,
+            _step1_total,
+            _t1,
+            task_id,
+        )
+
     if pending:
         _bsep = '═' * 20
         logger.info(f"{_bsep}>>> Step1: 抓取详情 结束 <<<{_bsep}")
@@ -250,7 +261,8 @@ def _process_pending_tasks(batch_size: int = None):
         logger.info(f"{_bsep}>>> Step2: LLM提取 开始 <<<{_bsep}")
         logger.info(f"📋 开始 LLM 提取，本批 {len(fetched_rows)} 条 fetched 帖子")
 
-    for row in fetched_rows:
+    _step2_total = len(fetched_rows)
+    for idx, row in enumerate(fetched_rows, start=1):
         task_id = row["task_id"]
         raw_content = row["raw_content"] or ""
         url = row["source_url"]
@@ -263,118 +275,144 @@ def _process_pending_tasks(batch_size: int = None):
             image_paths = json.loads(image_paths_raw) if isinstance(image_paths_raw, str) else image_paths_raw or []
         except Exception:
             image_paths = []
-        
+
         _sep = '─' * 60
         _title_short = post_title[:35] if len(post_title) <= 35 else post_title[:32] + "..."
 
-            # 正文为空且无图片 → 跳过
-        if not raw_content and not image_paths:
-            extract_error += 1
-            logger.info(f"{_sep}")
-            logger.info(f"  [{platform}] {_title_short} | 正文=0字 | 图片=0张 | {task_id}")
-            logger.info(f"  🔗 {url}")
-            sqlite_service.update_task_status(task_id, "error", error_msg="正文为空且无图片", raw_content=raw_content)
-            logger.error(f"  ❌ 正文为空且无图片，已标记 error")
-            logger.info("")
-            continue
-
-        logger.info(f"{_sep}")
-        logger.info(f"  [{platform}] {_title_short} | 正文={len(raw_content)}字 | 图片={len(image_paths)}张 | {task_id}")
-        logger.info(f"  🔗 {url}")
-
-        _t0 = time.time()
         try:
-            extract_retries = getattr(settings, "extract_retries_on_failure", 3) if image_paths else 0
-            questions, status, agent_used_tool, agent_succeeded, trace_session_id = [], "empty", False, True, None
-
-            for extract_attempt in range(extract_retries + 1):
-                # MinerAgent（function-calling 模式）自主决定是否调用 ocr_images 工具
-                questions, status, agent_used_tool, agent_succeeded, trace_session_id = extract_questions_from_post(
-                    content=raw_content,
-                    platform=platform,
-                    company=row["company"] or "",
-                    position=row["position"] or "",
-                    business_line=row["business_line"] or "",
-                    difficulty=row["difficulty"] or "",
-                    source_url=url,
-                    post_title=row["post_title"] or "",
-                    extraction_source="content",
-                    image_paths=image_paths,
-                    task_id=task_id,
-                )
-                if questions or status == "unrelated":
-                    break
-                if extract_attempt < extract_retries and (
-                    status in ("parse_error", "empty", "model_refused", "chinese_guard_failed")
-                ):
-                    logger.warning(f"  提取失败（{status}），第 {extract_attempt + 1}/{extract_retries + 1} 次重试...")
-                    time.sleep(2)
-            if not questions and extract_retries > 0 and status in (
-                "parse_error",
-                "empty",
-                "chinese_guard_failed",
-            ):
-                logger.warning(f"  ⚠️ 重试 {extract_retries} 次后仍提取失败: {url}")
-
-            # 帖子与面经无关 → 标记 unrelated（专用状态，参与「清洗无关帖」操作）
-            if status == "unrelated":
-                extract_unrelated += 1
-                sqlite_service.update_task_status(task_id, "unrelated", error_msg="LLM 判断与面经无关", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2), trace_session_id=trace_session_id)
-                logger.warning(f"  ⚠️ 无关帖，已标记 unrelated")
-                logger.info("")
-                continue
-
-            # 两阶段异步：Stage1 完成已入队，待 Stage2 批量处理
-            if status == "stage2_pending":
-                sqlite_service.update_task_status(
-                    task_id, "stage2_pending",
-                    raw_content=raw_content,
-                    agent_used_tool=agent_used_tool,
-                    extract_duration_min=round((time.time() - _t0) / 60, 2),
-                    trace_session_id=trace_session_id,
-                )
-                logger.info(f"  📤 Stage1 完成已入队，待 Stage2 批量处理（batch_size={getattr(settings, 'miner_stage2_batch_size', 10)} 触发）")
-                logger.info("")
-                continue
-
-            # LLM 解析失败 → 标记 error
-            if status == "parse_error":
+            # 正文为空且无图片 → 跳过
+            if not raw_content and not image_paths:
                 extract_error += 1
-                sqlite_service.update_task_status(task_id, "error", error_msg="LLM 返回无法解析为 JSON", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2), trace_session_id=trace_session_id)
-                logger.error(f"  ❌ LLM 返回无法解析为 JSON")
+                logger.info(f"{_sep}")
+                logger.info(f"  [{platform}] {_title_short} | 正文=0字 | 图片=0张 | {task_id}")
+                logger.info(f"  🔗 {url}")
+                sqlite_service.update_task_status(task_id, "error", error_msg="正文为空且无图片", raw_content=raw_content)
+                logger.error(f"  ❌ 正文为空且无图片，已标记 error")
                 logger.info("")
                 continue
 
-            # 提取到题目 → 入库（降级成功时仅 SQLite，不写入 Graph）
-            if questions:
-                extract_ok += 1
-                # 根据是否调用了OCR来判断题目来源
-                extraction_src = "image" if agent_used_tool else "content"
-                crawl_task_id = row["id"] if "id" in row.keys() else None
-                count = _save_questions(questions, crawl_task_id=crawl_task_id, skip_neo4j=not agent_succeeded)
-                # 耗时 = 两阶段总时间（Stage1 本地 + Stage2 豆包），单位分钟
-                _dur = round(time.time() - _t0, 1)
-                _dur_min = round(_dur / 60, 2)
-                sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=_dur_min, trace_session_id=trace_session_id)
-                logger.info(f"  ✅ 提取完成: {count} 道题目入库，耗时 {_dur_min}min（两阶段总时间）" + ("（仅 SQLite，未写入 Graph）" if not agent_succeeded else "") + (f"（来源：{'图片' if agent_used_tool else '正文'}）" if agent_used_tool else ""))
+            logger.info(f"{_sep}")
+            logger.info(f"  [{platform}] {_title_short} | 正文={len(raw_content)}字 | 图片={len(image_paths)}张 | {task_id}")
+            logger.info(f"  🔗 {url}")
+
+            _t0 = time.time()
+            try:
+                extract_retries = getattr(settings, "extract_retries_on_failure", 3) if image_paths else 0
+                questions, status, agent_used_tool, agent_succeeded, trace_session_id = [], "empty", False, True, None
+
+                for extract_attempt in range(extract_retries + 1):
+                    # MinerAgent（function-calling 模式）自主决定是否调用 ocr_images 工具
+                    questions, status, agent_used_tool, agent_succeeded, trace_session_id = extract_questions_from_post(
+                        content=raw_content,
+                        platform=platform,
+                        company=row["company"] or "",
+                        position=row["position"] or "",
+                        business_line=row["business_line"] or "",
+                        difficulty=row["difficulty"] or "",
+                        source_url=url,
+                        post_title=row["post_title"] or "",
+                        extraction_source="content",
+                        image_paths=image_paths,
+                        task_id=task_id,
+                    )
+                    if questions or status == "unrelated":
+                        break
+                    if extract_attempt < extract_retries and (
+                        status in ("parse_error", "empty", "model_refused", "chinese_guard_failed")
+                    ):
+                        logger.warning(f"  提取失败（{status}），第 {extract_attempt + 1}/{extract_retries + 1} 次重试...")
+                        time.sleep(2)
+                if not questions and extract_retries > 0 and status in (
+                    "parse_error",
+                    "empty",
+                    "chinese_guard_failed",
+                ):
+                    logger.warning(f"  ⚠️ 重试 {extract_retries} 次后仍提取失败: {url}")
+
+                # 帖子与面经无关 → 标记 unrelated（专用状态，参与「清洗无关帖」操作）
+                if status == "unrelated":
+                    extract_unrelated += 1
+                    sqlite_service.update_task_status(task_id, "unrelated", error_msg="LLM 判断与面经无关", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2), trace_session_id=trace_session_id)
+                    logger.warning(f"  ⚠️ 无关帖，已标记 unrelated")
+                    logger.info("")
+                    continue
+
+                # 两阶段异步：Stage1 完成已入队，待 Stage2 批量处理
+                if status == "stage2_pending":
+                    _qc = 0
+                    if url:
+                        try:
+                            with sqlite_service._get_conn() as _conn:
+                                _cr = _conn.execute(
+                                    "SELECT COUNT(*) AS c FROM questions WHERE source_url=?",
+                                    (url,),
+                                ).fetchone()
+                                _qc = int(_cr["c"]) if _cr else 0
+                        except Exception:
+                            _qc = 0
+                    sqlite_service.update_task_status(
+                        task_id, "stage2_pending",
+                        raw_content=raw_content,
+                        agent_used_tool=agent_used_tool,
+                        extract_duration_min=round((time.time() - _t0) / 60, 2),
+                        trace_session_id=trace_session_id,
+                        questions_count=_qc,
+                    )
+                    logger.info(f"  📤 Stage1 完成已入队，待 Stage2 批量处理（batch_size={getattr(settings, 'miner_stage2_batch_size', 10)} 触发）")
+                    logger.info("")
+                    continue
+
+                # LLM 解析失败 → 标记 error
+                if status == "parse_error":
+                    extract_error += 1
+                    sqlite_service.update_task_status(task_id, "error", error_msg="LLM 返回无法解析为 JSON", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2), trace_session_id=trace_session_id)
+                    logger.error(f"  ❌ LLM 返回无法解析为 JSON")
+                    logger.info("")
+                    continue
+
+                # 提取到题目 → 入库（降级成功时仅 SQLite，不写入 Graph）
+                if questions:
+                    extract_ok += 1
+                    # 根据是否调用了OCR来判断题目来源
+                    extraction_src = "image" if agent_used_tool else "content"
+                    crawl_task_id = row["id"] if "id" in row.keys() else None
+                    count = _save_questions(questions, crawl_task_id=crawl_task_id, skip_neo4j=not agent_succeeded)
+                    # 耗时 = 两阶段总时间（Stage1 远程粗提取 + Stage2 豆包），单位分钟
+                    _dur = round(time.time() - _t0, 1)
+                    _dur_min = round(_dur / 60, 2)
+                    sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=_dur_min, trace_session_id=trace_session_id)
+                    logger.info(f"  ✅ 提取完成: {count} 道题目入库，耗时 {_dur_min}min（两阶段总时间）" + ("（仅 SQLite，未写入 Graph）" if not agent_succeeded else "") + (f"（来源：{'图片' if agent_used_tool else '正文'}）" if agent_used_tool else ""))
+                    logger.info("")
+                    processed += count
+                    continue
+
+                # MinerAgent 正文+OCR 均无题目 → 标记 error 保留记录
+                extract_error += 1
+                sqlite_service.update_task_status(task_id, "error", error_msg="正文+OCR 均无题目（暂不删除）", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2), trace_session_id=trace_session_id)
+                logger.warning(f"  ⚠️ 正文+OCR 均无题目，已标记 error")
                 logger.info("")
-                processed += count
-                continue
 
-            # MinerAgent 正文+OCR 均无题目 → 标记 error 保留记录
-            extract_error += 1
-            sqlite_service.update_task_status(task_id, "error", error_msg="正文+OCR 均无题目（暂不删除）", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2), trace_session_id=trace_session_id)
-            logger.warning(f"  ⚠️ 正文+OCR 均无题目，已标记 error")
-            logger.info("")
+            except MinerFatalApiError:
+                logger.critical("  ⛔ 上游 API 致命错误，中止本批 process_tasks（请检查 MINER_REMOTE_* / max_tokens）")
+                raise
+            except Exception as e:
+                extract_error += 1
+                import traceback
+                sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200], raw_content=raw_content, extract_duration_min=round((time.time()-_t0)/60, 2))
+                logger.error(
+                    f"  ❌ LLM 提取异常: {e}\n{traceback.format_exc()}"
+                )
+                logger.info("")
 
-        except Exception as e:
-            extract_error += 1
-            import traceback
-            sqlite_service.update_task_status(task_id, "error", error_msg=str(e)[:200], raw_content=raw_content, extract_duration_min=round((time.time()-_t0)/60, 2))
-            logger.error(
-                f"  ❌ LLM 提取异常: {e}\n{traceback.format_exc()}"
+        finally:
+            _pt = (post_title[:52] + "…") if len(post_title) > 52 else post_title
+            logger.info(
+                "📌 [进度 Step2 %d/%d] 本帖处理结束 | %s | task_id=%s",
+                idx,
+                _step2_total,
+                _pt,
+                task_id,
             )
-            logger.info("")
 
     if fetched_rows:
         _bsep = '═' * 20
@@ -482,6 +520,41 @@ def process_single_task(task_id: str) -> Dict:
     if status == "parse_error":
         sqlite_service.update_task_status(task_id, "error", error_msg="LLM 返回无法解析为 JSON", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time() - _t0) / 60, 2), trace_session_id=trace_session_id)
         return {"status": "error", "message": "LLM 返回格式错误，无法解析", "questions_added": 0, "ocr_called": agent_used_tool}
+
+    # two_stage：Stage1 已入队 stage2_pending；粗题已写入 questions，Stage2 仅 UPDATE 精答案
+    if status == "stage2_pending":
+        _qc = 0
+        if url:
+            try:
+                with sqlite_service._get_conn() as _c:
+                    _r = _c.execute(
+                        "SELECT COUNT(*) AS c FROM questions WHERE source_url=?",
+                        (url,),
+                    ).fetchone()
+                    _qc = int(_r["c"]) if _r else 0
+            except Exception:
+                _qc = 0
+        sqlite_service.update_task_status(
+            task_id,
+            "stage2_pending",
+            raw_content=raw_content,
+            agent_used_tool=agent_used_tool,
+            extract_duration_min=round((time.time() - _t0) / 60, 2),
+            trace_session_id=trace_session_id,
+            questions_count=_qc,
+        )
+        logger.info(
+            "[SingleTask] Stage1 完成已入队 Stage2 task_id=%s 粗题入库=%d trace=%s",
+            task_id,
+            _qc,
+            (trace_session_id or "")[:16] + ("…" if trace_session_id and len(trace_session_id) > 16 else ""),
+        )
+        return {
+            "status": "ok",
+            "message": f"Stage1 完成：已入库 {_qc} 道粗题，已入队待 Stage2 精加工",
+            "questions_added": _qc,
+            "ocr_called": agent_used_tool,
+        }
 
     if questions:
         # 根据是否调用了 OCR 工具判断题目来源（与批量提取逻辑一致）

@@ -10,6 +10,52 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+
+def fix_literal_newlines_in_json_double_quoted_strings(text: str) -> str:
+    """
+    将「双引号字符串值内」非法的裸换行/控制字符转为 JSON 转义（\\n、\\t、\\uXXXX）。
+    模型常按 Prompt 在 answer_text 里直接敲回车，导致整段非合法 JSON；本函数在解析前修补。
+    不影响字符串外（如缩进换行）的空白；遵循 JSON 内 \\\" \\\\ 等转义规则。
+    """
+    if not text:
+        return text
+    out: List[str] = []
+    i = 0
+    n = len(text)
+    in_string = False
+    escape = False
+    while i < n:
+        c = text[i]
+        if not in_string:
+            if c == '"':
+                in_string = True
+            out.append(c)
+        else:
+            if escape:
+                out.append(c)
+                escape = False
+            elif c == "\\":
+                out.append(c)
+                escape = True
+            elif c == '"':
+                in_string = False
+                out.append(c)
+            elif c == "\r":
+                if i + 1 < n and text[i + 1] == "\n":
+                    i += 1
+                out.extend(["\\", "n"])
+            elif c == "\n":
+                out.extend(["\\", "n"])
+            elif c == "\t":
+                out.extend(["\\", "t"])
+            elif ord(c) < 32:
+                out.append(f"\\u{ord(c):04x}")
+            else:
+                out.append(c)
+        i += 1
+    return "".join(out)
+
+
 # 标准输出字段（下游微调期望的 7 字段）
 STD_FIELDS = ["question_text", "answer_text", "raw_answer", "difficulty", "question_type", "topic_tags", "company", "position"]
 
@@ -46,6 +92,9 @@ def _normalize_s1_item(item: Dict) -> Dict:
     # raw_answer 默认用 answer_text
     if not out.get("raw_answer") and out.get("answer_text"):
         out["raw_answer"] = out["answer_text"]
+    qid = item.get("q_id")
+    if qid:
+        out["q_id"] = str(qid).strip()
     return out
 
 
@@ -58,25 +107,26 @@ def _get_qt(item: Dict) -> str:
 def _parse_stage2_list_relaxed(text: str) -> Optional[List[Dict[str, Any]]]:
     """
     宽松解析 Stage2 输出：
-    1) 先走标准 JSON（strict=False，允许控制字符）；
+    1) 先修补字符串内裸换行，再标准 json.loads；
     2) 失败后，按 question_text/answer_text 模式兜底提取（保留 Markdown 原文）。
     """
     if not text or not text.strip():
         return []
 
+    fixed = fix_literal_newlines_in_json_double_quoted_strings(text.strip())
     try:
-        data = json.loads(text, strict=False)
+        data = json.loads(fixed, strict=False)
         if isinstance(data, list):
             return data
     except Exception:
         pass
 
     # 兜底：从数组文本中按对象模式提取，兼容 answer_text 中出现未转义双引号的情况。
-    start = text.find("[")
-    end = text.rfind("]")
+    start = fixed.find("[")
+    end = fixed.rfind("]")
     if start == -1 or end == -1 or end <= start:
         return None
-    body = text[start : end + 1]
+    body = fixed[start : end + 1]
 
     pattern = re.compile(
         r'\{\s*"question_text"\s*:\s*"(?P<qt>.*?)"\s*,\s*"answer_text"\s*:\s*"(?P<ans>.*?)"\s*\}(?=\s*,|\s*\])',
@@ -162,6 +212,9 @@ def merge_stage2_with_stage1(stage2_output: str, stage1_output: str) -> str:
         # question_text：若仍空，用 Stage1
         if not row.get("question_text") and s1.get("question_text"):
             row["question_text"] = s1["question_text"]
+        _qid = s1.get("q_id") or item.get("q_id")
+        if _qid:
+            row["q_id"] = str(_qid).strip()
         merged.append(row)
 
     return json.dumps(merged, ensure_ascii=False)

@@ -12,18 +12,24 @@ import csv
 import io
 import json
 import logging
+import os
 import re
 import sqlite3
+import subprocess
+import sys
+import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 
-from backend.config.config import settings
+from backend.config.config import settings, _get as _env_get
 from backend.services.finetune.stage_merge_utils import merge_stage2_with_stage1, is_stage2_incomplete
 
 logger = logging.getLogger(__name__)
+
+_TRAIN_SPAWN_LOCK = threading.Lock()
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]  # backend/services/finetune -> 项目根
 _FINETUNE_DIR = _PROJECT_ROOT / "微调"
@@ -514,6 +520,46 @@ def get_sample(sample_id: int) -> Optional[Dict]:
 # 辅助大模型生成
 # ===========================================================
 
+def openai_miner_style_extract(
+    *,
+    content: str,
+    title: str = "",
+    model: str,
+    api_key: Optional[str],
+    base_url: str,
+    temperature: float,
+    timeout: float = 120.0,
+) -> Dict:
+    """
+    使用与「微调辅助标注」相同的 system prompt，通过 OpenAI 兼容接口做一次面经结构化提取。
+    成功返回 {"output": str, "model": str}，失败返回 {"error": str}
+    """
+    if not base_url:
+        return {"error": "未配置 base_url"}
+    if not model:
+        return {"error": "未配置 model"}
+    full_content = content
+    if title:
+        full_content = f"【帖子标题】{title}\n\n【面经正文】\n{content}"
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key or "sk-dummy", base_url=base_url, timeout=timeout)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _ASSIST_SYSTEM_PROMPT},
+                {"role": "user", "content": f"## 面经原文\n{full_content}\n\n请提取所有面试题并输出 JSON 数组。"},
+            ],
+            temperature=temperature,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        return {"output": raw, "model": model}
+    except Exception as e:
+        logger.error("openai_miner_style_extract 失败: %s", e)
+        return {"error": str(e)}
+
+
 def assist_generate(content: str, title: str = "", model: str = None, api_key: str = None,
                     base_url: str = None, temperature: float = None) -> Dict:
     """
@@ -524,31 +570,231 @@ def assist_generate(content: str, title: str = "", model: str = None, api_key: s
     _api_key = api_key or settings.finetune_llm_api_key
     _base_url = base_url or settings.finetune_llm_base_url
     _temp = temperature if temperature is not None else settings.finetune_llm_temperature
+    to = float(settings.finetune_llm_timeout or 120)
+    return openai_miner_style_extract(
+        content=content,
+        title=title,
+        model=_model,
+        api_key=_api_key,
+        base_url=_base_url,
+        temperature=_temp,
+        timeout=to,
+    )
 
-    if not _base_url:
-        return {"error": "未配置 FINETUNE_LLM_BASE_URL"}
 
-    # 拼接标题和内容
-    full_content = content
-    if title:
-        full_content = f"【帖子标题】{title}\n\n【面经正文】\n{content}"
+def list_model_compare_presets() -> List[Dict]:
+    """模型对比页可选预设（不含密钥）。"""
+    finetuned = settings.compare_finetuned_ollama_model
+    presets = [
+        {
+            "id": "miner_local",
+            "label": "Miner · 本地",
+            "description": "与数据采集/Miner 一致的本地 OpenAI 兼容端点（通常为 Ollama 基座）",
+            "model": settings.miner_local_model or "",
+            "base_url": settings.miner_local_base_url or "",
+            "configured": bool(
+                (settings.miner_local_model or "").strip() and (settings.miner_local_base_url or "").strip()
+            ),
+        },
+        {
+            "id": "finetuned_local",
+            "label": "本地 · 微调后",
+            "description": "同一本地端点，换用 COMPARE_FINETUNED_OLLAMA_MODEL 指定的模型名（如已导入的 LoRA/GGUF）",
+            "model": finetuned,
+            "base_url": settings.miner_local_base_url or "",
+            "configured": bool(
+                finetuned and (settings.miner_local_base_url or "").strip()
+            ),
+        },
+        {
+            "id": "miner_remote",
+            "label": "Miner · 远程",
+            "description": "Miner 远程 API（如火山等）",
+            "model": settings.miner_remote_model or "",
+            "base_url": (settings.miner_remote_base_url or "")[:56] + "…"
+            if len(settings.miner_remote_base_url or "") > 56
+            else (settings.miner_remote_base_url or ""),
+            "configured": bool(
+                (settings.miner_remote_model or "").strip()
+                and (settings.miner_remote_base_url or "").strip()
+            ),
+        },
+        {
+            "id": "finetune_assist",
+            "label": "标注辅助模型",
+            "description": "微调页「AI 辅助」当前使用的 FINETUNE_* 配置",
+            "model": settings.finetune_llm_model or "",
+            "base_url": (settings.finetune_llm_base_url or "")[:56] + "…"
+            if len(settings.finetune_llm_base_url or "") > 56
+            else (settings.finetune_llm_base_url or ""),
+            "configured": bool(
+                (settings.finetune_llm_model or "").strip()
+                and (settings.finetune_llm_base_url or "").strip()
+            ),
+        },
+        {
+            "id": "app_remote",
+            "label": "全局远程（练习对话）",
+            "description": "与 LLM_MODE=remote 时主对话相同的远程模型",
+            "model": settings.llm_remote_model or "",
+            "base_url": (settings.llm_remote_base_url or "")[:56] + "…"
+            if len(settings.llm_remote_base_url or "") > 56
+            else (settings.llm_remote_base_url or ""),
+            "configured": bool(
+                (settings.llm_remote_model or "").strip()
+                and (settings.llm_remote_base_url or "").strip()
+            ),
+        },
+    ]
+    return presets
 
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=_api_key or "sk-dummy", base_url=_base_url, timeout=120)
-        resp = client.chat.completions.create(
-            model=_model,
-            messages=[
-                {"role": "system", "content": _ASSIST_SYSTEM_PROMPT},
-                {"role": "user", "content": f"## 面经原文\n{full_content}\n\n请提取所有面试题并输出 JSON 数组。"},
-            ],
-            temperature=_temp,
+
+def _resolve_compare_preset(preset_id: str) -> Optional[Dict]:
+    """解析预设为 openai_miner_style_extract 参数。失败返回 None。"""
+    temp = settings.finetune_llm_temperature
+    if preset_id == "miner_local":
+        if not (settings.miner_local_model and settings.miner_local_base_url):
+            return None
+        return {
+            "model": settings.miner_local_model,
+            "api_key": _env_get("MINER_LOCAL_API_KEY") or settings.llm_local_api_key,
+            "base_url": settings.miner_local_base_url,
+            "timeout": float(settings.miner_local_timeout or 120),
+            "temperature": temp,
+        }
+    if preset_id == "finetuned_local":
+        m = settings.compare_finetuned_ollama_model
+        if not m or not settings.miner_local_base_url:
+            return None
+        return {
+            "model": m,
+            "api_key": _env_get("MINER_LOCAL_API_KEY") or settings.llm_local_api_key,
+            "base_url": settings.miner_local_base_url,
+            "timeout": float(settings.miner_local_timeout or 120),
+            "temperature": temp,
+        }
+    if preset_id == "miner_remote":
+        if not (settings.miner_remote_model and settings.miner_remote_base_url):
+            return None
+        return {
+            "model": settings.miner_remote_model,
+            "api_key": settings.miner_remote_api_key,
+            "base_url": settings.miner_remote_base_url,
+            "timeout": float(settings.miner_remote_timeout or 180),
+            "temperature": temp,
+        }
+    if preset_id == "finetune_assist":
+        if not (settings.finetune_llm_model and settings.finetune_llm_base_url):
+            return None
+        return {
+            "model": settings.finetune_llm_model,
+            "api_key": settings.finetune_llm_api_key,
+            "base_url": settings.finetune_llm_base_url,
+            "timeout": float(settings.finetune_llm_timeout or 120),
+            "temperature": temp,
+        }
+    if preset_id == "app_remote":
+        if not (settings.llm_remote_model and settings.llm_remote_base_url):
+            return None
+        return {
+            "model": settings.llm_remote_model,
+            "api_key": settings.llm_remote_api_key,
+            "base_url": settings.llm_remote_base_url,
+            "timeout": float(settings.llm_remote_timeout or 300),
+            "temperature": temp,
+        }
+    return None
+
+
+def _preset_label(preset_id: str) -> str:
+    for p in list_model_compare_presets():
+        if p["id"] == preset_id:
+            return p["label"]
+    return preset_id
+
+
+def compare_models_parallel(preset_ids: List[str], content: str, title: str = "") -> Dict:
+    """
+    并行对多个预设调用同一套面经提取提示，用于对比输出。
+    preset_ids 顺序在返回结果中保持。
+    """
+    import concurrent.futures
+    import time as _time
+
+    def _one(pid: str) -> Dict:
+        t0 = _time.perf_counter()
+        meta = _resolve_compare_preset(pid)
+        if not meta:
+            return {
+                "preset_id": pid,
+                "label": _preset_label(pid),
+                "ok": False,
+                "error": "该预设未配置完整，请检查 .env",
+                "output": "",
+                "model": "",
+                "latency_ms": 0,
+                "question_count": None,
+            }
+        r = openai_miner_style_extract(
+            content=content,
+            title=title,
+            model=meta["model"],
+            api_key=meta["api_key"],
+            base_url=meta["base_url"],
+            temperature=meta["temperature"],
+            timeout=meta["timeout"],
         )
-        raw = (resp.choices[0].message.content or "").strip()
-        return {"output": raw, "model": _model}
-    except Exception as e:
-        logger.error("辅助大模型调用失败: %s", e)
-        return {"error": str(e)}
+        ms = int((_time.perf_counter() - t0) * 1000)
+        if r.get("error"):
+            return {
+                "preset_id": pid,
+                "label": _preset_label(pid),
+                "ok": False,
+                "error": r["error"],
+                "output": "",
+                "model": meta.get("model", ""),
+                "latency_ms": ms,
+                "question_count": None,
+            }
+        out = r.get("output") or ""
+        qn = None
+        try:
+            parsed = json.loads(out)
+            if isinstance(parsed, list):
+                qn = len(parsed)
+        except Exception:
+            pass
+        return {
+            "preset_id": pid,
+            "label": _preset_label(pid),
+            "ok": True,
+            "error": None,
+            "output": out,
+            "model": r.get("model", meta.get("model", "")),
+            "latency_ms": ms,
+            "question_count": qn,
+        }
+
+    n = len(preset_ids)
+    results: List[Optional[Dict]] = [None] * n
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, n)) as ex:
+        futs = {ex.submit(_one, preset_ids[i]): i for i in range(n)}
+        for fut in concurrent.futures.as_completed(futs):
+            idx = futs[fut]
+            try:
+                results[idx] = fut.result()
+            except Exception as e:
+                results[idx] = {
+                    "preset_id": preset_ids[idx],
+                    "label": _preset_label(preset_ids[idx]),
+                    "ok": False,
+                    "error": str(e),
+                    "output": "",
+                    "model": "",
+                    "latency_ms": 0,
+                    "question_count": None,
+                }
+    return {"results": [r for r in results if r is not None]}
 
 
 # ===========================================================
@@ -1162,7 +1408,8 @@ def import_faq(
 
 DEFAULT_RUN_CONFIG = {
     "base_model": "qwen3:4b",
-    "method": "lora",
+    # 8GB 显存笔记本默认用 QLoRA（4bit），全精度 LoRA 易 OOM
+    "method": "qlora",
     "output_name": "qwen3-4b-miner-lora",
     "lora_r": 16,
     "lora_alpha": 32,
@@ -1172,7 +1419,7 @@ DEFAULT_RUN_CONFIG = {
     "num_epochs": 3,
     "per_device_train_batch_size": 2,
     "gradient_accumulation_steps": 8,
-    "max_seq_length": 2048,
+    "max_seq_length": 4096,
     "warmup_ratio": 0.1,
     "weight_decay": 0.01,
     "use_rslora": True,
@@ -1180,12 +1427,23 @@ DEFAULT_RUN_CONFIG = {
 }
 
 
+def _normalize_max_seq_length(v) -> int:
+    """与前端一致：256–8192（长输出 SFT 可设 4096/8192，8GB 建议先试 4096）。"""
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        n = int(DEFAULT_RUN_CONFIG["max_seq_length"])
+    return max(256, min(8192, n))
+
+
 def get_run_config() -> Dict:
     """获取当前微调运行配置"""
     if _RUN_CONFIG_PATH.exists():
         try:
             data = json.loads(_RUN_CONFIG_PATH.read_text(encoding="utf-8"))
-            return {**DEFAULT_RUN_CONFIG, **data}
+            cfg = {**DEFAULT_RUN_CONFIG, **data}
+            cfg["max_seq_length"] = _normalize_max_seq_length(cfg.get("max_seq_length"))
+            return cfg
         except Exception as e:
             logger.warning("读取微调配置失败: %s", e)
     return dict(DEFAULT_RUN_CONFIG)
@@ -1197,6 +1455,7 @@ def save_run_config(config: Dict) -> Dict:
     allowed = set(DEFAULT_RUN_CONFIG.keys()) | {"lora_target_modules"}
     merged = {**DEFAULT_RUN_CONFIG, **{k: v for k, v in config.items() if k in allowed}}
     merged.pop("bf16", None)  # 兼容旧配置，不再保存 bf16
+    merged["max_seq_length"] = _normalize_max_seq_length(merged.get("max_seq_length"))
     _RUN_CONFIG_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"status": "ok", "path": str(_RUN_CONFIG_PATH)}
 
@@ -1213,13 +1472,107 @@ def _parse_lr(v) -> float:
         return 2e-4
 
 
-def generate_training_script(config: Dict = None, sample_ids: List[int] = None) -> Dict:
+def _finetune_train_log_path(run_id: int) -> Path:
+    d = _FINETUNE_DIR / "logs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"train_run_{run_id}.log"
+
+
+def _run_finetune_training_worker(run_id: int, script_path: Path) -> None:
+    """后台线程：在「微调」目录下用当前 Python 解释器执行 train_lora.py，日志写入文件。"""
+    from backend.services.storage.sqlite_service import sqlite_service
+
+    cwd = _FINETUNE_DIR.resolve()
+    log_path = _finetune_train_log_path(run_id)
+    log_path_resolved = log_path.resolve()
+    exe = sys.executable
+    script_name = script_path.name
+    try:
+        with open(log_path, "ab") as logf:
+            header = f"\n# ---- run_id={run_id} {now_beijing_str()} ----\n"
+            logf.write(header.encode("utf-8", errors="replace"))
+            logf.flush()
+            child_env = os.environ.copy()
+            # Windows + Unsloth：减少 torch.compile / inductor 与 triton-windows 的冲突
+            child_env.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
+            child_env.setdefault("TOKENIZERS_PARALLELISM", "false")
+            # 国内访问 huggingface.co 易超时：默认走镜像（可用环境变量 HF_ENDPOINT 覆盖）
+            child_env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+            child_env.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
+            child_env["PYTHONUNBUFFERED"] = "1"
+            proc = subprocess.Popen(
+                [exe, "-u", script_name],
+                cwd=str(cwd),
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                env=child_env,
+            )
+            logger.info(
+                "微调训练子进程已启动 run_id=%s 日志文件=%s 路径=%s",
+                run_id,
+                log_path_resolved.name,
+                log_path_resolved,
+            )
+            code = proc.wait()
+    except Exception:
+        logger.exception("微调训练进程异常 run_id=%s", run_id)
+        ended = now_beijing().isoformat(timespec="seconds")
+        sqlite_service.update_finetune_run_status(run_id, "failed", ended_at=ended)
+        return
+    ended = now_beijing().isoformat(timespec="seconds")
+    if code == 0:
+        sqlite_service.update_finetune_run_status(run_id, "completed", ended_at=ended)
+        logger.info("微调训练完成 run_id=%s", run_id)
+    else:
+        sqlite_service.update_finetune_run_status(run_id, "failed", ended_at=ended)
+        logger.warning(
+            "微调训练非正常退出 run_id=%s code=%s 日志文件=%s 路径=%s",
+            run_id,
+            code,
+            log_path_resolved.name,
+            log_path_resolved,
+        )
+
+
+def _try_spawn_finetune_training(run_id: int, script_path: Path) -> Dict:
+    """在进程内启动后台训练；同一时刻仅允许一条 running。"""
+    from backend.services.storage.sqlite_service import sqlite_service
+
+    with _TRAIN_SPAWN_LOCK:
+        if sqlite_service.finetune_has_running_run():
+            return {
+                "training_started": False,
+                "training_error": "已有任务正在训练中，请等待结束后再启动",
+                "train_log_path": None,
+            }
+        started = now_beijing().isoformat(timespec="seconds")
+        if not sqlite_service.update_finetune_run_status(run_id, "running", started_at=started):
+            return {"training_started": False, "training_error": "训练记录更新失败", "train_log_path": None}
+    t = threading.Thread(
+        target=_run_finetune_training_worker,
+        args=(run_id, script_path),
+        name=f"finetune_train_{run_id}",
+        daemon=True,
+    )
+    t.start()
+    return {
+        "training_started": True,
+        "training_error": None,
+        "train_log_path": str(_finetune_train_log_path(run_id)),
+    }
+
+
+def generate_training_script(
+    config: Dict = None, sample_ids: List[int] = None, run_training: bool = True
+) -> Dict:
     """
     根据配置生成 Unsloth LoRA/QLoRA 训练脚本。
     数据格式：将 labeled_data.jsonl (prompt/completion) 转为 instruction 格式。
     sample_ids: 可选，指定则先导出这些样本到 labeled_data.jsonl，再生成脚本；否则使用已有 labeled_data.jsonl。
+    run_training: True 时在后台用当前解释器启动 train_lora.py（需已安装 unsloth 等，且与后端 Python 环境一致）。
     """
     cfg = {**DEFAULT_RUN_CONFIG, **(config or {})}
+    cfg["max_seq_length"] = _normalize_max_seq_length(cfg.get("max_seq_length"))
     cfg["learning_rate"] = _parse_lr(cfg.get("learning_rate"))
     _FINETUNE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1271,22 +1624,64 @@ def generate_training_script(config: Dict = None, sample_ids: List[int] = None) 
     else:
         hf_model = base_model
 
+    # 训练精度（写入 train_lora.py 的常量，不可在 f-string 里写 _prec=cfg... 否则会当作外层求值）
+    _prec_raw = cfg.get("precision")
+    if isinstance(_prec_raw, str) and _prec_raw.strip():
+        prec = _prec_raw.strip().lower()
+    elif isinstance(cfg.get("bf16"), bool):
+        prec = "bf16" if cfg.get("bf16") else "fp16"
+    else:
+        prec = "bf16"
+    bf16_training = prec in ("bf16", "4bit")
+    fp16_training = prec == "fp16"
+
     script_content = f'''# -*- coding: utf-8 -*-
 # 一键微调脚本（Unsloth LoRA/QLoRA）
 # 生成时间: {now_beijing_str()}
 # 使用: pip install unsloth datasets trl transformers && python train_lora.py
+# 建议用无缓冲运行: python -u train_lora.py（后端子进程已带 -u）
+
+import os
+import sys
+from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+# 须在 import unsloth 之前：降低 Windows 上 inductor/triton 相关问题
+os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# 国内网络：拉取基座模型（默认可用环境变量 HF_ENDPOINT 覆盖为官方源）
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
+
+import json
+import time
+from datetime import datetime
 
 from unsloth import FastLanguageModel
 from datasets import load_dataset
 import torch
 
+
+def tlog(msg: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{{ts}}] {{msg}}", flush=True)
+
+# 路径相对本脚本目录，避免 Windows 下反斜杠转义（\\\\t 等）导致路径错误
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_OUTPUT_SUBDIR = {json.dumps(output_name)}
+OUTPUT_DIR = str(_SCRIPT_DIR / "lora_output" / _OUTPUT_SUBDIR)
+DATA_PATH = str(_SCRIPT_DIR / "training_data_alpaca.jsonl")
+
 # ========== 配置（来自微调界面） ==========
 # 基座模型：{base_model} -> {hf_model}
 BASE_MODEL = "{hf_model}"
-OUTPUT_DIR = "{output_dir}"
-DATA_PATH = "{converted_path}"
 LOAD_IN_4BIT = {str(load_in_4bit)}
-MAX_SEQ_LENGTH = {int(cfg.get("max_seq_length", 2048))}
+MAX_SEQ_LENGTH = {int(cfg["max_seq_length"])}
 LORA_R = {int(cfg.get("lora_r", 16))}
 LORA_ALPHA = {int(cfg.get("lora_alpha", 32))}
 LORA_DROPOUT = {float(cfg.get("lora_dropout", 0.05))}
@@ -1297,13 +1692,30 @@ GRAD_ACCUM = {int(cfg.get("gradient_accumulation_steps", 8))}
 WARMUP_RATIO = {float(cfg.get("warmup_ratio", 0.1))}
 WEIGHT_DECAY = {float(cfg.get("weight_decay", 0.01))}
 USE_RSLORA = {str(cfg.get("use_rslora", True))}
-# 训练精度: bf16/fp16/fp32，QLoRA 时 4bit 表示基座量化
-_prec = cfg.get("precision") or (cfg.get("bf16", True) if isinstance(cfg.get("bf16"), bool) else "bf16")
-BF16 = {str(_prec == "bf16" or _prec == "4bit")}
-FP16 = {str(_prec == "fp16")}
+# 训练精度: {prec}（bf16/fp16；QLoRA 时 4bit 与 bf16 训练可并存）
+BF16 = {str(bf16_training)}
+FP16 = {str(fp16_training)}
+# Windows 上 datasets 多进程易出问题，改为 0（主进程）
+_DATASET_NUM_PROC = 0 if sys.platform == "win32" else 2
+# 调试时可设 FINETUNE_MAX_STEPS=10 只跑几步验证链路（不设则按 num_epochs 完整训练）
+_fin_ms = os.environ.get("FINETUNE_MAX_STEPS", "").strip()
+TRAIN_MAX_STEPS = int(_fin_ms) if _fin_ms.isdigit() else -1
+_ls = os.environ.get("FINETUNE_LOGGING_STEPS", "").strip()
+LOGGING_STEPS = max(1, int(_ls)) if _ls.isdigit() else 1
+_rep = os.environ.get("FINETUNE_REPORT_TO", "").strip().lower()
+if _rep in ("tensorboard", "tb"):
+    REPORT_TO = "tensorboard"
+elif _rep == "wandb":
+    REPORT_TO = "wandb"
+else:
+    REPORT_TO = "none"
 
 def main():
-    print("加载模型...")
+    if not Path(DATA_PATH).is_file():
+        raise SystemExit(f"数据文件不存在: {{DATA_PATH}}")
+    if not torch.cuda.is_available():
+        raise SystemExit("未检测到 CUDA：请安装 GPU 版 PyTorch（如 2.5.1+cu124）后再训练。")
+    tlog("加载模型...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=BASE_MODEL,
         max_seq_length=MAX_SEQ_LENGTH,
@@ -1317,8 +1729,8 @@ def main():
         target_modules={target_modules},
         use_rslora=USE_RSLORA,
     )
-    print("加载数据...")
-    dataset = load_dataset("json", data_files=str(DATA_PATH), split="train")
+    tlog("加载数据...")
+    dataset = load_dataset("json", data_files=DATA_PATH, split="train")
     def format_instruction(example):
         text = f"""<|im_start|>user
 {{example["instruction"]}}
@@ -1327,19 +1739,123 @@ def main():
 <|im_start|>assistant
 {{example["output"]}}<|im_end|>"""
         return {{"text": text}}
-    dataset = dataset.map(format_instruction, remove_columns=dataset.column_names)
+    dataset = dataset.map(
+        format_instruction,
+        remove_columns=dataset.column_names,
+        num_proc=_DATASET_NUM_PROC,
+    )
     from trl import SFTTrainer
-    from transformers import TrainingArguments
+    from transformers import TrainingArguments, TrainerCallback
+
+    class _StepHeartbeatCallback(TrainerCallback):
+        def __init__(self):
+            self._seen = False
+
+        def on_step_begin(self, args, state, control, **kwargs):
+            if not self._seen:
+                self._seen = True
+                tlog("已进入训练迭代：第 1 个 micro-batch 开始（长序列/首次 GPU 计算可能较慢，请等待 loss 日志）")
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs:
+                return
+            parts = []
+            for k, v in logs.items():
+                if isinstance(v, float):
+                    parts.append(f"{{k}}={{v:.6f}}")
+                else:
+                    parts.append(f"{{k}}={{v}}")
+            tlog(f"step {{state.global_step}} | " + " | ".join(parts))
+
+    class _EpochTimingCallback(TrainerCallback):
+        def __init__(self, out_path: Path):
+            self.out_path = out_path
+            self._train_t0 = None
+            self._epoch_t0 = None
+            self._epoch_num = None
+            self.per_epoch = []
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            self._train_t0 = time.perf_counter()
+
+        def on_epoch_begin(self, args, state, control, **kwargs):
+            self._epoch_t0 = time.perf_counter()
+            try:
+                self._epoch_num = int(state.epoch) + 1
+            except (TypeError, ValueError):
+                self._epoch_num = 1
+
+        def on_epoch_end(self, args, state, control, **kwargs):
+            if self._epoch_t0 is None:
+                return
+            dur = time.perf_counter() - self._epoch_t0
+            en = self._epoch_num or 1
+            rec = dict(
+                epoch=en,
+                duration_sec=round(dur, 3),
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+            )
+            self.per_epoch.append(rec)
+            tlog(f"Epoch {{en}} 完成，本 epoch 用时 {{dur:.1f}}s（约 {{dur / 60:.2f}} min）")
+            self._write_json(total_sec=None)
+
+        def on_train_end(self, args, state, control, **kwargs):
+            total = None
+            if self._train_t0 is not None:
+                total = round(time.perf_counter() - self._train_t0, 3)
+            self._write_json(total_sec=total)
+            if total is not None:
+                tlog(
+                    f"训练总用时 {{total}}s（约 {{total / 60:.2f}} min），各 epoch 耗时已写入 {{self.out_path}}"
+                )
+
+        def _write_json(self, total_sec):
+            payload = dict(
+                output_dir=str(self.out_path.parent.resolve()),
+                per_epoch=self.per_epoch,
+                total_training_sec=total_sec,
+                updated_at=datetime.now().isoformat(timespec="seconds"),
+            )
+            self.out_path.parent.mkdir(parents=True, exist_ok=True)
+            self.out_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    epoch_json = Path(OUTPUT_DIR) / "epoch_times.json"
+    n_gpu = max(1, torch.cuda.device_count())
+    eff_batch = BATCH_SIZE * GRAD_ACCUM * n_gpu
+    tlog(
+        f"有效 batch size = 每卡{{BATCH_SIZE}} × 梯度累积{{GRAD_ACCUM}} × GPU{{n_gpu}} = {{eff_batch}}；"
+        "慢多为序列长与反传开销，非单纯「batch 大」。OOM 时优先减 BATCH_SIZE 或 MAX_SEQ_LENGTH。"
+    )
+    tlog(f"开始训练… logging_steps={{LOGGING_STEPS}}，max_steps={{TRAIN_MAX_STEPS}}，样本数={{len(dataset)}}，report_to={{REPORT_TO}}")
+    if REPORT_TO == "tensorboard":
+        _tb = Path(OUTPUT_DIR) / "tensorboard"
+        tlog(
+            "TensorBoard 目录: "
+            + str(_tb.resolve())
+            + '  执行: tensorboard --logdir "'
+            + str(_tb)
+            + '"'
+        )
+    elif REPORT_TO == "wandb":
+        tlog("已启用 W&B，需本机已 wandb login；浏览器可查看曲线。")
+    tlog("首个 optimizer step 前向+反传可能需数分钟，请等待下方带时间的 loss 行。")
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
         dataset_text_field="text",
         max_seq_length=MAX_SEQ_LENGTH,
-        dataset_num_proc=2,
+        dataset_num_proc=_DATASET_NUM_PROC,
         packing=False,
+        callbacks=[
+            _StepHeartbeatCallback(),
+            _EpochTimingCallback(epoch_json),
+        ],
         args=TrainingArguments(
-            output_dir=str(OUTPUT_DIR),
+            output_dir=OUTPUT_DIR,
             per_device_train_batch_size=BATCH_SIZE,
             gradient_accumulation_steps=GRAD_ACCUM,
             learning_rate=LEARNING_RATE,
@@ -1348,14 +1864,21 @@ def main():
             weight_decay=WEIGHT_DECAY,
             bf16=BF16,
             fp16=FP16,
-            logging_steps=10,
+            logging_steps=LOGGING_STEPS,
             save_strategy="epoch",
+            report_to=REPORT_TO,
+            logging_dir=str(Path(OUTPUT_DIR) / "tensorboard")
+            if REPORT_TO == "tensorboard"
+            else None,
+            dataloader_pin_memory=False,
+            max_steps=TRAIN_MAX_STEPS,
+            disable_tqdm=False,
         ),
     )
     trainer.train()
     model.save_pretrained(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
-    print(f"训练完成，模型已保存到 {{OUTPUT_DIR}}")
+    tlog(f"训练完成，模型已保存到 {{OUTPUT_DIR}}")
 
 if __name__ == "__main__":
     main()
@@ -1380,12 +1903,33 @@ if __name__ == "__main__":
         logger.warning("保存训练记录失败: %s", e)
         run_id = None
 
-    return {
+    out = {
         "status": "ok",
         "run_id": run_id,
         "script_path": str(script_path),
         "data_path": str(converted_path),
         "output_dir": str(output_dir),
         "sample_count": count,
-        "message": f"已生成训练脚本，共 {count} 条样本。请执行: cd 微调 && python {script_path.name}",
+        "training_started": False,
+        "train_log_path": None,
+        "training_error": None,
+        "message": f"已生成训练脚本，共 {count} 条样本。",
     }
+    if run_id is not None and run_training:
+        sp = _try_spawn_finetune_training(run_id, script_path)
+        out["training_started"] = sp["training_started"]
+        out["train_log_path"] = sp.get("train_log_path")
+        out["training_error"] = sp.get("training_error")
+        if sp["training_started"]:
+            out["message"] = (
+                f"已生成脚本并于服务器后台启动训练（{count} 条）。日志：{sp.get('train_log_path')}"
+            )
+        elif sp.get("training_error"):
+            out["message"] = (
+                f"已生成训练脚本（{count} 条），但未启动后台训练：{sp['training_error']}"
+            )
+    elif run_id is not None and not run_training:
+        out["message"] = (
+            f"已生成训练脚本，共 {count} 条。未自动训练；可在本机「微调」目录下使用与后端相同的 Python 执行 {script_path.name}。"
+        )
+    return out

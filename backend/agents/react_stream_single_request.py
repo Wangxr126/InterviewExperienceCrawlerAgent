@@ -62,9 +62,25 @@ async def react_arun_stream_single_tool_stream(
         final_answer = None
 
         _n = len(input_text)
-        _prev = input_text[:400] + ("…" if _n > 400 else "")
-        logger.info("🤖 %s 开始处理问题（%d 字，预览前 400 字）: %s", agent.name, _n, _prev)
-        logger.debug("%s 完整 user 输入:\n%s", agent.name, input_text)
+        try:
+            from backend.config.config import settings as _settings
+
+            _cap = int(getattr(_settings, "miner_log_input_preview_chars", 0) or 0)
+        except Exception:
+            _cap = 0
+        if _cap <= 0:
+            _prev = input_text
+            logger.info("🤖 %s 开始处理问题（完整日志 %d 字）: %s", agent.name, _n, _prev)
+        else:
+            _prev = input_text[:_cap] + ("…" if _n > _cap else "")
+            logger.info(
+                "🤖 %s 开始处理问题（%d 字，预览前 %d 字，MINER_LOG_INPUT_PREVIEW_CHARS）: %s",
+                agent.name,
+                _n,
+                _cap,
+                _prev,
+            )
+            logger.debug("%s 完整 user 输入:\n%s", agent.name, input_text)
         logger.info("[react_stream_single] 每步单请求 stream+tools（astream_invoke_with_tools）")
 
         stream_kw = _llm_stream_kwargs(agent, kwargs)

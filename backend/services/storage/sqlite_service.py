@@ -189,7 +189,7 @@ class SqliteService:
                 created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """,
-            # ── 微调样本表（Miner 两阶段：Stage1 本地 Qwen3 + Stage2 豆包 API）──
+            # ── 微调样本表（Miner 两阶段：Stage1 MINER_REMOTE 粗提取 + Stage2 豆包 API）──
             """
             CREATE TABLE IF NOT EXISTS finetune_samples (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1775,6 +1775,84 @@ class SqliteService:
                 """, (post_title or "", raw_content or "", img_val, task_id))
                 conn.commit()
 
+    def persist_stage1_questions_rough(
+        self,
+        task_id: str,
+        source_url: str,
+        question_items: List[Dict[str, Any]],
+        ocr_called: bool,
+    ) -> int:
+        """
+        two_stage 异步：Stage1 完成后立即写入 questions。
+        每条须含 q_id；answer_text / raw_answer 暂为粗提取，Stage2 按 q_id UPDATE 精加工结果。
+        先按 source_url 删除旧题再插入（与全量重提一致）。
+        """
+        if not source_url or not question_items:
+            return 0
+        extraction_src = "image" if ocr_called else "content"
+        n = 0
+        try:
+            with self._get_conn() as conn:
+                row = conn.execute(
+                    "SELECT id, source_platform FROM crawl_tasks WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
+                crawl_task_id = int(row["id"]) if row and row["id"] is not None else None
+                plat = (row["source_platform"] if row else "") or ""
+                conn.execute("DELETE FROM questions WHERE source_url=?", (source_url,))
+                for q in question_items:
+                    if not isinstance(q, dict) or not (q.get("question_text") or "").strip():
+                        continue
+                    qid = (q.get("q_id") or "").strip()
+                    if not qid:
+                        continue
+                    qt = (q.get("question_text") or "").strip()
+                    tags = q.get("topic_tags") or []
+                    if isinstance(tags, str):
+                        try:
+                            tags = json.loads(tags)
+                        except Exception:
+                            tags = []
+                    if not isinstance(tags, list):
+                        tags = []
+                    ans_raw = q.get("answer_text")
+                    ans = (ans_raw if isinstance(ans_raw, str) else str(ans_raw or "")).strip()
+                    raw_raw = q.get("raw_answer")
+                    raw = (raw_raw if isinstance(raw_raw, str) else str(raw_raw or "")).strip() or ans
+                    bl = q.get("business_line")
+                    business_line = (bl if isinstance(bl, str) else str(bl or ""))[:500]
+                    conn.execute(
+                        """
+                        INSERT INTO questions
+                            (q_id, question_text, answer_text, raw_answer, difficulty, question_type,
+                             source_platform, source_url, company, position, business_line,
+                             topic_tags, extraction_source, crawl_task_id, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            qid,
+                            qt,
+                            ans,
+                            raw,
+                            q.get("difficulty") or "medium",
+                            q.get("question_type") or "技术题",
+                            plat,
+                            source_url,
+                            (str(q.get("company") or ""))[:500],
+                            (str(q.get("position") or ""))[:500],
+                            business_line,
+                            json.dumps(tags, ensure_ascii=False),
+                            extraction_src,
+                            crawl_task_id,
+                        ),
+                    )
+                    n += 1
+                conn.commit()
+        except Exception as e:
+            logger.warning("persist_stage1_questions_rough 失败 task_id=%s: %s", task_id, e)
+            return 0
+        return n
+
     # ===========================================================
     # Stage2 待处理队列（MQ，达到 batch_size 触发）
     # ===========================================================
@@ -2131,17 +2209,26 @@ class SqliteService:
         data_path: str = None,
         sample_count: int = 0,
         status: str = "generated",
+        started_at: str = None,
     ) -> int:
-        """插入一条微调训练记录"""
+        """插入一条微调训练记录（可选 started_at，用于直接标记为训练中）"""
         with self._get_conn() as conn:
             cur = conn.execute(
                 """INSERT INTO finetune_runs
-                   (config_json, output_dir, script_path, data_path, sample_count, status)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (config_json, output_dir, script_path, data_path or "", sample_count, status),
+                   (config_json, output_dir, script_path, data_path, sample_count, status, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (config_json, output_dir, script_path, data_path or "", sample_count, status, started_at),
             )
             conn.commit()
             return cur.lastrowid
+
+    def finetune_has_running_run(self) -> bool:
+        """是否存在状态为 running 的训练记录"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM finetune_runs WHERE status = 'running' LIMIT 1"
+            ).fetchone()
+            return row is not None
 
     def list_finetune_runs(self, limit: int = 50) -> List[Dict]:
         """分页查询微调训练记录，按创建时间倒序"""

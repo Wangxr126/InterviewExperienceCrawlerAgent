@@ -3,6 +3,7 @@
 
 与 main 解耦，避免 task_executor ↔ main 循环依赖。
 子进程 stderr 追加写入 process_tasks_worker.log，便于排查（stdout 仍丢弃）。
+启动后会挂一个 daemon 线程 wait 子进程，结束时在主进程打一条「已结束 pid=… exit=…」日志（便于与仅打印「▶ 启动」对照）。
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -56,4 +58,24 @@ def spawn_process_tasks_worker(batch_size: int, reason: str) -> subprocess.Popen
         batch_size,
         log_path,
     )
+
+    def _log_exit_when_done(p: subprocess.Popen, pid: int, r: str, bs: int, lp: Path) -> None:
+        code = p.wait()
+        lvl = logging.ERROR if code else logging.INFO
+        logger.log(
+            lvl,
+            "[后台子进程] ◼ process_tasks worker 已结束 pid=%s exit=%s reason=%s batch_size=%s 日志=%s",
+            pid,
+            code,
+            r,
+            bs,
+            lp,
+        )
+
+    threading.Thread(
+        target=_log_exit_when_done,
+        args=(proc, proc.pid, reason, batch_size, log_path),
+        daemon=True,
+        name=f"process_tasks_wait_{proc.pid}",
+    ).start()
     return proc

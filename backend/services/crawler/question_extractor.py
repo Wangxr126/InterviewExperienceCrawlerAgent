@@ -26,6 +26,34 @@ from typing import List, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+class MinerFatalApiError(RuntimeError):
+    """Miner/Stage1 上游 API 配置或参数错误，继续批处理无意义（子进程应非零退出）。"""
+
+
+def _is_miner_fatal_upstream_error(raw: Optional[str]) -> bool:
+    """判断是否为重试无法修复的上游错误（鉴权、参数超范围、模型不存在等）。"""
+    if not raw or not isinstance(raw, str):
+        return False
+    if "Stage1 模型调用失败" not in raw and "OpenAI Function Calling调用失败" not in raw:
+        return False
+    markers = (
+        "InvalidParameter",
+        "Range of max_tokens",
+        "invalid_request_error",
+        "invalid_api_key",
+        "Incorrect API key",
+        "insufficient_quota",
+        "Model Not Exist",
+        "model_not_found",
+        # 仅免费额度/控制台「仅用免费档」等：重试同一账号无意义，应中止批处理并让子进程非零退出
+        "Error code: 403",
+        "AllocationQuota",
+        "FreeTierOnly",
+    )
+    return any(m in raw for m in markers)
+
+
 # 日志：精简原始（不存完整 prompt/few-shot）、输出截断、JSONL 格式
 
 # Miner Service配置打印标志（只打印一次）
@@ -44,6 +72,27 @@ def _print_miner_config_once():
         logger.info("✅ Miner Service (题目提取) 初始化完成")
         logger.info("─" * 60)
         logger.info(f"   - Mode: {settings.miner_mode}")
+        if (settings.miner_mode or "").lower() == "two_stage":
+            s1m = getattr(settings, "miner_stage1_mode", "remote")
+            n_ep = len(getattr(settings, "miner_stage1_models", []) or [])
+            if s1m == "local":
+                logger.info(
+                    "   - Stage1: kind=local, endpoints=%s, model=%s, base=%s",
+                    n_ep,
+                    getattr(settings, "miner_stage1_local_model", "") or "(未设置)",
+                    (getattr(settings, "miner_stage1_local_base_url", "") or "(未设置)")[:80],
+                )
+            else:
+                explicit = getattr(settings, "miner_stage1_remote_explicit_in_env", False)
+                src = "显式 MINER_STAGE1_REMOTE_*" if explicit else "回退 MINER_REMOTE_*（.env 中 MINER_STAGE1_REMOTE_* 若为 # 注释则不会加载）"
+                fb = getattr(settings, "miner_stage1_fallback_models_in_env", False)
+                logger.info("   - Stage1: kind=remote, endpoints=%s, 配置来源=%s, 备用链=%s", n_ep, src, "已设" if fb else "未设")
+                logger.info(
+                    "   - Stage1 解析后: model=%s, base=%s, timeout=%ss",
+                    getattr(settings, "miner_stage1_remote_model", "") or "(未设置)",
+                    (getattr(settings, "miner_stage1_remote_base_url", "") or "(未设置)")[:88],
+                    getattr(settings, "miner_stage1_remote_timeout", 0),
+                )
         logger.info(f"   - Model: {settings.miner_model}")
         logger.info(f"   - Provider: {settings.miner_provider}")
         logger.info(f"   - Base URL: {settings.miner_base_url}")
@@ -218,7 +267,7 @@ _shared_miner_agent = None
 
 def _get_miner_agent(image_paths: List[str] = None, task_id: str = ""):
     """获取或创建 MinerAgent 实例。
-    MINER_MODE=two_stage 时使用两阶段提取（Stage1本地+Stage2豆包精加工标准答案），否则用单阶段 MinerAgent。
+    MINER_MODE=two_stage 时使用两阶段提取（Stage1=MINER_REMOTE_* 远程粗提取 + Stage2 豆包精加工），否则用单阶段 MinerAgent。
     """
     from backend.config.config import settings
     if (settings.miner_mode or "").lower() == "two_stage":
@@ -279,7 +328,21 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
             if _stripped == "__STAGE2_PENDING__":
                 logger.info("[MinerAgent] 返回 __STAGE2_PENDING__，已入队异步 Stage 2 处理")
                 return result, ocr_called, is_unrelated
-            
+
+            # two_stage：Stage1 失败说明勿走「非 JSON → 直连 LLM」降级（直连用 MINER_REMOTE，会绕过 MINER_STAGE1_FALLBACK，且易重复 403）
+            from backend.config.config import settings as _miner_settings
+
+            if (_miner_settings.miner_mode or "").lower() == "two_stage" and (
+                "Stage1 模型调用失败" in _stripped
+                or "OpenAI Function Calling调用失败" in _stripped
+                or "本地模型调用失败" in _stripped
+            ):
+                logger.warning(
+                    "[MinerAgent] two_stage Stage1 失败文案已返回，跳过直连 LLM 降级 | 预览=%s",
+                    (_stripped[:160] + "…") if len(_stripped) > 160 else _stripped,
+                )
+                return "", ocr_called, is_unrelated
+
             # 检测拒绝文本
             if any(re.search(p, _stripped, re.IGNORECASE) for p in _REFUSE_QUICK):
                 logger.warning(f"[MinerAgent] Agent 返回拒绝文本，降级为直接 LLM 调用: {_stripped[:60]}")
@@ -290,6 +353,8 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
                 logger.warning(f"[MinerAgent] 返回非 JSON 格式，触发降级: {_stripped[:80]}")
                 raise ValueError("non_json_output_fallback")
         return result, ocr_called, is_unrelated
+    except MinerFatalApiError:
+        raise
     except Exception as e:
         logger.warning(f"[MinerAgent] 执行失败，降级为直接 LLM 调用: {e}")
         # 降级：手动 OCR + 直接调用 LLM
@@ -745,6 +810,14 @@ def extract_questions_from_post(
             source_url=source_url,
             post_title=post_title,
         )
+        if _is_miner_fatal_upstream_error(raw):
+            _msg = (raw or "")[:2000]
+            logger.error(
+                "Miner/Stage1 上游致命错误（配置或 API），中止批处理 | url=%s | 预览=%s",
+                source_url,
+                _msg[:400],
+            )
+            raise MinerFatalApiError(_msg)
         trace_session_id = _get_latest_trace_session_id()
         llm_response_time_sec = time.perf_counter() - t0
         if ocr_called:

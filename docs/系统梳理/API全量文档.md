@@ -120,7 +120,9 @@
 | GET | `/api/finetune/run-config` | 读取训练配置 |
 | POST | `/api/finetune/run-config` | 保存训练配置 |
 | GET | `/api/finetune/runs` | 训练运行记录 |
-| POST | `/api/finetune/generate-training` | 生成训练脚本/数据 |
+| POST | `/api/finetune/generate-training` | 生成 `train_lora.py` 与 Alpaca 数据并写入 `finetune_runs`；默认 `run_training: true` 时在后台启动 `微调/train_lora.py`（`run_training: false` 则仅生成脚本） |
+| GET | `/api/finetune/compare-presets` | 模型对比页：可选端点预设列表（无密钥） |
+| POST | `/api/finetune/compare` | 模型对比：Body `preset_ids`（2～4）、`content`、`title`；并行调用多模型返回 `results` |
 | DELETE | `/api/finetune/samples/{sample_id}` | 删除样本 |
 | POST | `/api/finetune/delete-log` | 删除日志文件 |
 | POST | `/api/finetune/preview-log` | 预览日志内容 |
@@ -157,5 +159,19 @@
 ## 10. 接口调用关系（前端视角）
 
 - `web/src/api.js` 已对主要接口封装，前端页面基本不直接写 `fetch`。
-- 页面与后端接口是强绑定关系：`CollectView` 对应 `crawler`；`FinetuneView` 对应 `finetune`；`SchedulerView` 对应 `scheduler`；`ChatView` 对应 `chat/submit_answer`。
+- 页面与后端接口是强绑定关系：`CollectView` 对应 `crawler`；`FinetuneView` / `ModelCompareView` 对应 `finetune`（对比接口为 `compare-presets`、`compare`）；`SchedulerView` 对应 `scheduler`；`ChatView` 对应 `chat/submit_answer`。
 - 流式接口统一使用 SSE：`/api/chat/stream`、`/api/submit_answer/stream`、`/api/crawler/extraction-trace-stream`。
+
+## 11. 后端源码与路由位置（速查）
+
+| 职责 | 主要文件 |
+|------|----------|
+| HTTP 路由主体（题库、对话、爬虫、微调、用户数据等） | `backend/main.py` |
+| 定时任务相关路由 | `backend/api/scheduler_api.py` |
+| 推理会话 / trace 相关路由 | `backend/api/reasoning_api.py` |
+| 微调与模型对比业务逻辑 | `backend/services/finetune/finetune_service.py`（路由在 `main.py` 中注册） |
+| SQLite 与持久化 | `backend/services/storage/sqlite_service.py` 等 |
+| 采集执行与提取 | `backend/services/crawler/` |
+| Agent 实现 | `backend/agents/` |
+
+更完整的目录说明见 [`docs/README.md`](../README.md)。

@@ -111,7 +111,7 @@ def _call_remote_ocr(image_path: str, timeout: int) -> Optional[str]:
     """按 OCR_REMOTE_MODELS 顺序调用，任一成功即返回文本。"""
     endpoints = settings.ocr_remote_models
     if not endpoints:
-        logger.warning(
+        logger.error(
             "[OCR-Remote] 无可用端点：请配置 OCR_REMOTE_MODELS（JSON）"
             " 或 OCR_REMOTE_MODEL + OCR_REMOTE_API_KEY + OCR_REMOTE_BASE_URL"
         )
@@ -268,6 +268,18 @@ def _call_claude_vision_ocr(image_path: str, timeout: int = 120) -> Optional[str
 # 统一入口
 # ──────────────────────────────────────────────────────────────
 
+
+def is_remote_ocr_unconfigured() -> bool:
+    """当前为 remote 模式但缺少发起请求所需的 OCR_REMOTE_* 配置。"""
+    if settings.ocr_method != "remote":
+        return False
+    if not (settings.ocr_remote_api_key or "").strip() or not (settings.ocr_remote_base_url or "").strip():
+        return True
+    if not settings.ocr_remote_models:
+        return True
+    return False
+
+
 def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
     """
     批量 OCR 本地图片，返回拼接后的文本。
@@ -297,12 +309,12 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
     # 预检（ollama_vl 不需要 Key）
     if method == "remote":
         if not (settings.ocr_remote_api_key or "").strip() or not (settings.ocr_remote_base_url or "").strip():
-            logger.warning(
+            logger.error(
                 "[OCR] remote 模式必须单独配置 OCR_REMOTE_API_KEY 与 OCR_REMOTE_BASE_URL（不复用 MINER/LLM）"
             )
             return ""
         if not settings.ocr_remote_models:
-            logger.warning(
+            logger.error(
                 "[OCR] remote 模式需要 OCR_REMOTE_MODELS（JSON）"
                 " 或 OCR_REMOTE_MODEL + 上述 Key/Base"
             )

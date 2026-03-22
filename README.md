@@ -304,10 +304,14 @@ wxr_agent/
 │
 ├── 微调/
 │   ├── llm_logs/                 # 训练/对比日志（如 miner_two_stage_log.jsonl）
-│   └── labeled_data.jsonl
+│   ├── logs/                     # 后台训练 stdout（train_run_{run_id}.log）
+│   ├── labeled_data.jsonl
+│   └── train_lora.py             # 由「生成并训练」生成（可手动执行）
 │
 └── web/                          # Vue 3 + Vite（build → backend/static/dist）
 ```
+
+侧边栏 10 页与 `web/src/views/*.vue` 对照、HTTP 路由与 `backend/` 源码索引、以及 `docs/` 下全部 Markdown 列表，见 **[`docs/README.md`](docs/README.md)**。
 
 **查阅 DeepSeek 流式 / 参数矩阵 / 适配层说明**：打开 [`llm_observability/README.md`](llm_observability/README.md)（完整手册在 `llm_observability/docs/deepseek-streaming-guide.md`）。原 `docs/DeepSeek流式输出与参数组合分析.md` 已改为迁移指针。
 
@@ -353,13 +357,15 @@ wxr_agent/
 | `GET` | `/api/user/{id}/reviews` | SM-2 复习队列 |
 | `GET` | `/api/resources` | 学习资源 |
 | `GET` / `POST` | `/api/crawler/*` | 发现、处理队列、重提取、任务列表等 |
-| `GET` / `POST` | `/api/finetune/*` | 微调样本与导入导出 |
+| `GET` / `POST` | `/api/finetune/*` | 微调样本、导出、`generate-training`（可选后台训练）、`compare-presets` / `compare`（模型对比） |
 | `GET` / `POST` / `PUT` / `DELETE` | `/api/scheduler/*` | 可视化定时任务 |
 | `GET` | `/api/reasoning/*` | 推理轨迹会话查询 |
 
 笔记、推荐题等能力主要通过 **Interviewer 工具**（如 `manage_note`）在对话中调用，不一定对应独立 REST 路径。
 
-**完整清单**：[`docs/系统梳理/API全量文档.md`](docs/系统梳理/API全量文档.md)；交互式文档：http://localhost:8000/docs
+**完整清单**：[`docs/系统梳理/API全量文档.md`](docs/系统梳理/API全量文档.md)；交互式文档：http://localhost:8000/docs  
+
+**文档索引**：[`docs/README.md`](docs/README.md)（仓库结构速查、侧边栏视图与 `.vue` 对照、`docs/` 全量列表、模型对比与占位图说明）
 
 ---
 
