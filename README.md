@@ -1,25 +1,23 @@
-# wxr_agent：智能面经采集与处理系统
+# InterviewExperienceCrawlerAgent
 
-> 基于双 Agent 协作的面经智能处理平台。自动采集牛客/小红书面经，通过结构化处理、知识图谱构建、SM-2 算法追踪，提供 AI 面试对话练习与个性化复习方案。
-
----
-
-## 📋 项目概述
-
-`wxr_agent` 是一个面向"内容采集 + 智能处理 + 结构化输出"的 Agent 系统，核心目标是将原始网页/文本数据转化为可复用的知识结果（结构化 JSON、训练日志、可追溯记录等）。
-
-项目围绕 **双 Agent 协作机制** 构建：
-
-- **Agent A（采集与预处理 Agent）**：负责内容抓取、平台识别、文本清洗、标准化输出
-- **Agent B（理解与生成 Agent）**：负责语义提炼、结构化生成、结果落盘、日志记录
-
-二者通过明确的任务边界和工具调用链路，实现"可扩展、可追踪、可调优"的自动化处理流程。
+面向面试题采集、结构化提取、智能练习与学习追踪的一体化 Agent 系统。  
+项目将牛客/小红书等来源内容接入采集链路，经 `MinerAgent` 提取后入库，再由 `InterviewerAgent` 完成对话练习、评分反馈与学习建议。
 
 ---
 
-## 🖼️ 前端效果总览（根目录直观展示）
+## 项目定位
 
-> 你可以直接浏览本 README 了解主要页面效果；完整大图请看 [`项目图片总览.md`](项目图片总览.md)。
+- **采集侧**：URL 收录、批量抓取、任务队列、重提取、Stage2 精答增强
+- **理解侧**：`MinerAgent` + OCR + Schema 约束，输出结构化题目数据
+- **练习侧**：`InterviewerAgent` 流式对话、答题评分、复盘反馈、推荐建议
+- **存储侧**：SQLite（业务主库）+ Neo4j（知识图谱）+ Qdrant（向量检索）
+- **可观测侧**：后端日志、子进程日志、推理轨迹、工具调用统计
+
+---
+
+## 前端效果总览
+
+> 直接看本 README 可快速了解界面；全量图见 [`项目图片总览.md`](项目图片总览.md)。
 
 ### 核心业务页面
 
@@ -45,434 +43,220 @@
 ![GraphRAG知识图谱](docs/项目图片/17_GraphRAG知识图谱.png)
 ![模型对比](docs/项目图片/18_模型对比.png)
 
-### 当前待补截图（按最新侧边栏）
+### 当前仍建议补充
 
-- `19_收录面经页面.png`（`IngestView.vue`）
+- `19_收录面经页面.png`（对应 `web/src/views/IngestView.vue`）
 
 ---
 
-## ⚙️ 快速开始
+## 最新系统架构（代码对齐）
 
-### 环境要求
+```text
+前端（Vue 3 + Vite，web/）
+  └─ 生产构建到 backend/static/dist
+          │
+          ▼
+FastAPI 主服务（backend/main.py）
+  ├─ 题库 / 对话 / 评分 / 收录 / 报告 / 图谱 / 工具统计
+  ├─ 采集链路与任务管理（crawler）
+  ├─ 微调标注与模型对比接口（finetune / model bench）
+  ├─ 定时任务 API（scheduler_api 挂载）
+  └─ 推理轨迹 API（reasoning_api 挂载）
+          │
+          ├─ Agent 层：InterviewerAgent（对话编排）
+          ├─ Agent 层：MinerAgent / MinerReActAgent（提取）
+          ├─ 服务层：crawler / scheduling / finetune / storage / knowledge
+          │
+          ├─ SQLite（backend/data/local_data.db）
+          ├─ Neo4j（docker compose）
+          └─ Qdrant（docker compose）
+```
 
-| 组件 | 版本 / 要求 |
-|------|------------|
-| Python | 3.12+ |
-| Conda 环境 | `NewCoderAgent` |
-| Docker Desktop | 需运行（用于本地 Neo4j） |
-| 操作系统 | Windows 10/11（已测试） |
+---
 
-### 启动步骤
+## Agent 角色（真实命名）
+
+### `MinerAgent`（采集与提取）
+
+- 从采集内容中抽取题目、标签、知识点等结构化信息
+- 支持 OCR 辅助、无关内容终止（`mark_unrelated`）等策略
+- 与采集任务、批量重提取、Stage2 精答流程联动
+
+### `InterviewerAgent`（对话与编排）
+
+- 承担练习问答、流式回复、答题评分、学习建议
+- 通过工具调用组织记忆、推荐、掌握度等业务能力
+- 管理会话上下文与多轮对话编排（`get_orchestrator`）
+
+---
+
+## 前端页面（当前侧边栏）
+
+`web/src/App.vue` 中当前导航项：
+
+- `browse`：`BrowseView.vue`（题库浏览）
+- `chat`：`ChatView.vue`（练习对话）
+- `ingest`：`IngestView.vue`（收录面经）
+- `collect`：`CollectView.vue`（数据采集）
+- `scheduler`：`SchedulerView.vue`（定时任务）
+- `report`：`ReportView.vue`（学习报告）
+- `finetune`：`FinetuneView.vue`（微调标注）
+- `tool_usage`：`ToolUsageView.vue`（工具统计）
+- `graph_rag`：`GraphRagView.vue`（GraphRAG）
+- `model_compare`：`ModelBenchView.vue`（模型对比）
+
+---
+
+## 核心能力清单
+
+- **题库管理**：筛选、分页、随机抽题、智能组题
+- **对话练习**：SSE 流式问答，支持会话历史
+- **答题评估**：异步/流式评分、学习反馈、记录沉淀
+- **采集链路**：抓取、清洗、提取、批量重提取、任务可视化
+- **定时调度**：APScheduler 可视化管理，支持运行/启停/CRUD
+- **微调流程**：样本标注、训练数据生成、模型对比评测
+- **知识图谱与推荐**：Neo4j 图谱、Qdrant 向量检索、学习建议
+
+---
+
+## 快速开始
+
+### 1) 环境要求
+
+- Python 3.12+
+- Conda 环境：`NewCoderAgent`
+- Docker Desktop（Neo4j / Qdrant）
+- Node.js（前端开发模式）
+
+### 2) 安装依赖
 
 ```bash
-# 1. 进入项目目录
 cd E:\Agent\AgentProject\wxr_agent
-
-# 2. 配置环境变量（复制示例并填入 API Key / Neo4j 密码 / Qdrant 等）
 copy .env.example .env
-
-# 3. 安装依赖（建议使用 Conda 环境 NewCoderAgent）
 conda activate NewCoderAgent
 pip install -r requirements.txt
 python -m spacy download zh_core_web_sm
 python -m spacy download en_core_web_sm
+```
 
-# 4. 启动 Neo4j + Qdrant（本地 Docker，数据卷见 docker-compose.yml）
+### 3) 启动基础服务
+
+```bash
 docker compose up -d
+```
 
-# 5. 启动后端（Windows 下 run.py 可自动切到 NewCoderAgent 的解释器，见 run.py 顶部说明）
+### 4) 启动后端
+
+```bash
 python run.py
 ```
 
-启动成功后访问：
-- **后端 API**：http://localhost:8000
-- **API 文档**：http://localhost:8000/docs
-- **前端（生产）**：构建 `web` 后由后端托管同端口（`backend/static/dist`）
-- **前端（开发）**：`cd web && npm run dev` → http://localhost:5173
+### 5) 启动前端（开发模式）
 
-更细的排障与顺序说明见 [`docs/STARTUP_GUIDE.md`](docs/STARTUP_GUIDE.md)。
-
----
-
-## 🏗️ 系统架构
-
-```
-┌────────────────────────────────────────────────────────────┐
-│  前端 (Vue 3 + Vite)  web/  →  生产构建 backend/static/dist │
-└────────────────────────────┬───────────────────────────────┘
-                             │ HTTP
-┌────────────────────────────▼───────────────────────────────┐
-│           FastAPI 主应用 (backend/main.py)                 │
-│  · REST / SSE（对话、评分、爬虫、微调、调度、推理追踪）      │
-│  · APScheduler 定时发现与队列处理（backend/services/       │
-│    scheduling/）                                            │
-│  · 静态资源 /post-images（帖子图片）                        │
-├────────────────────────────────────────────────────────────┤
-│  InterviewerAgent（backend/agents/interviewer_agent.py）   │
-│  ReAct 对话 + 会话/收录/评分等业务编排（含 get_orchestrator） │
-├────────────────────────────────────────────────────────────┤
-│  采集与提取链路                                             │
-│  · task_executor.execute() 统一按钮/定时入口               │
-│  · question_extractor / MinerAgent（单阶段 ReAct + OCR）    │
-│  · 可选 MCP：正文抓取、图片 OCR（见 .env CRAWLER_SOURCE 等） │
-└────────────────────────────┬───────────────────────────────┘
-     ┌───────────────────────┼───────────────────────┐
-     ▼                       ▼                       ▼
-┌─────────────┐      ┌─────────────┐      ┌──────────────────┐
-│ Neo4j       │      │ Qdrant      │      │ SQLite + 文件目录 │
-│ 知识图谱     │      │ 向量记忆     │      │ backend/data/    │
-│ :7687       │      │ :6333       │      │ local_data.db 等 │
-└─────────────┘      └─────────────┘      └──────────────────┘
-```
-
-**说明**：Neo4j 与 Qdrant 均可通过根目录 `docker compose` 在本地启动；向量与记忆相关配置见 `.env` 中 `QDRANT_*`、`NEO4J_*`。SQLite 默认路径为 `backend/data/local_data.db`（可用 `DATA_DIR` / `SQLITE_DB_PATH` 覆盖）。
-
----
-
-## 🤖 双 Agent 协作机制
-
-### Agent A：采集与预处理 Agent
-
-**职责：**
-- 接收任务输入（URL / 文本 / 批量项）
-- 调用抓取 Tool 获取原始内容
-- 平台识别（牛客 / 小红书 / 通用网页）
-- 文本清洗、降噪、字段标准化
-- 输出统一中间结构（供 Agent B 消费）
-
-**输出示例（中间态）：**
-```json
-{
-  "url": "https://www.nowcoder.com/discuss/...",
-  "title": "字节跳动 Java 面经",
-  "platform": "nowcoder",
-  "raw_content": "...",
-  "clean_content": "...",
-  "metadata": {
-    "company": "字节跳动",
-    "position": "Java 后端",
-    "difficulty": "hard"
-  }
-}
-```
-
-### Agent B：理解与生成 Agent
-
-**职责：**
-- 消费 Agent A 的标准化中间结果
-- 执行语义提炼、信息归类、标签化
-- 结构化生成（题目、知识点、答案等）
-- 组织最终输出（JSONL / 持久化存储 / 回传响应）
-- 写入处理日志（trace + prompt + result）
-
-**输出特征：**
-- 面向下游可直接消费
-- 保留来源和处理时间戳
-- 保证可追溯（任务 ID、阶段日志、异常上下文）
-
----
-
-## 🔄 处理流程逻辑
-
-### 主流程（端到端）
-
-```mermaid
-flowchart TD
-    A["📥 输入任务<br/>URL/文本/批量"] --> B["🤖 Agent A 接收任务"]
-    B --> C["🔗 调用抓取 Tool"]
-    C --> D["🏷️ 平台识别 + 内容解析"]
-    D --> E["🧹 文本清洗与标准化"]
-    E --> F["📦 中间结构输出"]
-    F --> G["🤖 Agent B 消费中间结构"]
-    G --> H["💡 语义提炼/结构化生成"]
-    H --> I["💾 结果落盘 JSONL/DB"]
-    I --> J["✅ 返回最终响应"]
-    
-    style A fill:#e1f5ff
-    style B fill:#fff3e0
-    style G fill:#fff3e0
-    style J fill:#c8e6c9
-```
-
-### 异常与回退流程
-
-```mermaid
-flowchart TD
-    A["🔗 抓取请求"] --> B{"✓ 抓取成功?"}
-    B -->|否| C["📝 记录错误日志"]
-    C --> D["🔄 重试策略"]
-    D --> E{"✓ 重试成功?"}
-    E -->|否| F["⬇️ 降级输出 error item"]
-    E -->|是| G["继续解析"]
-    B -->|是| G["继续解析"]
-    G --> H{"✓ 解析成功?"}
-    H -->|否| I["⬇️ 回退到 generic parser"]
-    I --> J["✅ 输出可用结果"]
-    H -->|是| J["✅ 输出可用结果"]
-    
-    style A fill:#ffebee
-    style F fill:#ffcdd2
-    style J fill:#c8e6c9
-```
-
-### 数据流与日志流
-
-```mermaid
-sequenceDiagram
-    participant User as 调用方
-    participant A as Agent A
-    participant T as Fetch/Parse Tools
-    participant B as Agent B
-    participant L as Logs/Storage
-
-    User->>A: 提交任务(url/text)
-    A->>T: 调用抓取与解析
-    T-->>A: 返回标准化内容
-    A->>B: 传递中间结构
-    B->>B: 提炼与结构化生成
-    B->>L: 写入结果与日志
-    B-->>User: 返回最终输出
-```
-
----
-
-## 🛠️ Tool 实现设计
-
-项目采用"Tool 原子能力 + Agent 编排"的模式，核心 Tool 分为以下几类：
-
-### 内容获取类 Tool
-
-**`fetch_content(url)`**
-- 单链接抓取 + 解析
-- 统一请求超时（10s）
-- 统一 UA，减少站点拦截概率
-
-**`fetch_multiple_contents(urls)`**
-- 批量并行抓取（失败隔离）
-- 单条失败不影响整体
-- 返回成功/失败统计
-
-### 平台解析类 Tool
-
-**`detectPlatform(url)`**
-- 根据 URL 特征识别平台
-- 支持：牛客、小红书、通用网页
-
-**`parseNowcoder(html, url)`**
-- 牛客定制解析
-- 提取：标题、公司、岗位、难度、内容
-
-**`parseXiaohongshu(html, url)`**
-- 小红书定制解析
-- 提取：标题、话题、内容、互动数据
-
-**`parseGeneric(html, url)`**
-- 通用网页回退解析
-- 基于 DOM 结构和启发式规则
-
-**设计要点：**
-- 优先定制解析，失败时自动回退通用解析
-- 保持统一输出 schema，降低下游复杂度
-
-### 处理与输出类 Tool
-
-**`cleanText(raw_text)`**
-- 去噪、裁剪、空白规整
-- 移除 HTML 标签、特殊字符
-- 保留关键格式（换行、列表）
-
-**`structureOutput(parsed_data)`**
-- 结果封装为 JSON 文本块
-- 验证必填字段
-- 添加元数据（处理时间、版本等）
-
-**`logProcessing(task_id, stage, input, output, metadata)`**
-- 日志落盘（便于微调与故障复盘）
-- 记录：Prompt、Response、耗时、Token 消耗
-- 支持按任务 ID 追踪完整链路
-
----
-
-## 📁 目录结构
-
-```
-wxr_agent/
-├── llm_observability/          # LLM 可观测性脚本与手册
-├── mcp/                          # MCP 服务（content-extractor / fetcher / image-extractor）
-├── run.py                        # 后端启动（可自动指向 NewCoderAgent 解释器）
-├── docker-compose.yml            # 本地 Neo4j + Qdrant
-├── requirements.txt
-├── .env                          # 运行时配置（勿提交密钥）
-│
-├── backend/
-│   ├── main.py                   # FastAPI 入口、大部分 REST/SSE 路由
-│   ├── config/config.py          # 从环境变量读取的统一配置
-│   ├── api/
-│   │   ├── scheduler_api.py      # /api/scheduler/* 定时任务 CRUD
-│   │   └── reasoning_api.py      # /api/reasoning/* 推理会话查询
-│   ├── agents/
-│   │   ├── interviewer_agent.py  # 面试主 Agent + 编排（get_orchestrator）
-│   │   ├── miner_agent.py        # 题目提取 Agent（基础实现）
-│   │   ├── miner_react_agent.py  # Miner ReAct 封装
-│   │   ├── miner_agent_v3.py     # 提取变体
-│   │   ├── two_stage_miner_agent.py
-│   │   ├── prompts/              # Interviewer / Miner 等提示词
-│   │   └── schemas/              # Miner JSON schema
-│   ├── services/
-│   │   ├── crawler/              # 牛客/小红书爬取、任务执行、OCR 适配
-│   │   ├── scheduling/           # APScheduler、子进程 worker（批量提取 / process_tasks）
-│   │   ├── storage/              # SQLite、Neo4j、推理轨迹、会话存储
-│   │   ├── knowledge/            # 知识管理（KnowledgeManager）
-│   │   ├── finetune/             # 微调样本与导入
-│   │   ├── warmup/               # LLM / Embedding / Rerank 预热
-│   │   └── ...                   # rerank、多路召回推荐等
-│   ├── tools/
-│   │   ├── interviewer_tools.py
-│   │   └── miner_tools.py
-│   ├── llm/                      # 流式与 DeepSeek 适配等
-│   └── data/                     # 默认数据根（库文件、post_images、neo4j/qdrant 卷映射等）
-│
-├── 微调/
-│   ├── llm_logs/                 # 训练/对比日志（如 miner_two_stage_log.jsonl）
-│   ├── logs/                     # 后台训练 stdout（train_run_{run_id}.log）
-│   ├── labeled_data.jsonl
-│   └── train_lora.py             # 由「生成并训练」生成（可手动执行）
-│
-└── web/                          # Vue 3 + Vite（build → backend/static/dist）
-```
-
-侧边栏 10 页与 `web/src/views/*.vue` 对照、HTTP 路由与 `backend/` 源码索引、以及 `docs/` 下全部 Markdown 列表，见 **[`docs/README.md`](docs/README.md)**。
-
-**查阅 DeepSeek 流式 / 参数矩阵 / 适配层说明**：打开 [`llm_observability/README.md`](llm_observability/README.md)（完整手册在 `llm_observability/docs/deepseek-streaming-guide.md`）。原 `docs/DeepSeek流式输出与参数组合分析.md` 已改为迁移指针。
-
----
-
-## 📊 数据流与日志
-
-### 日志类型
-
-| 日志类型 | 存储位置 | 用途 |
-|---------|---------|------|
-| **Task Log** | `微调/llm_logs/` | 任务生命周期（开始/结束/耗时） |
-| **Tool Log** | `微调/llm_logs/` | 每个 Tool 的输入输出摘要 |
-| **Error Log** | `微调/llm_logs/` | 异常堆栈 + 上下文 |
-| **LLM Log** | `微调/llm_logs/llm_prompt_log.jsonl` | Prompt/Response（脱敏后） |
-| **Platform Log** | `微调/llm_logs/nowcoder_*.jsonl` 等 | 按平台分类的处理结果 |
-
-### 日志示例
-
-```jsonl
-{"task_id": "task_001", "stage": "fetch", "url": "https://...", "status": "success", "duration_ms": 1234}
-{"task_id": "task_001", "stage": "parse", "platform": "nowcoder", "extracted_fields": 8, "status": "success"}
-{"task_id": "task_001", "stage": "llm_process", "prompt_tokens": 512, "response_tokens": 256, "status": "success"}
-```
-
----
-
-## 🔌 主要 API 接口（节选）
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET` | `/api/config` | 前端运行配置（用户、爬虫/OCR 来源等） |
-| `GET` | `/api/questions` | 题库筛选分页 |
-| `GET` | `/api/questions/random` | 随机一题 |
-| `GET` | `/api/questions/smart-practice` | 智能组题 |
-| `GET` | `/api/questions/meta` | 公司、标签、岗位等元数据 |
-| `POST` | `/api/chat` | 对话（非流式） |
-| `POST` | `/api/chat/stream` | 对话（SSE 流式） |
-| `POST` | `/api/submit_answer` | 异步评分 + SM-2 |
-| `POST` | `/api/submit_answer/stream` | 评分 SSE |
-| `POST` | `/api/ingest` | URL 收录进采集链路 |
-| `GET` | `/api/user/{id}/mastery` | 掌握度 |
-| `GET` | `/api/user/{id}/reviews` | SM-2 复习队列 |
-| `GET` | `/api/resources` | 学习资源 |
-| `GET` / `POST` | `/api/crawler/*` | 发现、处理队列、重提取、任务列表等 |
-| `GET` / `POST` | `/api/finetune/*` | 微调样本、导出、`generate-training`（可选后台训练）、`compare-presets` / `compare`（模型对比） |
-| `GET` / `POST` / `PUT` / `DELETE` | `/api/scheduler/*` | 可视化定时任务 |
-| `GET` | `/api/reasoning/*` | 推理轨迹会话查询 |
-
-笔记、推荐题等能力主要通过 **Interviewer 工具**（如 `manage_note`）在对话中调用，不一定对应独立 REST 路径。
-
-**完整清单**：[`docs/系统梳理/API全量文档.md`](docs/系统梳理/API全量文档.md)；交互式文档：http://localhost:8000/docs  
-
-**文档索引**：[`docs/README.md`](docs/README.md)（仓库结构速查、侧边栏视图与 `.vue` 对照、`docs/` 全量列表、模型对比与占位图说明）
-
----
-
-## 🚀 可扩展性
-
-### 新平台支持
-
-1. 在 `backend/services/crawler/` 新增对应平台抓取模块
-2. 在调度/抓取入口注册 URL 检测与任务流转规则
-3. 定义统一输出 schema（供提取链路复用）
-
-### 新处理策略
-
-在 Agent B 中新增策略节点，无需修改 Agent A 或 Tool 层。
-
-### 新输出目标
-
-追加写库/消息队列/向量库适配层，保持 Tool 接口不变。
-
----
-
-## 📈 稳定性建议
-
-- **批处理并发限流**：避免被站点封禁
-- **超时 + 重试 + 熔断**：提升容错能力
-- **结果 schema 校验**：避免脏数据进入下游
-- **全链路日志**：便于故障复盘与数据沉淀
-
----
-
-## ❓ 常见问题
-
-### Q: 如何配置默认用户和 Agent 步数？
-在 `.env` 中添加：
-- `DEFAULT_USER_ID=user_001`
-- `INTERVIEWER_MAX_STEPS=8`
-
-### Q: `MemoryTool 初始化失败`
-确认项目根目录存在 `.env` 文件，且 `backend/main.py` 开头有 `load_dotenv(override=True)`。
-
-### Q: Neo4j 连不上
-确认 `docker compose up -d` 已启动，并在 **`.env`** 中设置 `NEO4J_URI=bolt://localhost:7687` 及与 `docker-compose.yml` 中 `NEO4J_AUTH` 一致的密码。
-
-### Q: Docker 拉取镜像失败（代理问题）
-检查 Windows IE 代理注册表：
-```powershell
-Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" | Select ProxyEnable, ProxyServer
-Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -Name ProxyEnable -Value 0
-```
-
-### Q: `SetLimitExceeded (429)` LLM 限流
-进入火山引擎控制台 → 模型推理 → 在线推理 → 关闭「安全体验模式」或提升推理配额。
-
-### Q: 开发模式（代码改动自动重启）
 ```bash
-python run.py --reload
+cd web
+npm install
+npm run dev
+```
+
+### 6) 访问地址
+
+- API：<http://localhost:8000>
+- Swagger：<http://localhost:8000/docs>
+- 前端开发：<http://localhost:5173>
+- Neo4j：<http://localhost:7474>
+- Qdrant：<http://localhost:6333/dashboard>
+
+---
+
+## API 入口（高频）
+
+- `GET /api/config`：运行配置
+- `GET /api/questions`：题库查询
+- `GET /api/questions/smart-practice`：智能练习组题
+- `POST /api/chat/stream`：流式对话
+- `POST /api/submit_answer/stream`：流式评分
+- `POST /api/ingest`：URL 收录
+- `GET /api/crawler/stats`：采集统计
+- `GET/POST /api/scheduler/*`：定时任务管理
+- `GET/POST /api/finetune/*`：微调与模型对比
+- `GET /api/reasoning/*`：推理轨迹查询
+
+更完整接口文档见 [`docs/系统梳理/API全量文档.md`](docs/系统梳理/API全量文档.md)。
+
+---
+
+## 目录结构（精简版）
+
+```text
+InterviewExperienceCrawlerAgent/
+├─ backend/
+│  ├─ main.py
+│  ├─ api/                  # scheduler_api / reasoning_api
+│  ├─ agents/               # interviewer_agent / miner_agent / miner_react_agent
+│  ├─ services/             # crawler / scheduling / storage / finetune / knowledge
+│  ├─ tools/
+│  ├─ config/config.py
+│  └─ data/                 # local_data.db / neo4j_data / qdrant_storage / logs 等
+├─ web/                     # Vue3 + Vite
+├─ docs/                    # 系统梳理与使用文档
+├─ 微调/                    # 训练脚本与产物
+├─ docker-compose.yml
+├─ run.py
+└─ requirements.txt
 ```
 
 ---
 
-## 📚 功能概览
+## 配置说明
 
-| 模块 | 功能 |
-|------|------|
-| **题库浏览** | 按公司、难度、标签、关键词筛选题目；随机抽题 |
-| **面试对话** | 与 AI 面试官实时对话，支持换个问法、举一反三 |
-| **答题评测** | 提交答案后获得评分（0-5）、强弱点分析、AI 解析 |
-| **掌握度追踪** | SM-2 算法计算复习周期，弱点标签自动识别 |
-| **知识推荐** | 针对薄弱点推荐学习资源和知识章节 |
-| **记忆系统** | hello-agents 四层记忆持久化对话上下文 |
-| **面经收录** | 输入牛客/小红书帖子 URL，自动采集并入库 |
-| **笔记功能** | 对任意题目添加个人笔记 |
+- 配置来源：项目根目录 `.env`
+- 配置读取：`backend/config/config.py`
+- 支持本地/远程 LLM 双模式（`LLM_MODE=local|remote`）
+- 推荐先参考：
+  - [`docs/STARTUP_GUIDE.md`](docs/STARTUP_GUIDE.md)
+  - [`docs/环境配置说明.md`](docs/环境配置说明.md)
 
 ---
 
-## 🙏 致谢
+## 文档导航
 
-- [hello-agents](https://github.com/datawhalechina/hello-agents)：Agent 框架
-- [DataWhale](https://datawhale.club)：开源社区
-- 火山引擎 Doubao / 阿里云 DashScope：LLM & Embedding 服务
+- 文档索引：[`docs/README.md`](docs/README.md)
+- 页面功能说明：[`docs/系统梳理/页面功能与按钮说明.md`](docs/系统梳理/页面功能与按钮说明.md)
+- Agent 全景：
+  - [`docs/系统梳理/Agent-Interviewer全景文档.md`](docs/系统梳理/Agent-Interviewer全景文档.md)
+  - [`docs/系统梳理/Agent-Miner全景文档.md`](docs/系统梳理/Agent-Miner全景文档.md)
+- 模型对比：[`docs/系统梳理/模型对比页面说明.md`](docs/系统梳理/模型对比页面说明.md)
+- MCP 与扩展：
+  - [`docs/MCP服务详解.md`](docs/MCP服务详解.md)
+  - [`docs/MCP构建与部署指南.md`](docs/MCP构建与部署指南.md)
+
+---
+
+## 常见问题
+
+### 1) 为什么 `python run.py` 仍提示环境问题？
+
+`run.py` 会尝试切换到固定的 `NewCoderAgent` 解释器路径；若路径变化，请修改 `run.py` 中的 `CONDA_ENV_PYTHON`。
+
+### 2) Neo4j / Qdrant 连接失败怎么办？
+
+优先检查：
+
+- `docker compose ps`
+- `docker compose logs neo4j`
+- `docker compose logs qdrant`
+
+并确认 `.env` 中连接地址与 `docker-compose.yml` 端口一致。
+
+### 3) 页面能打开但流式卡住怎么办？
+
+先用直连后端方式排查：前端设置 `VITE_STREAM_DIRECT=true`，绕过代理缓存验证 SSE。
+
+---
+
+## 致谢
+
+- [hello-agents](https://github.com/datawhalechina/hello-agents)
+- [DataWhale](https://datawhale.club)
+- 火山引擎 / 阿里云 / Ollama 等模型与基础设施能力

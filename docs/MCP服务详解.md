@@ -61,9 +61,9 @@ python mcp/mcp-content-extractor/server.py
     "content-extractor": {
       "command": "python",
       "args": ["mcp/mcp-content-extractor/server.py"],
-      "cwd": "/path/to/wxr_agent",
+      "cwd": "/path/to/InterviewExperienceCrawlerAgent",
       "env": {
-        "XHS_USER_DATA_DIR": "/path/to/wxr_agent/backend/data/xhs_user_data"
+        "XHS_USER_DATA_DIR": "/path/to/InterviewExperienceCrawlerAgent/backend/data/xhs_user_data"
       }
     }
   }
@@ -76,7 +76,7 @@ python mcp/mcp-content-extractor/server.py
 
 ### 评价
 
-✅ **保留** - 这是面经 Agent 的核心功能，用于爬取面试题
+✅ **保留** - 这是 InterviewExperienceCrawlerAgent 的核心功能，用于爬取面试题
 
 ---
 
@@ -259,7 +259,7 @@ ALLOWED_DOMAINS=example.com    # 允许的域名（逗号分隔）
 
 ```bash
 # 1. 创建独立项目
-git clone <wxr_agent_repo> mcp-content-fetcher-standalone
+git clone <InterviewExperienceCrawlerAgent_repo> mcp-content-fetcher-standalone
 cd mcp-content-fetcher-standalone
 rm -rf mcp/mcp-image-extractor mcp/mcp-content-extractor backend docs
 
@@ -288,7 +288,7 @@ npm publish
 
 ```bash
 # 1. 创建独立项目
-git clone <wxr_agent_repo> mcp-image-extractor-standalone
+git clone <InterviewExperienceCrawlerAgent_repo> mcp-image-extractor-standalone
 cd mcp-image-extractor-standalone
 rm -rf mcp/mcp-content-fetcher mcp/mcp-content-extractor backend docs
 
@@ -338,7 +338,7 @@ docker push <registry>/mcp-image-extractor
     "content-extractor": {
       "command": "python",
       "args": ["mcp/mcp-content-extractor/server.py"],
-      "cwd": "/path/to/wxr_agent"
+      "cwd": "/path/to/InterviewExperienceCrawlerAgent"
     },
     "content-fetcher": {
       "command": "node",
@@ -377,7 +377,7 @@ docker push <registry>/mcp-image-extractor
     "content-extractor": {
       "command": "python",
       "args": ["mcp/mcp-content-extractor/server.py"],
-      "cwd": "/path/to/wxr_agent"
+      "cwd": "/path/to/InterviewExperienceCrawlerAgent"
     },
     "content-fetcher": {
       "url": "https://content-fetcher.smithery.ai/mcp",

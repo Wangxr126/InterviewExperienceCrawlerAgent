@@ -22,7 +22,7 @@
 
 ```bash
 # 方式 A：从现有项目中提取（推荐）
-git clone https://github.com/你的用户名/wxr_agent.git mcp-content-fetcher
+git clone https://github.com/你的用户名/InterviewExperienceCrawlerAgent.git mcp-content-fetcher
 cd mcp-content-fetcher
 
 # 删除不需要的文件

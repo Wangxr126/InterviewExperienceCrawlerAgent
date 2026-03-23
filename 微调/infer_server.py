@@ -40,6 +40,7 @@ BASE_MODEL     = "unsloth/Qwen3-4B"
 LOAD_IN_4BIT   = True
 PORT           = int(os.environ.get("INFER_PORT", 8899))
 MAX_NEW_TOKENS = int(os.environ.get("INFER_MAX_NEW_TOKENS", os.environ.get("MAX_NEW_TOKENS", 2048)))
+MAX_INPUT_TOKENS = int(os.environ.get("INFER_MAX_INPUT_TOKENS", "2048"))
 
 # adapter 路径（None = 基础模型不加载 adapter）
 ADAPTERS: dict[str, Optional[str]] = {
@@ -218,14 +219,27 @@ def _infer_stream_sync(model, final_prompt: str, infer_params: dict, queue: asyn
     """在普通线程里做 generate，把 token 塞到 asyncio Queue。"""
     try:
         t0 = time.time()
-        inputs = _tokenizer(final_prompt, return_tensors="pt").to(model.device)
+        # 关键：在 8GB 显卡上，Miner 超长 prompt 容易触发 OOM，需强制截断输入长度
+        input_ids = _tokenizer.encode(final_prompt, add_special_tokens=False)
+        raw_len = len(input_ids)
+        if raw_len > MAX_INPUT_TOKENS:
+            print(
+                f"[infer] 输入过长，已截断: raw_tokens={raw_len} -> {MAX_INPUT_TOKENS}",
+                flush=True,
+            )
+        inputs = _tokenizer(
+            final_prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=MAX_INPUT_TOKENS,
+        ).to(model.device)
         streamer = TextIteratorStreamer(
             _tokenizer, skip_prompt=True, skip_special_tokens=True
         )
         first_token_sent = False
         gen_kwargs = dict(
             **inputs,
-            max_new_tokens=int(infer_params.get("max_new_tokens") or MAX_NEW_TOKENS),
+            max_new_tokens=int(infer_params.get("max_new_tokens") or min(MAX_NEW_TOKENS, 512)),
             temperature=float(infer_params.get("temperature") or 0.7),
             top_p=float(infer_params.get("top_p") or 0.9),
             do_sample=bool(infer_params.get("do_sample", True)),
@@ -244,7 +258,22 @@ def _infer_stream_sync(model, final_prompt: str, infer_params: dict, queue: asyn
         total_ms = int((time.time() - t0) * 1000)
         asyncio.run_coroutine_threadsafe(queue.put(("meta", {"total_ms": total_ms})), loop)
     except Exception as e:
-        asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
+        err_text = str(e)
+        # 对 OOM 给出明确、可操作的错误提示，避免前端“无输出卡住”
+        if isinstance(e, torch.OutOfMemoryError) or ("out of memory" in err_text.lower()):
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            err_text = (
+                "CUDA 显存不足（OOM）。建议："
+                "1) 降低 max_new_tokens（如 256）；"
+                "2) 缩短输入（减少帖子正文长度）；"
+                "3) 减少并发请求，仅保留单模型。"
+            )
+            print(f"[infer][OOM] {err_text}", flush=True)
+        asyncio.run_coroutine_threadsafe(queue.put(("error", err_text)), loop)
     finally:
         asyncio.run_coroutine_threadsafe(queue.put(("done", "")), loop)
 

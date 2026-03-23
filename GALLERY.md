@@ -1,4 +1,4 @@
-# wxr_agent 项目截图展示
+# InterviewExperienceCrawlerAgent 项目截图展示
 
 本文档汇总当前可用的前端页面截图，便于快速了解系统能力。
 

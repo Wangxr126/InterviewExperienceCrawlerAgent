@@ -1,4 +1,4 @@
-# 面经 Agent 启动与排障指南
+# InterviewExperienceCrawlerAgent 启动与排障指南
 
 面向本地开发：后端（FastAPI）、前端（Vite）、可选本地 LLM（Ollama）、Docker 中的 Neo4j 与 Qdrant。
 
@@ -51,7 +51,7 @@ docker compose up -d
 
 ```bash
 conda activate NewCoderAgent
-cd E:\Agent\AgentProject\wxr_agent
+cd <your_project_path>/InterviewExperienceCrawlerAgent
 python run.py
 ```
 

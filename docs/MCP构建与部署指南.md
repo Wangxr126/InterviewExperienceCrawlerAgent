@@ -7,7 +7,7 @@
 ## 一、项目概述
 
 - **仓库**：https://github.com/Wangxr126/mcp-content-fetcher
-- **本地路径**：`mcp/mcp-content-fetcher`（相对 **wxr_agent 仓库根**；根目录结构见 [`docs/README.md`](README.md)）
+- **本地路径**：`mcp/mcp-content-fetcher`（相对 **InterviewExperienceCrawlerAgent 仓库根**；根目录结构见 [`docs/README.md`](README.md)）
 - **功能**：从牛客网、小红书 URL 提取正文和元数据，支持 MCP 协议（`fetch_content` / `fetch_multiple_contents` 工具）
 - **技术栈**：TypeScript + Node.js + Express + axios + cheerio
 - **部署目标**：Render（推荐）、Smithery（可选）

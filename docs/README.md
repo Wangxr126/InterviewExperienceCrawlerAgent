@@ -1,6 +1,6 @@
 # 文档中心（`docs/`）
 
-面向 **wxr_agent（面经 Agent）** 仓库的说明入口。环境变量与默认值以根目录 `.env` 与 [`backend/config/config.py`](../backend/config/config.py) 为准；代码结构若有变更，请优先对照源码更新本节。
+面向 **InterviewExperienceCrawlerAgent** 仓库的说明入口。环境变量与默认值以根目录 `.env` 与 [`backend/config/config.py`](../backend/config/config.py) 为准；代码结构若有变更，请优先对照源码更新本节。
 
 ---
 
