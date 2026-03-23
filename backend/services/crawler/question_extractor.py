@@ -6,7 +6,7 @@
   - question_text    题目正文
   - answer_text      参考答案（从面经中提取，无则留空）
   - difficulty       easy / medium / hard
-  - question_type    技术题 / 算法题 / 行为题 / 系统设计 / HR问题
+  - question_type    小类名：算法-/工程-/基础-/软技能-/AI-*（与 miner_prompt 4b、miner_schema 一致）
   - topic_tags       技术标签列表（如 ["Redis", "Java", "JVM"]）
   - company          公司（继承自帖子元数据）
   - position         岗位
@@ -15,27 +15,37 @@
   - source_url       原帖链接
 """
 from backend.utils.time_utils import now_beijing_str, timestamp_to_beijing, timestamp_ms_to_beijing
+from backend.utils.question_text_cleanup import strip_question_enumeration
+from backend.utils.text_garbled import (
+    company_should_be_cleared,
+    is_unusable_after_repair,
+    is_unusable_answer_after_repair,
+    repair_text,
+)
 from backend.agents.prompts.miner_prompt import get_miner_prompt, format_miner_user_prompt
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
+from backend.services.company_normalization import normalize_company_field
+
 logger = logging.getLogger(__name__)
 
 
 class MinerFatalApiError(RuntimeError):
-    """Miner/Stage1 上游 API 配置或参数错误，继续批处理无意义（子进程应非零退出）。"""
+    """Miner 上游 API 配置或参数错误，继续批处理无意义（子进程应非零退出）。"""
 
 
 def _is_miner_fatal_upstream_error(raw: Optional[str]) -> bool:
     """判断是否为重试无法修复的上游错误（鉴权、参数超范围、模型不存在等）。"""
     if not raw or not isinstance(raw, str):
         return False
-    if "Stage1 模型调用失败" not in raw and "OpenAI Function Calling调用失败" not in raw:
+    if "Stage1 模型调用失败" not in raw and "模型调用失败" not in raw and "OpenAI Function Calling调用失败" not in raw:
         return False
     markers = (
         "InvalidParameter",
@@ -59,6 +69,10 @@ def _is_miner_fatal_upstream_error(raw: Optional[str]) -> bool:
 # Miner Service配置打印标志（只打印一次）
 _miner_config_printed = False
 
+# 供重试提示：乱码校验等写入，替代已移除的两阶段模块中的同名变量
+_last_extraction_error: Optional[str] = None
+
+
 def _print_miner_config_once():
     """首次调用时打印Miner Service配置"""
     global _miner_config_printed
@@ -72,30 +86,18 @@ def _print_miner_config_once():
         logger.info("✅ Miner Service (题目提取) 初始化完成")
         logger.info("─" * 60)
         logger.info(f"   - Mode: {settings.miner_mode}")
-        if (settings.miner_mode or "").lower() == "two_stage":
-            s1m = getattr(settings, "miner_stage1_mode", "remote")
-            n_ep = len(getattr(settings, "miner_stage1_models", []) or [])
-            if s1m == "local":
-                logger.info(
-                    "   - Stage1: kind=local, endpoints=%s, model=%s, base=%s",
-                    n_ep,
-                    getattr(settings, "miner_stage1_local_model", "") or "(未设置)",
-                    (getattr(settings, "miner_stage1_local_base_url", "") or "(未设置)")[:80],
-                )
-            else:
-                explicit = getattr(settings, "miner_stage1_remote_explicit_in_env", False)
-                src = "显式 MINER_STAGE1_REMOTE_*" if explicit else "回退 MINER_REMOTE_*（.env 中 MINER_STAGE1_REMOTE_* 若为 # 注释则不会加载）"
-                fb = getattr(settings, "miner_stage1_fallback_models_in_env", False)
-                logger.info("   - Stage1: kind=remote, endpoints=%s, 配置来源=%s, 备用链=%s", n_ep, src, "已设" if fb else "未设")
-                logger.info(
-                    "   - Stage1 解析后: model=%s, base=%s, timeout=%ss",
-                    getattr(settings, "miner_stage1_remote_model", "") or "(未设置)",
-                    (getattr(settings, "miner_stage1_remote_base_url", "") or "(未设置)")[:88],
-                    getattr(settings, "miner_stage1_remote_timeout", 0),
-                )
         logger.info(f"   - Model: {settings.miner_model}")
         logger.info(f"   - Provider: {settings.miner_provider}")
         logger.info(f"   - Base URL: {settings.miner_base_url}")
+        if (settings.miner_mode or "").lower() == "two_stage":
+            n1 = len(settings.miner_stage1_models or [])
+            s2n = [m.get("model", "") for m in (settings.miner_stage2_models or [])]
+            logger.info(f"   - Two-stage Stage1: {settings.miner_stage1_mode}, endpoints={n1}")
+            logger.info(f"   - Two-stage Stage2 models: {s2n or '(未配置，仅 Stage1)'}")
+        elif (settings.miner_mode or "").lower() == "remote":
+            n_ep = len(settings.miner_remote_models or [])
+            if n_ep > 1:
+                logger.info(f"   - Remote fallback chain: {n_ep} 个端点（MINER_REMOTE + MINER_REMOTE_FALLBACK_MODELS）")
         logger.info(f"   - Temperature: {settings.miner_temperature}")
         logger.info(f"   - Max Tokens: {settings.miner_max_tokens}")
         logger.info(f"   - Max Retries: {settings.miner_max_retries}")
@@ -134,12 +136,8 @@ EXTRACT_SYSTEM_PROMPT = """你是面经提取专家，从面经原文中提取�
 - 流程：「面试官很和善」「共XX分钟」
 - 少于8字且无技术词汇
 
-## question_type分类
-算法类：DP编程题、回溯编程题、贪心编程题、图算法题、树算法题、链表题、数组题、其他算法题
-AI/ML：LLM原理题、LLM算法题、模型结构题、模型训练题、RAG题、Agent题、CV题、NLP题
-工程类：系统设计题、数据库题、缓存题、消息队列题、微服务题、性能优化题、并发编程题
-基础类：操作系统题、计算机网络题、数据结构题、编程语言题
-软技能：项目经验题、行为题、HR题
+## question_type（须填「小类」完整字符串，禁止算法类/工程类等大类）
+与主线 Miner 一致：算法-动态规划、算法-回溯与搜索、工程-缓存与Redis、工程-系统设计与架构、基础-操作系统、软技能-行为与情景、AI-RAG与检索增强 等；完整清单见项目 miner_prompt §4b 与 backend.agents.schemas.miner_schema.ALLOWED_QUESTION_TYPES。
 
 ## 输出格式
 直接输出JSON数组，不加markdown代码块。**所有字段内容必须用中文。**
@@ -266,13 +264,7 @@ _shared_miner_agent = None
 
 
 def _get_miner_agent(image_paths: List[str] = None, task_id: str = ""):
-    """获取或创建 MinerAgent 实例。
-    MINER_MODE=two_stage 时使用两阶段提取（Stage1=MINER_REMOTE_* 远程粗提取 + Stage2 豆包精加工），否则用单阶段 MinerAgent。
-    """
-    from backend.config.config import settings
-    if (settings.miner_mode or "").lower() == "two_stage":
-        from backend.agents.miner_agent_v3 import create_miner_agent
-        return create_miner_agent(image_paths=image_paths or [], task_id=task_id or "", mode="two_stage")
+    """获取或创建 MinerAgent 实例（单阶段 ReAct + 工具调用）。"""
     from backend.agents.miner_agent import MinerAgent
     return MinerAgent(image_paths=image_paths or [], task_id=task_id or "")
 
@@ -291,6 +283,8 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
         (result, ocr_called, is_unrelated)
     """
     from backend.agents.miner_agent import UNRELATED_SIGNAL
+    from backend.config.config import settings as _settings_mode
+
     _REFUSE_QUICK = [
         r"^抱歉[，]?我无法",
         r"^对不起[，]?我(不能|无法)",
@@ -299,50 +293,59 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
         r"^抱歉，我不能",
     ]
     try:
-        agent = _get_miner_agent(image_paths=image_paths, task_id=task_id)
-        # 重试时直接用带纠错指令的 retry_hint 作为输入，跳过 format_miner_user_prompt
-        if retry_hint:
-            result, ocr_called, is_unrelated = agent.run(
-                content=content,
-                has_image=has_image,
-                company=company,
-                position=position,
-                user_input_override=retry_hint,
-                source_url=source_url,
-                post_title=post_title,
+        if (_settings_mode.miner_mode or "").lower() == "two_stage":
+            from backend.agents.two_stage_miner_agent import TwoStageExtractor
+
+            ext = TwoStageExtractor(image_paths=image_paths or [], task_id=task_id or "")
+            if retry_hint:
+                result, ocr_called, is_unrelated = ext.extract(
+                    content=content,
+                    has_image=has_image,
+                    company=company,
+                    position=position,
+                    user_input_override=retry_hint,
+                    source_url=source_url,
+                    post_title=post_title,
+                )
+            else:
+                result, ocr_called, is_unrelated = ext.extract(
+                    content=content,
+                    has_image=has_image,
+                    company=company,
+                    position=position,
+                    source_url=source_url,
+                    post_title=post_title,
+                )
+            logger.info(
+                f"[TwoStageExtractor] 执行完成，输出长度: {len(result)}, ocr_called={ocr_called}, is_unrelated={is_unrelated}"
             )
         else:
-            result, ocr_called, is_unrelated = agent.run(
-                content=content,
-                has_image=has_image,
-                company=company,
-                position=position,
-                source_url=source_url,
-                post_title=post_title,
+            agent = _get_miner_agent(image_paths=image_paths, task_id=task_id)
+            if retry_hint:
+                result, ocr_called, is_unrelated = agent.run(
+                    content=content,
+                    has_image=has_image,
+                    company=company,
+                    position=position,
+                    user_input_override=retry_hint,
+                    source_url=source_url,
+                    post_title=post_title,
+                )
+            else:
+                result, ocr_called, is_unrelated = agent.run(
+                    content=content,
+                    has_image=has_image,
+                    company=company,
+                    position=position,
+                    source_url=source_url,
+                    post_title=post_title,
+                )
+            logger.info(
+                f"[MinerAgent] 执行完成，输出长度: {len(result)}, ocr_called={ocr_called}, is_unrelated={is_unrelated}"
             )
-        logger.info(f"[MinerAgent] 执行完成，输出长度: {len(result)}, ocr_called={ocr_called}, is_unrelated={is_unrelated}")
         # Agent 成功返回，但 result 是拒绝文本时降级为直接 LLM 调用
         if result and not is_unrelated:
             _stripped = result.strip()
-            # 特殊处理：__STAGE2_PENDING__ 表示已入队异步处理，不应降级
-            if _stripped == "__STAGE2_PENDING__":
-                logger.info("[MinerAgent] 返回 __STAGE2_PENDING__，已入队异步 Stage 2 处理")
-                return result, ocr_called, is_unrelated
-
-            # two_stage：Stage1 失败说明勿走「非 JSON → 直连 LLM」降级（直连用 MINER_REMOTE，会绕过 MINER_STAGE1_FALLBACK，且易重复 403）
-            from backend.config.config import settings as _miner_settings
-
-            if (_miner_settings.miner_mode or "").lower() == "two_stage" and (
-                "Stage1 模型调用失败" in _stripped
-                or "OpenAI Function Calling调用失败" in _stripped
-                or "本地模型调用失败" in _stripped
-            ):
-                logger.warning(
-                    "[MinerAgent] two_stage Stage1 失败文案已返回，跳过直连 LLM 降级 | 预览=%s",
-                    (_stripped[:160] + "…") if len(_stripped) > 160 else _stripped,
-                )
-                return "", ocr_called, is_unrelated
-
             # 检测拒绝文本
             if any(re.search(p, _stripped, re.IGNORECASE) for p in _REFUSE_QUICK):
                 logger.warning(f"[MinerAgent] Agent 返回拒绝文本，降级为直接 LLM 调用: {_stripped[:60]}")
@@ -365,45 +368,77 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
                 ocr_text = ocr_images_to_text(image_paths, task_id) or ""
             except Exception as ocr_e:
                 logger.warning(f"[OCR] 降级 OCR 也失败: {ocr_e}")
-        
+            if not (ocr_text or "").strip():
+                logger.warning(
+                    "[Miner降级] 共 %d 张图但 OCR 无可用文本（将仅按正文调 LLM）| task=%s | paths=%s",
+                    len(image_paths),
+                    task_id or "-",
+                    image_paths,
+                )
+
         # 使用 format_miner_user_prompt 格式化输入
         from backend.agents.prompts.miner_prompt import format_miner_user_prompt
         user_prompt = retry_hint or format_miner_user_prompt(content, has_image, company, position)
         if ocr_text:
             user_prompt += f"\n\n## 图片OCR识别内容\n{ocr_text}"
-        
+
         return _call_llm_direct(user_prompt), bool(ocr_text), False
 
 
 def _call_llm_direct(user_prompt: str) -> Optional[str]:
-    """直接调用 LLM API（不走 Agent，作为降级方案）。使用 Miner 专属配置。"""
-    try:
-        from openai import OpenAI
-        from backend.config.config import settings
-        timeout = settings.miner_timeout or 180
-        model = settings.miner_model
-        if not model:
-            logger.error("Miner 模型未配置（miner_model 为空），请检查 .env 中 MINER_LOCAL_MODEL 或 MINER_REMOTE_MODEL")
-            return None
-        client = OpenAI(
-            api_key=settings.miner_api_key,
-            base_url=settings.miner_base_url,
-            timeout=timeout,
+    """直接调用 LLM API（不走 Agent，作为降级方案）。remote 时按 MINER_REMOTE_FALLBACK_MODELS 依次切换端点。"""
+    from openai import OpenAI
+    from backend.config.config import settings
+
+    endpoints = settings.miner_remote_models
+    if not endpoints:
+        logger.error(
+            "Miner 直连无可用端点：请配置 MINER_LOCAL_* / MINER_REMOTE_*，"
+            "two_stage 时 Stage1 需 MINER_STAGE1_* 或 MINER_REMOTE_*"
         )
-        messages = [
-            {"role": "system", "content": get_miner_prompt()},
-            {"role": "user",   "content": user_prompt},
-        ]
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=settings.miner_temperature,
-            timeout=timeout,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"LLM 直接调用失败: {e}")
         return None
+
+    messages = [
+        {"role": "system", "content": get_miner_prompt()},
+        {"role": "user", "content": user_prompt},
+    ]
+    last_err: Exception | None = None
+    for idx, ep in enumerate(endpoints):
+        model = (ep.get("model") or "").strip()
+        base = (ep.get("base_url") or "").strip().rstrip("/")
+        key = (ep.get("api_key") or "").strip() or "sk-dummy"
+        timeout = int(ep.get("timeout") or settings.miner_timeout or 180)
+        if not model or not base:
+            continue
+        try:
+            client = OpenAI(api_key=key, base_url=base, timeout=timeout)
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=settings.miner_temperature,
+                timeout=timeout,
+            )
+            out = (resp.choices[0].message.content or "").strip()
+            if out:
+                if idx > 0:
+                    logger.info("[Miner直连] 备用端点成功 model=%s (%d/%d)", model, idx + 1, len(endpoints))
+                return out
+            last_err = RuntimeError("empty completion content")
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "[Miner直连] 端点失败 model=%s (%d/%d): %s",
+                model,
+                idx + 1,
+                len(endpoints),
+                e,
+            )
+            if idx + 1 < len(endpoints):
+                continue
+        break
+    if last_err:
+        logger.error("LLM 直接调用全部端点失败: %s", last_err)
+    return None
 
 
 def _call_llm(user_prompt: str) -> Optional[str]:
@@ -450,6 +485,11 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
         return [], "empty"
     # 去掉 markdown 代码块（```json ... ``` 或 ``` ... ```）
     text = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`").strip()
+    text = text.lstrip("\ufeff")
+    # 模型常在 JSON 前后加说明，整段 json.loads 失败；先识别无关声明（与 prompt 的 unrelated 对象一致）
+    if re.search(r'"status"\s*:\s*"unrelated"', text, re.IGNORECASE):
+        logger.info("LLM 输出中含 status=unrelated（可能带前后缀非 JSON），标记为无关帖")
+        return [], "unrelated"
     # 去掉 deepseek-r1 的 <think>...</think> 推理块（Ollama 本地部署时混在 content 里）
     text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"<think>[\s\S]*$", "", text, flags=re.IGNORECASE).strip()
@@ -491,6 +531,11 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
     try:
         data = json.loads(text)
         if isinstance(data, dict):
+            # 与 prompt 一致：{"status":"unrelated","reason":"..."} 表示无面经题，应标记 unrelated 而非 parse_error
+            _su = (data.get("status") or "").strip().lower()
+            if _su == "unrelated":
+                logger.info("LLM 返回无关帖（JSON 对象）: %s", (data.get("reason") or "")[:200])
+                return [], "unrelated"
             tool_name = data.get("name") or data.get("tool") or data.get("function")
             if tool_name == "ocr_images":
                 logger.warning("LLM 返回 ocr_images 工具调用格式但未被执行，将触发手动 OCR 降级")
@@ -527,6 +572,9 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
                     (data.get("reason") or "")[:120],
                 )
                 return [], "foreign_language"
+            if _st == "unrelated":
+                logger.info("LLM 返回无关帖（0c）: %s", (data.get("reason") or "")[:200])
+                return [], "unrelated"
             if data.get("reason") == "帖子与面经无关":
                 return [], "unrelated"
             # 处理空对象 {} 的情况（LLM有时返回空对象表示无题目）
@@ -553,6 +601,9 @@ def _parse_json_from_llm(text: str, user_prompt_for_debug: str = None) -> Tuple[
                     (data.get("reason") or "")[:120],
                 )
                 return [], "foreign_language"
+            if _st1 == "unrelated":
+                logger.info("LLM 返回无关帖（整段 JSON）: %s", (data.get("reason") or "")[:200])
+                return [], "unrelated"
             # 常见顶层 key 或嵌套 job.project_detail
             for key in ("questions", "items", "results", "data", "list", "output"):
                 if key in data and isinstance(data[key], list):
@@ -695,12 +746,8 @@ def _apply_miner_chinese_locale_guard(
         cn_reason,
         source_url,
     )
-    try:
-        from backend.agents import two_stage_miner_agent as tsm
-
-        tsm._last_extraction_error = f"[乱码校验] {cn_reason}"
-    except Exception:
-        pass
+    global _last_extraction_error
+    _last_extraction_error = f"[乱码校验] {cn_reason}"
     return [], "chinese_guard_failed"
 
 
@@ -729,7 +776,10 @@ def extract_questions_from_post(
     若正文无题目且有图片，MinerAgent 会自主调用 ocr_images 工具获取图片内容后再提取。
     """
     _print_miner_config_once()
-    
+
+    global _last_extraction_error
+    _last_extraction_error = None
+
     # 只检查是否完全为空（不检查长度）
     if not content and not image_paths:
         logger.warning(f"内容和图片均为空，跳过提取 | url={source_url} | title={post_title[:30] if post_title else ''}")
@@ -740,6 +790,15 @@ def extract_questions_from_post(
 
     # 使用新的 Prompt 系统
     user_prompt = format_miner_user_prompt(full_content, has_image=bool(image_paths), company=company, position=position)
+    if os.environ.get("WXR_WORKER_SUBPROCESS") == "1":
+        logger.info(
+            "[题目提取][子进程] url=%s | 原始正文=%d字 | 标题=%s | 图=%d张 | miner用户消息约%d字",
+            source_url,
+            len(content or ""),
+            (post_title or "")[:120],
+            len(image_paths or []),
+            len(user_prompt),
+        )
 
     from backend.config.config import settings
     max_retries = settings.miner_max_retries
@@ -770,12 +829,8 @@ def extract_questions_from_post(
             # 情况B：上次解析失败（空/格式错误）
             elif not items or status != "ok":
                 _err_hint = ""
-                try:
-                    from backend.agents.two_stage_miner_agent import _last_extraction_error
-                    if _last_extraction_error:
-                        _err_hint = f"\n\n**上次失败原因**：{_last_extraction_error}\n请针对上述错误修正输出，确保 JSON 合法。"
-                except Exception:
-                    pass
+                if _last_extraction_error:
+                    _err_hint = f"\n\n**上次失败原因**：{_last_extraction_error}\n请针对上述错误修正输出，确保 JSON 合法。"
                 attempt_prompt = user_prompt + (
                     f"\n\n【第{attempt}次重试 - 重要纠错】"
                     "上一次你的回复不是合法的 JSON 数组，解析失败。"
@@ -787,12 +842,8 @@ def extract_questions_from_post(
             # 情况C：其他重试
             else:
                 _err_hint = ""
-                try:
-                    from backend.agents.two_stage_miner_agent import _last_extraction_error
-                    if _last_extraction_error:
-                        _err_hint = f"\n\n**上次失败原因**：{_last_extraction_error}\n请针对上述错误修正输出。"
-                except Exception:
-                    pass
+                if _last_extraction_error:
+                    _err_hint = f"\n\n**上次失败原因**：{_last_extraction_error}\n请针对上述错误修正输出。"
                 attempt_prompt = user_prompt + (
                     f"\n\n【第{attempt}次重试 - 重要纠错】"
                     "上一次提取的题目数量不足或格式有误。"
@@ -813,7 +864,7 @@ def extract_questions_from_post(
         if _is_miner_fatal_upstream_error(raw):
             _msg = (raw or "")[:2000]
             logger.error(
-                "Miner/Stage1 上游致命错误（配置或 API），中止批处理 | url=%s | 预览=%s",
+                "Miner 上游致命错误（配置或 API），中止批处理 | url=%s | 预览=%s",
                 source_url,
                 _msg[:400],
             )
@@ -829,11 +880,6 @@ def extract_questions_from_post(
             _append_llm_log_to_csv(user_prompt, "[mark_unrelated]", llm_response_time_sec,
                                    source=platform, title=post_title, source_url=source_url)
             return [], "unrelated", agent_used_tool, True, trace_session_id
-
-        # 两阶段异步：Stage1 完成已入队，待 Stage2 批量处理
-        if raw == "__STAGE2_PENDING__":
-            logger.info(f"Stage1 完成已入队，待 Stage2 批量处理: {source_url}")
-            return [], "stage2_pending", agent_used_tool, True, trace_session_id
 
         items, status = _parse_json_from_llm(raw, user_prompt_for_debug=user_prompt)
 
@@ -923,6 +969,12 @@ def extract_questions_from_post(
                 logger.info(f"LLM 原始返回（前500字）: {raw[:500]}")
 
     if not items:
+        # 多轮重试后 status 可能仍为 parse_error，但最后一次 raw 实为 unrelated 对象
+        if status == "parse_error" and (raw or "").strip():
+            _salvage_items, _salvage_st = _parse_json_from_llm(raw, user_prompt_for_debug=None)
+            if _salvage_st == "unrelated":
+                logger.info("兜底：重试耗尽后从原始输出识别为无关帖 | url=%s", source_url)
+                return [], "unrelated", agent_used_tool, True, trace_session_id
         logger.warning(f"LLM 未提取到题目 | url={source_url} | title={post_title[:30] if post_title else ''}")
         return [], status, agent_used_tool, True, trace_session_id
 
@@ -934,8 +986,14 @@ def extract_questions_from_post(
             continue
         
         # 兼容多种字段名：question_text / question
-        q_text = str(item.get("question_text") or item.get("question", "")).strip()
-        
+        q_text = strip_question_enumeration(
+            str(item.get("question_text") or item.get("question", "")).strip()
+        )
+        q_text, _ = repair_text(q_text)
+        if is_unusable_after_repair(q_text):
+            logger.warning("题干疑似乱码已跳过 | preview=%s", (q_text or "")[:80])
+            continue
+
         # 放宽过滤条件：只过滤完全为空的题目
         if not q_text:
             logger.warning(f"题目为空被过滤")
@@ -950,6 +1008,19 @@ def extract_questions_from_post(
         item_company = str(item.get("company", "")).strip()
         post_company = (company or "").strip() if (company or "").strip() != "未知" else ""
         final_company = item_company or post_company or ""
+        try:
+            from backend.services.company_normalization import normalize_company_field
+
+            final_company = normalize_company_field(
+                final_company,
+                post_title=post_title or "",
+                hint_text=q_text[:1200],
+            )
+        except Exception:
+            pass
+        final_company, _ = repair_text(final_company)
+        if company_should_be_cleared(final_company):
+            final_company = ""
         item_position = str(item.get("position", "")).strip()
         post_position = (position or "").strip() if (position or "").strip() != "未知" else ""
         final_position = item_position or post_position or ""
@@ -961,13 +1032,20 @@ def extract_questions_from_post(
         q_id = str(uuid.uuid4())
         
         # 兼容多种字段名：answer_text/answer, question_type/type/role
-        # two_stage 模式：answer_text=豆包答案（展示用），raw_answer=原答案（Stage1）
         q_type = str(item.get("question_type") or item.get("type") or item.get("role", "技术题")).strip() or "技术题"
+        ans = str(item.get("answer_text") or item.get("answer", "")).strip()
+        raw_a = str(item.get("raw_answer", "")).strip()
+        ans, _ = repair_text(ans)
+        raw_a, _ = repair_text(raw_a)
+        if is_unusable_answer_after_repair(ans):
+            ans = ""
+        if is_unusable_answer_after_repair(raw_a):
+            raw_a = ""
         questions.append({
             "q_id": q_id,
             "question_text": q_text,
-            "answer_text": str(item.get("answer_text") or item.get("answer", "")).strip(),
-            "raw_answer": str(item.get("raw_answer", "")).strip(),
+            "answer_text": ans,
+            "raw_answer": raw_a,
             "difficulty": difficulty_val,
             "question_type": q_type,
             "topic_tags": json.dumps(tags_raw, ensure_ascii=False),

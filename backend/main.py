@@ -79,7 +79,15 @@ _NOWCODER_OUTPUT_DIR = _cfg.nowcoder_output_dir
 
 
 
-for _d in [_BACKEND_DATA, _BACKEND_LOGS, _MEMORY_DIR, _XHS_DATA_DIR, _POST_IMAGES_DIR, _NOWCODER_OUTPUT_DIR]:
+for _d in [
+    _BACKEND_DATA,
+    _BACKEND_LOGS,
+    Path(_cfg.subprocess_log_dir),
+    _MEMORY_DIR,
+    _XHS_DATA_DIR,
+    _POST_IMAGES_DIR,
+    _NOWCODER_OUTPUT_DIR,
+]:
 
     _d.mkdir(parents=True, exist_ok=True)
 
@@ -310,13 +318,10 @@ from backend.services.storage.sqlite_service import sqlite_service
 from backend.services.multi_recall_recommender import multi_recall_recommender
 
 from backend.services.scheduling.scheduler import crawl_scheduler
+from backend.services.scheduling.subprocess_log_paths import new_subprocess_log_file
 from backend.services.crawler.task_executor import (
     execute as task_execute,
     get_source_info as task_get_source_info,
-    prepare_extract_pending,
-    prepare_retry_errors,
-    prepare_re_extract_all,
-    get_fetched_task_ids,
 )
 
 
@@ -420,9 +425,11 @@ if _POST_IMAGES_DIR.exists():
 
 from backend.api.scheduler_api import router as scheduler_router
 from backend.api.reasoning_api import router as reasoning_router
+from backend.api.model_bench_api import router as model_bench_router
 
 app.include_router(scheduler_router)
 app.include_router(reasoning_router)
+app.include_router(model_bench_router)
 
 
 
@@ -469,30 +476,11 @@ def _print_agent_llm_config():
 
     logger.info("  " + "─" * 56)
 
-    # Miner Agent（two_stage：Stage1 由 MINER_STAGE1_MODE + MINER_STAGE1_*；Stage2 用 MINER_STAGE2_*）
-    if s.miner_mode == "two_stage":
-        mm_stage2 = s.miner_stage2_model or "(未设置)"
-        logger.info(f"  [Miner Agent] mode=two_stage")
-        s1m = getattr(s, "miner_stage1_mode", "remote")
-        n_ep = len(getattr(s, "miner_stage1_models", []) or [])
-        if s1m == "local":
-            logger.info(
-                f"    Stage1(本地): model={s.miner_stage1_local_model or '(未设置)'}, "
-                f"base={s.miner_stage1_local_base_url or '(未设置)'}, timeout={s.miner_stage1_local_timeout}s"
-            )
-        else:
-            _src = "显式 MINER_STAGE1_REMOTE_*" if getattr(s, "miner_stage1_remote_explicit_in_env", False) else "回退 MINER_REMOTE_*（# 注释的变量不会进入进程）"
-            logger.info(f"    Stage1(远程) 来源: {_src}")
-            logger.info(
-                f"    Stage1(远程): primary={s.miner_stage1_remote_model or '(未设置)'}, "
-                f"base={s.miner_stage1_remote_base_url or '(未设置)'}, "
-                f"timeout={s.miner_stage1_remote_timeout}s, 端点链={n_ep}, "
-                f"MINER_STAGE1_FALLBACK_MODELS={'已设' if getattr(s, 'miner_stage1_fallback_models_in_env', False) else '未设'}"
-            )
-        logger.info(f"    Stage2(精加工): model={mm_stage2}, base={s.miner_stage2_base_url or '(未设置)'}")
-    else:
-        mm = s.miner_model or s.llm_model_id or "(未设置)"
-        logger.info(f"  [Miner Agent] mode={s.miner_mode}, model={mm}, temperature={s.miner_temperature}, max_tokens={s.miner_max_tokens}, base={s.miner_base_url or s.llm_base_url or '(同全局)'}")
+    mm = s.miner_model or s.llm_model_id or "(未设置)"
+    logger.info(
+        f"  [Miner Agent] mode={s.miner_mode}, model={mm}, temperature={s.miner_temperature}, "
+        f"max_tokens={s.miner_max_tokens}, base={s.miner_base_url or s.llm_base_url or '(同全局)'}"
+    )
 
     # Interviewer Agent
 
@@ -514,7 +502,6 @@ async def startup_event():
     from backend.config.config import settings as _s
     from backend.services.crawler.question_extractor import _print_miner_config_once
     from backend.services.storage import sqlite_service
-    from backend.services.stage2_processor import run_stage2_processor_now
 
     _print_miner_config_once()
     _print_agent_llm_config()
@@ -539,7 +526,7 @@ async def startup_event():
                         f"剩余 {len(remaining)} 条。"
                     )
                     if getattr(_s, "crawler_auto_resume_batch_extract_on_startup", True):
-                        log_path = _BACKEND_LOGS / "batch_extract.log"
+                        log_path = new_subprocess_log_file("batch_extract")
                         cmd = (
                             [sys.executable, "-m", "backend.services.scheduling.batch_extract_worker"]
                             + remaining
@@ -555,17 +542,6 @@ async def startup_event():
                         )
     except (OSError, ValueError, KeyError):
         pass
-
-    # Stage2 恢复补跑：后端重启后，优先处理上次遗留的 pending/in_progress
-    # （即使不足 batch_size，也会 lease 并按实际数量处理）
-    try:
-        if sqlite_service.get_stage2_queue_count() > 0:
-            logger.info("[Startup] Stage2 队列存在遗留任务，后台补跑 Stage2 ...")
-            # 强制恢复 in_progress：通常表示“上次后端已不存在”，应立即回到 pending 供处理
-            sqlite_service.recover_stale_stage2_pending(0)
-            asyncio.create_task(asyncio.to_thread(run_stage2_processor_now))
-    except Exception:
-        logger.warning("[Startup] Stage2 补跑失败（不影响主服务启动）", exc_info=True)
 
     # fetched 恢复补跑：后端重启后，自动继续上次未完成的正文提取任务
     # 依赖 crawl_tasks.status 持久化，无需额外状态文件
@@ -621,12 +597,13 @@ async def shutdown_event():
                 _batch_extract_proc.kill()
             except OSError:
                 pass
-        log_path = _BACKEND_LOGS / "batch_extract.log"
         try:
             with open(_BATCH_EXTRACT_STATE_FILE, "r", encoding="utf-8") as f:
                 import json
                 state = json.load(f)
             start_offset = state.get("log_start_offset", 0)
+            _lp = state.get("log_path")
+            log_path = Path(_lp) if _lp else _BACKEND_LOGS / "batch_extract.log"
             completed = _parse_completed_from_log(log_path, start_offset)
             _save_batch_extract_state(
                 state.get("task_ids", []),
@@ -634,6 +611,7 @@ async def shutdown_event():
                 start_offset,
                 completed=completed,
                 interrupted_at=__import__("datetime").datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                log_path=_lp or str(log_path.resolve()),
             )
             logger.info(
                 f"[Shutdown] 批量提取已保存进度：已完成 {len(completed)}/{state.get('total', 0)}，重启后可恢复"
@@ -944,14 +922,17 @@ def get_questions(
     company: Optional[str] = Query(None, description="公司名，模糊匹配"),
     position: Optional[str] = Query(None, description="岗位，模糊匹配"),
     difficulty: Optional[str] = Query(None, description="难度：easy/medium/hard"),
-    question_type: Optional[str] = Query(None, description="题目类型：技术题/算法题/系统设计/行为题/HR问题"),
+    question_type: Optional[str] = Query(None, description="题目类型小类：算法-/工程-/基础-/软技能-/AI-*（见 /api/questions/meta 下拉）"),
     tag: Optional[str] = Query(None, description="技术标签，如 Redis"),
     keyword: Optional[str] = Query(None, description="关键词，搜索题目文本"),
     source_platform: Optional[str] = Query(None, description="来源平台：nowcoder/xiaohongshu"),
     rand: bool = Query(False, description="true 时随机返回"),
     page: int = Query(1, ge=1, description="页码，从 1 开始"),
     page_size: int = Query(20, ge=1, le=100, description="每页题目数量"),
-    sort_by: Optional[str] = Query(None, description="排序字段：created_at/difficulty/company/question_type/question_text"),
+    sort_by: Optional[str] = Query(
+        None,
+        description="排序字段：created_at/difficulty/company/question_type/question_text/next_review_at（待复习时间，需 user_id）",
+    ),
     sort_order: Optional[str] = Query(None, description="排序方向：asc/desc"),
     user_id: Optional[str] = Query(None, description="用户ID，传入时在题目中附加该用户最近作答得分"),
 ):
@@ -986,7 +967,8 @@ def get_questions(
             company=company, position=position, difficulty=difficulty,
             question_type=question_type, tags=tags, keyword=keyword,
             source_platform=source_platform, limit=page_size, offset=offset,
-            sort_by=sort_by or "created_at", sort_order=sort_order or "desc"
+            sort_by=sort_by or "created_at", sort_order=sort_order or "desc",
+            user_id=user_id,
         )
         total_pages = _math.ceil(total / page_size) if page_size > 0 else 1
         cur_page = page
@@ -1008,6 +990,9 @@ def get_questions(
             if qid and qid in scores_map:
                 r["last_score"] = scores_map[qid]["score"]
                 r["last_studied_at"] = scores_map[qid]["studied_at"]
+                nra = scores_map[qid].get("next_review_at")
+                if nra is not None and nra != "":
+                    r["next_review_at"] = nra
 
     return {
         "total": total,
@@ -1158,8 +1143,9 @@ def get_questions_meta():
                          conn.execute("SELECT DISTINCT question_type FROM questions WHERE question_type IS NOT NULL AND question_type != '' ORDER BY question_type").fetchall()]
 
         if not question_types:
+            from backend.agents.schemas.miner_schema import ALLOWED_QUESTION_TYPES
 
-            question_types = ["技术题", "算法题", "系统设计", "行为题", "HR问题"]
+            question_types = sorted(ALLOWED_QUESTION_TYPES)
 
 
 
@@ -2274,55 +2260,6 @@ async def process_crawler_queue(batch_size: int | None = Query(default=None, ge=
 
 
 
-@app.post("/api/crawler/extract-pending")
-async def extract_pending_posts(batch_size: int | None = Query(default=None, ge=1, le=200)):
-    """异步提取所有 fetched 状态（已爬取正文但尚未提取题目）的帖子。子进程执行，不阻塞主进程（chat/提交作答等）。"""
-    batch_size = batch_size if batch_size is not None else _cfg.crawler_process_batch_size
-    logger.info(f"[API] 提取未处理帖子 被调用 batch_size={batch_size}")
-    pending_count, initial_by_platform = prepare_extract_pending()
-    if pending_count == 0:
-        logger.info("[API] 提取未处理帖子 无待处理，直接返回")
-        return {
-            "status": "ok",
-            "message": "没有待提取的帖子（状态为 fetched 的记录为 0）",
-            "pending": 0,
-            "source_info": task_get_source_info(),
-        }
-    task_ids = get_fetched_task_ids(batch_size)
-    if not task_ids:
-        return {
-            "status": "ok",
-            "message": "没有符合条件的待提取帖子",
-            "pending": 0,
-            "source_info": task_get_source_info(),
-        }
-    log_path = _BACKEND_LOGS / "batch_extract.log"
-    cmd = [sys.executable, "-m", "backend.services.scheduling.batch_extract_worker"] + task_ids
-    _spawn_batch_extract_subprocess(cmd, log_path, total_count=len(task_ids))
-    logger.info(f"[API] 提取未处理帖子 已启动子进程，共 {len(task_ids)} 条，日志: {log_path}")
-    return {
-        "status": "ok",
-        "message": f"已提交子进程后台提取，共 {len(task_ids)} 条，日志: {log_path}",
-        "pending": pending_count,
-        "source_info": task_get_source_info(),
-    }
-
-
-
-
-
-@app.post("/api/crawler/stage2-process")
-async def trigger_stage2_process():
-    """手动触发 Stage2 批量处理（处理 stage2_pending 队列中剩余项，不足 batch_size 也会处理）"""
-    from backend.services.stage2_processor import run_stage2_processor_now
-    from backend.services.storage import sqlite_service
-    count = sqlite_service.get_stage2_queue_count()
-    if count == 0:
-        return {"status": "ok", "message": "Stage2 队列为空", "processed": 0}
-    await asyncio.to_thread(run_stage2_processor_now)
-    return {"status": "ok", "message": f"已触发 Stage2 处理（队列原有 {count} 条）", "queued": count}
-
-
 @app.post("/api/crawler/clean-data")
 async def clean_unrelated_data(batch_size: int | None = Query(default=None, ge=1, le=200)):
     """清洗无关帖：1) 直接删除 unrelated 状态；2) 对 done 帖子用 LLM 二次判断，无关则删除。"""
@@ -2331,201 +2268,6 @@ async def clean_unrelated_data(batch_size: int | None = Query(default=None, ge=1
     result = await asyncio.to_thread(task_execute, "clean_data", "button", batch_size=batch_size)
     logger.info(f"[API] 清洗数据 完成: {result.get('message', '')}")
     return result
-
-
-
-
-
-@app.post("/api/crawler/retry-errors")
-async def retry_error_posts(batch_size: int | None = Query(default=None, ge=1, le=200)):
-    """将 error 且有正文的帖子重置为 fetched 后台提取；无正文的重置为 pending 重新抓取。"""
-    batch_size = batch_size if batch_size is not None else _cfg.crawler_process_batch_size
-    logger.info(f"[API] 重试失败帖子 被调用 batch_size={batch_size}")
-    to_extract, to_fetch, total, initial_by_platform = prepare_retry_errors()
-    if total == 0:
-        logger.info("[API] 重试失败帖子 无可重试，直接返回")
-        return {
-            "status": "ok",
-            "message": "没有可重试的帖子（error 记录为 0）",
-            "reset": 0,
-            "source_info": task_get_source_info(),
-        }
-    run_mode = getattr(_cfg, "crawler_background_run_mode", "process")
-    logger.info(f"[API] 重试失败帖子 重置 {total} 条，后台模式={run_mode}")
-    global _extraction_running, _extraction_initial_by_platform
-
-    def _bg_thread():
-        global _extraction_running, _extraction_initial_by_platform
-        try:
-            _extraction_running = True
-            _extraction_initial_by_platform = initial_by_platform
-            task_execute("process_tasks", "button", batch_size=batch_size)
-            logger.info(f"[API] 重试失败帖子 后台完成")
-        except Exception as e:
-            logger.error(f"重试失败: {e}")
-        finally:
-            _extraction_running = False
-            _extraction_initial_by_platform = {}
-
-    if run_mode == "process":
-        import threading
-        _extraction_running = True
-        _extraction_initial_by_platform = initial_by_platform
-        _p = _spawn_process_tasks_worker(batch_size=batch_size, reason="retry-errors")
-
-        def _watch():
-            global _extraction_running, _extraction_initial_by_platform
-            try:
-                _p.wait()
-            finally:
-                _extraction_running = False
-                _extraction_initial_by_platform = {}
-
-        threading.Thread(target=_watch, daemon=True).start()
-    else:
-        import threading
-        _t = threading.Thread(target=_bg_thread, daemon=True)
-        _t.start()
-        logger.info(f"[后台线程] ▶ 启动 重试提取线程 tid={_t.ident} | 重置 {total} 条 | batch_size={batch_size}")
-    msg_parts = []
-    if to_extract:
-        msg_parts.append(f"{to_extract} 条待重新提取")
-    if to_fetch:
-        msg_parts.append(f"{to_fetch} 条待重新抓取")
-    return {
-        "status": "ok",
-        "message": "；".join(msg_parts),
-        "reset": total,
-        # 供前端进度条：重置后各平台「待提取」基数（与 _extraction_initial_by_platform 一致）
-        "initial_by_platform": initial_by_platform,
-        "source_info": task_get_source_info(),
-    }
-
-
-
-
-
-@app.post("/api/crawler/re-extract-all")
-async def re_extract_all_posts(batch_size: int | None = Query(default=None, ge=1, le=200)):
-    """重新提取所有问题：删除旧题目、重置为待提取，后台重新 LLM 提取。"""
-    batch_size = batch_size if batch_size is not None else _cfg.crawler_process_batch_size
-    logger.info(f"[API] 重新提取所有问题 被调用 batch_size={batch_size}")
-    reset_count, deleted_questions, initial_by_platform = await asyncio.to_thread(prepare_re_extract_all)
-    if reset_count == 0:
-        return {
-            "status": "ok",
-            "message": "没有可重新提取的帖子（done/error 且含正文）",
-            "reset": 0,
-            "source_info": task_get_source_info(),
-        }
-    run_mode = getattr(_cfg, "crawler_background_run_mode", "process")
-    logger.info(f"[API] 重新提取所有问题 重置 {reset_count} 条，删除 {deleted_questions} 道旧题目，后台模式={run_mode}")
-    global _extraction_running, _extraction_initial_by_platform
-    from backend.services.crawler import question_extractor
-    _run_suffix = now_beijing_str("%Y%m%d_%H%M%S")
-    question_extractor._llm_log_run_suffix = _run_suffix
-    logger.info(f"[API] 重新提取 LLM 日志将写入: llm_prompt_log_{_run_suffix}.jsonl")
-
-    def _bg_thread():
-        global _extraction_running, _extraction_initial_by_platform
-        try:
-            _extraction_running = True
-            _extraction_initial_by_platform = initial_by_platform
-            task_execute("process_tasks", "button", batch_size=batch_size)
-            logger.info(f"[API] 重新提取所有问题 后台完成")
-        except Exception as e:
-            logger.error(f"重新提取失败: {e}", exc_info=True)
-        finally:
-            _extraction_running = False
-            _extraction_initial_by_platform = {}
-            question_extractor._llm_log_run_suffix = None
-
-    if run_mode == "process":
-        import threading
-        _extraction_running = True
-        _extraction_initial_by_platform = initial_by_platform
-        _p = _spawn_process_tasks_worker(batch_size=batch_size, reason="re-extract-all")
-
-        def _watch():
-            global _extraction_running, _extraction_initial_by_platform
-            try:
-                _p.wait()
-            finally:
-                _extraction_running = False
-                _extraction_initial_by_platform = {}
-                question_extractor._llm_log_run_suffix = None
-
-        threading.Thread(target=_watch, daemon=True).start()
-    else:
-        import threading
-        threading.Thread(target=_bg_thread, daemon=True).start()
-    return {
-        "status": "ok",
-        "message": f"已重置 {reset_count} 条帖子（删除 {deleted_questions} 道旧题），开始重新提取",
-        "reset": reset_count,
-        "questions_deleted": deleted_questions,
-        "initial_by_platform": initial_by_platform,
-        "source_info": task_get_source_info(),
-    }
-
-
-@app.post("/api/crawler/re-extract-stage2-unfinished")
-async def re_extract_stage2_unfinished_posts():
-    """
-    批量重提取「Stage2 未完成」帖子：
-    1) crawl_tasks.status = stage2_pending
-    2) crawl_tasks.status = done 且存在题目 answer_text == raw_answer（疑似只完成 Stage1）
-    """
-    import sqlite3
-
-    logger.info("[API] 重提取 Stage2 未完成帖子 被调用")
-
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT ct.task_id
-            FROM crawl_tasks ct
-            WHERE ct.status = 'stage2_pending'
-               OR (
-                    ct.status = 'done'
-                    AND EXISTS (
-                        SELECT 1
-                        FROM questions q
-                        WHERE q.source_url = ct.source_url
-                          AND trim(COALESCE(q.raw_answer, '')) != ''
-                          AND trim(COALESCE(q.answer_text, '')) = trim(COALESCE(q.raw_answer, ''))
-                    )
-               )
-            ORDER BY ct.id DESC
-            LIMIT 500
-            """
-        ).fetchall()
-        task_ids = [r["task_id"] for r in rows if r["task_id"]]
-
-    if not task_ids:
-        return {
-            "status": "ok",
-            "message": "没有发现 Stage2 未完成的帖子",
-            "count": 0,
-        }
-
-    # 仅豆包 Stage2 精加工：入队 stage2_pending + stage2_retry_worker，禁止走 batch_extract_worker（会重跑 Rough）
-    cmd = [sys.executable, "-m", "backend.services.scheduling.stage2_retry_worker"] + task_ids
-    log_path = _BACKEND_LOGS / "stage2_retry.log"
-    _spawn_batch_extract_subprocess(
-        cmd,
-        log_path,
-        len(task_ids),
-        persist_batch_state=False,
-        progress_label="[Stage2补跑]",
-    )
-    logger.info(f"[API] Stage2 未完成补跑（豆包）已启动，共 {len(task_ids)} 条，日志: {log_path}")
-    return {
-        "status": "ok",
-        "message": f"已提交 {len(task_ids)} 条，后台仅执行 Stage2（豆包）精加工，不写 Rough",
-        "count": len(task_ids),
-    }
 
 
 
@@ -2777,7 +2519,14 @@ def _spawn_process_tasks_worker(batch_size: int, reason: str):
     return spawn_process_tasks_worker(batch_size=batch_size, reason=reason)
 
 
-def _save_batch_extract_state(task_ids: list, total: int, log_start_offset: int, completed: list | None = None, interrupted_at: str | None = None) -> None:
+def _save_batch_extract_state(
+    task_ids: list,
+    total: int,
+    log_start_offset: int,
+    completed: list | None = None,
+    interrupted_at: str | None = None,
+    log_path: str | None = None,
+) -> None:
     """持久化批量提取状态，供 shutdown 时保存进度、startup 时恢复"""
     import json
     from datetime import datetime
@@ -2791,6 +2540,8 @@ def _save_batch_extract_state(task_ids: list, total: int, log_start_offset: int,
         state["completed"] = completed
     if interrupted_at:
         state["interrupted_at"] = interrupted_at
+    if log_path:
+        state["log_path"] = log_path
     try:
         with open(_BATCH_EXTRACT_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
@@ -2822,13 +2573,13 @@ def _spawn_batch_extract_subprocess(
     persist_batch_state: bool = True,
     progress_label: str = "[批量提取]",
 ) -> None:
-    """启动批量提取子进程，日志全量写文件，控制台每 60 秒打印一次进度条。
+    """启动批量提取子进程，日志写入 SUBPROCESS_LOG_DIR 下按任务类型与时间戳命名的文件。
 
     子进程 stdout/stderr 直接追加写入日志文件（不用 PIPE），避免父进程退出或终端中断时
     管道断裂导致子进程写入失败、进度条与实际不符或任务假死。
-    父进程 shutdown 时会写 abort 文件通知子进程优雅退出，并持久化已完成进度供下次恢复。
+    父进程 shutdown 时会写 abort 文件通知子进程优雅退出，并持久化已完成进度与 log_path 供下次解析。
 
-    persist_batch_state=False 时：不写批量提取断点状态、不占用 _batch_extract_proc（用于 Stage2 补跑子进程）。
+    persist_batch_state=False 时：不写批量提取断点状态、不占用 _batch_extract_proc。
     """
     import re
     import subprocess
@@ -2874,49 +2625,32 @@ def _spawn_batch_extract_subprocess(
             sys.stdout.write(_with_color(msg, C_PROGRESS))
             sys.stdout.flush()
 
-    _re_batch_done = re.compile(r"\[BatchExtractWorker\]\s+完成\s+task_id=")
-    _re_stage2_done = re.compile(r"\[Stage2Processor\]\s+完成\s+task_id=")
+    _re_batch_done = re.compile(r"\[BatchExtractWorker\]\s+完成\s+task_id=|\[Stage2EnrichWorker\]\s+完成\s+task_id=")
 
     def _handle_log_line(text: str) -> None:
         nonlocal completed
-        # 解析进度：完成 task_id=xxx 或 全部完成（与 _parse_completed_from_log 一致，避免空格/格式微差漏计）
-        if _re_batch_done.search(text) or _re_stage2_done.search(text):
+        # 解析进度：完成 task_id=xxx（BatchExtract 或 Stage2Enrich）
+        if _re_batch_done.search(text):
             with lock:
                 completed += 1
             _print_progress()
             last_print_time[0] = time.time()
-        if "[BatchExtractWorker] 全部完成" in text or "[Stage2RetryWorker] 结束" in text:
+        if "[BatchExtractWorker] 全部完成" in text or "[Stage2EnrichWorker] 全部完成" in text:
             with lock:
                 completed = total_count
             _print_progress()
             last_print_time[0] = time.time()
-        # 主终端透传 Stage2 关键进度（队列触发/开始/单任务完成/失败/本轮汇总）
-        if "[Stage2Processor]" in text:
+        # 主终端透传关键日志（开始/处理中/完成/异常）
+        if "[BatchExtractWorker]" in text or "[Stage2EnrichWorker]" in text:
             if (
-                "队列 " in text
-                or "开始处理 " in text
-                or "处理中 " in text
-                or "完成 task_id=" in text
-                or "处理失败 task_id=" in text
-                or "本轮完成 " in text
-            ):
-                sys.stdout.write(_colorize_log_line(text if text.endswith("\n") else text + "\n"))
-                sys.stdout.flush()
-        # 主终端透传 BatchExtractWorker 关键日志（开始/处理中/完成/异常）
-        if "[BatchExtractWorker]" in text:
-            if (
-                "开始批量提取" in text
+                "开始批量" in text
                 or "处理 " in text
                 or "完成 task_id=" in text
-                or "批量提取异常" in text
+                or "批量提取异常" in text or "异常 task_id=" in text
                 or "全部完成" in text
             ):
                 sys.stdout.write(_colorize_log_line(text if text.endswith("\n") else text + "\n"))
                 sys.stdout.flush()
-        now = time.time()
-        if now - last_print_time[0] >= 60:
-            last_print_time[0] = now
-            _print_progress()
 
     start_offset = log_path.stat().st_size if log_path.exists() else 0
     try:
@@ -2924,7 +2658,12 @@ def _spawn_batch_extract_subprocess(
     except OSError:
         pass
     if persist_batch_state:
-        _save_batch_extract_state(task_ids, total_count, start_offset)
+        _save_batch_extract_state(
+            task_ids,
+            total_count,
+            start_offset,
+            log_path=str(log_path.resolve()),
+        )
     env = os.environ.copy()
     env["BATCH_EXTRACT_ABORT_FILE"] = str(_BATCH_EXTRACT_ABORT_FILE)
     logf = open(log_path, "a", encoding="utf-8", buffering=1)
@@ -2994,12 +2733,41 @@ async def re_extract_batch_tasks(body: dict):
         raise HTTPException(status_code=400, detail="没有符合条件的任务（正文需≥50字）")
 
     # 子进程执行，与主进程完全隔离，不阻塞 loadTasks/loadStats/提交作答等
-    # 子进程日志全量写 batch_extract.log，控制台每 60 秒打印进度条
+    # 子进程日志写入 SUBPROCESS_LOG_DIR/batch_extract/，控制台按进度条线程刷新
     cmd = [sys.executable, "-m", "backend.services.scheduling.batch_extract_worker"] + valid_ids
-    log_path = _BACKEND_LOGS / "batch_extract.log"
+    log_path = new_subprocess_log_file("batch_extract")
     _spawn_batch_extract_subprocess(cmd, log_path, len(valid_ids))
     logger.info(f"[API] 批量重新提取已启动（子进程），共 {len(valid_ids)} 条，日志: {log_path}")
     return {"status": "ok", "message": f"已提交 {len(valid_ids)} 条，后台执行中", "count": len(valid_ids)}
+
+
+@app.post("/api/crawler/tasks/stage2-enrich-batch")
+async def stage2_enrich_batch(body: dict):
+    """
+    对已入库题目的帖子批量跑 Stage2（MINER_STAGE2_* 豆包等），合并后更新 questions.answer_text / raw_answer，并同步 Neo4j。
+    子进程后台执行，不阻塞其他 API。
+    请求体: { "task_ids": ["TASK-xxx", ...] }
+    """
+    task_ids = body.get("task_ids") or []
+    if not isinstance(task_ids, list) or not task_ids:
+        raise HTTPException(status_code=400, detail="请提供 task_ids 数组")
+    cleaned = [str(t).strip() for t in task_ids if t and str(t).strip()]
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="task_ids 为空")
+
+    cmd = [sys.executable, "-m", "backend.services.scheduling.stage2_enrich_worker"] + cleaned
+    log_path = new_subprocess_log_file("stage2_enrich")
+    _spawn_batch_extract_subprocess(
+        cmd, log_path, len(cleaned),
+        persist_batch_state=False,
+        progress_label="[Stage2精答]",
+    )
+    logger.info(f"[API] Stage2 批量精答已启动（子进程），共 {len(cleaned)} 条，日志: {log_path}")
+    return {
+        "status": "ok",
+        "message": f"已提交 {len(cleaned)} 条，后台 Stage2 精答执行中",
+        "count": len(cleaned),
+    }
 
 
 @app.post("/api/crawler/tasks/resume-batch")
@@ -3024,7 +2792,7 @@ async def resume_batch_extract():
     if not remaining:
         return {"status": "ok", "message": "剩余任务为空，已完成", "count": 0}
     cmd = [sys.executable, "-m", "backend.services.scheduling.batch_extract_worker"] + remaining
-    log_path = _BACKEND_LOGS / "batch_extract.log"
+    log_path = new_subprocess_log_file("batch_extract")
     _spawn_batch_extract_subprocess(cmd, log_path, len(remaining))
     logger.info(f"[API] 批量提取恢复已启动，剩余 {len(remaining)} 条")
     return {"status": "ok", "message": f"已恢复，剩余 {len(remaining)} 条后台执行中", "count": len(remaining)}
@@ -3070,7 +2838,7 @@ async def re_extract_single_task(task_id: str):
     logger.info(f"[API] 单任务重新提取 task_id={task_id} title={post_title}...")
 
     cmd = [sys.executable, "-m", "backend.services.scheduling.batch_extract_worker", task_id]
-    log_path = _BACKEND_LOGS / "batch_extract.log"
+    log_path = new_subprocess_log_file("batch_extract")
     _spawn_batch_extract_subprocess(cmd, log_path, 1)
     return {
         "status": "ok",
@@ -3168,7 +2936,10 @@ async def refetch_xhs_body(task_id: str = Query(..., description="任务 ID")):
 
 def get_crawl_tasks(
 
-    status: Optional[str] = Query(None, description="pending/fetched/stage2_pending/stage2_unfinished/done/error"),
+    status: Optional[str] = Query(
+        None,
+        description="pending/fetched/done/error/unrelated/skipped；虚拟：stage2_incomplete（已完成且至少一题未精答）、stage2_complete（已完成且全部题已精答区分）",
+    ),
 
     platform: Optional[str] = Query(None),
 
@@ -3194,21 +2965,14 @@ def get_crawl_tasks(
 
     params = []
 
+    # stage2 虚拟状态标记，用于后续生成特殊的 id IN (...) 子查询分页（绕过 SQLite EXISTS+OFFSET bug）
+    _stage2_status = None
+
     if status:
-        if status == "stage2_unfinished":
-            where_parts.append(
-                "("
-                "status = 'stage2_pending' "
-                "OR ("
-                "status = 'done' AND EXISTS ("
-                "SELECT 1 FROM questions q "
-                "WHERE q.source_url = crawl_tasks.source_url "
-                "AND trim(COALESCE(q.raw_answer, '')) != '' "
-                "AND trim(COALESCE(q.answer_text, '')) = trim(COALESCE(q.raw_answer, ''))"
-                ")"
-                ")"
-                ")"
-            )
+        if status == "stage2_incomplete":
+            _stage2_status = "incomplete"
+        elif status == "stage2_complete":
+            _stage2_status = "complete"
         else:
             where_parts.append("status = ?")
             params.append(status)
@@ -3245,43 +3009,68 @@ def get_crawl_tasks(
     else:
         order_clause = "ORDER BY id DESC"
 
-
+    # stage2 虚拟状态：SQLite 存在 EXISTS 子查询 + OFFSET 失效的 bug，
+    # 必须用 WHERE id IN (SELECT id FROM crawl_tasks WHERE <exists条件>) 包一层来绕过
+    _STAGE2_INCOMPLETE_INNER = (
+        "crawl_tasks.status = 'done' "
+        "AND EXISTS (SELECT 1 FROM questions q WHERE q.source_url = crawl_tasks.source_url) "
+        "AND EXISTS ("
+        "SELECT 1 FROM questions q2 WHERE q2.source_url = crawl_tasks.source_url "
+        "AND LENGTH(TRIM(COALESCE(q2.answer_text,''))) > 0 "
+        "AND ("
+        "q2.raw_answer IS NULL OR TRIM(q2.raw_answer) = '' "
+        "OR TRIM(COALESCE(q2.answer_text,'')) = TRIM(COALESCE(q2.raw_answer,''))"
+        ")"
+        ")"
+    )
+    _STAGE2_COMPLETE_INNER = (
+        "crawl_tasks.status = 'done' "
+        "AND EXISTS (SELECT 1 FROM questions q WHERE q.source_url = crawl_tasks.source_url) "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM questions q2 WHERE q2.source_url = crawl_tasks.source_url "
+        "AND LENGTH(TRIM(COALESCE(q2.answer_text,''))) > 0 "
+        "AND ("
+        "q2.raw_answer IS NULL OR TRIM(q2.raw_answer) = '' "
+        "OR TRIM(COALESCE(q2.answer_text,'')) = TRIM(COALESCE(q2.raw_answer,''))"
+        ")"
+        ")"
+    )
 
     with sqlite3.connect(sqlite_service.db_path) as conn:
 
         conn.row_factory = sqlite3.Row
 
-        total = conn.execute(
+        if _stage2_status:
+            # 绕过 SQLite EXISTS+OFFSET bug：先用子查询取出所有符合条件的 id，
+            # 外层再对这批 id 做普通 WHERE id IN (...) + 其他筛选条件 + LIMIT/OFFSET
+            _inner_cond = _STAGE2_INCOMPLETE_INNER if _stage2_status == "incomplete" else _STAGE2_COMPLETE_INNER
+            _extra_where_parts = [p for p in where_parts]  # platform/keyword/title 筛选（此时 where_parts 里不含 stage2 条件）
+            _extra_where = (" AND " + " AND ".join(_extra_where_parts)) if _extra_where_parts else ""
+            _id_subquery = f"SELECT id FROM crawl_tasks WHERE {_inner_cond}"
+            _count_sql = f"SELECT COUNT(*) FROM crawl_tasks WHERE id IN ({_id_subquery}){_extra_where}"
+            _rows_sql = (
+                f"SELECT id, task_id, source_url, source_platform, post_title, status, "
+                f"company, position, questions_count, discovered_at, processed_at, post_time, error_msg, "
+                f"length(raw_content) AS content_len, discover_keyword, extraction_source, "
+                f"extract_duration_min, agent_used_tool, trace_session_id, stage2_trace_session_id "
+                f"FROM crawl_tasks WHERE id IN ({_id_subquery}){_extra_where} "
+                f"{order_clause} LIMIT ? OFFSET ?"
+            )
+            total = conn.execute(_count_sql, params).fetchone()[0]
+            rows = conn.execute(_rows_sql, params + [limit, offset]).fetchall()
+        else:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM crawl_tasks {where}", params
+            ).fetchone()[0]
 
-            f"SELECT COUNT(*) FROM crawl_tasks {where}", params
-
-        ).fetchone()[0]
-
-        rows = conn.execute(
-
-            f"SELECT id, task_id, source_url, source_platform, post_title, status, "
-
-            f"company, position, questions_count, discovered_at, processed_at, post_time, error_msg, "
-
-            f"length(raw_content) AS content_len, discover_keyword, extraction_source, "
-
-            f"extract_duration_min, agent_used_tool, trace_session_id, "
-            f"CASE "
-            f"  WHEN status = 'stage2_pending' THEN 1 "
-            f"  WHEN status = 'done' AND EXISTS ("
-            f"    SELECT 1 FROM questions q "
-            f"    WHERE q.source_url = crawl_tasks.source_url "
-            f"      AND trim(COALESCE(q.raw_answer, '')) != '' "
-            f"      AND trim(COALESCE(q.answer_text, '')) = trim(COALESCE(q.raw_answer, ''))"
-            f"  ) THEN 1 "
-            f"  ELSE 0 "
-            f"END AS stage2_unfinished "
-
-            f"FROM crawl_tasks {where} {order_clause} LIMIT ? OFFSET ?",
-
-            params + [limit, offset]
-
-        ).fetchall()
+            rows = conn.execute(
+                f"SELECT id, task_id, source_url, source_platform, post_title, status, "
+                f"company, position, questions_count, discovered_at, processed_at, post_time, error_msg, "
+                f"length(raw_content) AS content_len, discover_keyword, extraction_source, "
+                f"extract_duration_min, agent_used_tool, trace_session_id, stage2_trace_session_id "
+                f"FROM crawl_tasks {where} {order_clause} LIMIT ? OFFSET ?",
+                params + [limit, offset]
+            ).fetchall()
 
 
 
@@ -3304,9 +3093,6 @@ def get_crawl_tasks(
         if task.get("processed_at"):
 
             task["processed_at"] = timestamp_to_beijing(task["processed_at"])
-
-        if int(task.get("stage2_unfinished") or 0) == 1:
-            task["status"] = "stage2_unfinished"
 
         tasks.append(task)
 

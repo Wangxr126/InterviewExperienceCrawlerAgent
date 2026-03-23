@@ -137,6 +137,17 @@ function normalizeFeedbackHtml(html) {
   if (!html || typeof html !== 'string') return html
   let out = html
 
+  // 某些 Markdown 场景下，"⚠ 混淆点：" 会被错误并入上一个 <ul> 里作为 <li>。
+  // 这里先把这种“列表内标题”提升为同级段落 + 列表，避免出现“混淆点是遗漏子项”的视觉误导。
+  out = out.replace(
+    /<li>\s*(?:<span class="[^"]*">[\s\S]*?<\/span>\s*)*(?:\u26A0\uFE0F?\s*)?混淆点[：:]\s*<\/li>\s*/gi,
+    '</ul><p>⚠ 混淆点：</p><ul class="fb-sec-list">'
+  )
+  out = out.replace(
+    /<li>\s*(?:<span class="[^"]*">[\s\S]*?<\/span>\s*)*(?:\u2717\s*)?错误[：:]\s*<\/li>\s*/gi,
+    '</ul><p>✗ 错误：</p><ul class="fb-sec-list">'
+  )
+
   const section = (kind, label, ulInner) =>
     `<div class="fb-sec fb-sec--${kind}"><div class="fb-sec-head"><span class="fb-sec-mark" aria-hidden="true"></span><span class="fb-sec-label">${label}</span></div>${ulInner}</div>`
 

@@ -122,7 +122,7 @@
       </div>
     </div>
 
-    <!-- 3. LLM 提取 -->
+    <!-- 3. 维护（批量提取改由「定时任务 → 处理队列」自动完成） -->
     <div class="card extract-section">
       <div class="section-header">
         <h3 class="section-title">🤖 LLM 题目提取</h3>
@@ -131,64 +131,17 @@
           <span v-if="errorCount > 0" class="badge badge-err">{{ errorCount }} 失败</span>
         </div>
       </div>
-      <p class="extract-desc">对已爬取正文的帖子调用 LLM 提取面试题入库，后台执行（与练习对话互不阻塞）</p>
+      <p class="extract-desc">
+        新帖抓取后，由侧边栏「定时任务」中的 <strong>处理任务队列（process_tasks）</strong> 定时执行：先补全正文，再单阶段 Miner 提取题目入库。
+        下方仅保留数据清洗；单条/多帖重提取请使用帖子记录中的勾选与工具列。
+      </p>
       <div class="extract-actions">
-        <el-tooltip content="对「待提取」状态的帖子（已有正文）调用 LLM 提取面试题，后台异步执行" placement="top">
-          <el-button type="primary" :loading="extractLoading" @click.prevent="extractPending">
-            提取面试题
-          </el-button>
-        </el-tooltip>
-        <el-tooltip content="将「失败」状态的帖子重置后重新处理：有正文的重新提取，无正文的重新抓取" placement="top">
-          <el-button type="warning" :loading="retryLoading" @click.prevent="retryErrors">重试失败项</el-button>
-        </el-tooltip>
-        <el-tooltip content="将「已完成」或「失败」且有正文的帖子全部重新提取（删除旧题目后用 LLM 重新提取）" placement="top">
-          <el-button type="info" :loading="reExtractLoading" @click.prevent="showReExtractDialog = true">重新提取所有</el-button>
-        </el-tooltip>
-        <el-tooltip content="自动筛选 Stage2 未完成（含待精加工/答案仍为 Stage1 粗稿）的帖子，仅调用豆包精加工，不重新跑 Rough/Stage1" placement="top">
-          <el-button type="warning" plain :loading="stage2UnfinishedLoading" @click.prevent="reExtractStage2Unfinished">
-            提取 Stage2 未完成
-          </el-button>
-        </el-tooltip>
-        <el-tooltip content="先抓取「待抓取」帖子的正文，再对「待提取」的做 LLM 提取，同步等待完成" placement="top">
-          <el-button type="success" :loading="processLoading" @click.prevent="processQueue">抓取正文并提取</el-button>
-        </el-tooltip>
         <el-tooltip content="用 LLM 判断「已完成」帖子是否与面经相关，无关则删除帖子及题目" placement="top">
           <el-button type="danger" :loading="cleanLoading" @click.prevent="cleanData">清洗无关帖</el-button>
         </el-tooltip>
       </div>
-      <div v-if="!extractPolling && extractMsg" class="result-msg" :class="extractMsg.ok ? 'ok' : 'err'">
+      <div v-if="extractMsg" class="result-msg" :class="extractMsg.ok ? 'ok' : 'err'">
         {{ extractMsg.text }}
-      </div>
-    </div>
-
-    <!-- 提取进度 + SSE 推理过程（独立卡片，位于 LLM 提取 与 帖子记录 之间） -->
-    <div v-if="extractPolling" class="card extract-progress-card">
-      <div class="extract-progress-wrap">
-        <div v-for="item in extractProgressByPlatform" :key="item.platform" class="extract-progress-item">
-          <span class="extract-platform-label">{{ item.label }}</span>
-          <div class="extract-progress-bar">
-            <div class="extract-progress-track">
-              <div class="extract-progress-fill" :style="{ width: item.pct + '%' }"></div>
-            </div>
-          </div>
-          <span class="extract-progress-text">{{ item.pct }}% · {{ item.text }}</span>
-        </div>
-        <div v-if="extractProgressByPlatform.length === 0" class="extract-progress-item">
-          <span class="extract-progress-text">处理中...</span>
-        </div>
-        <p v-if="extractProgressByPlatform.length > 0" class="extract-progress-hint">
-          分母为各平台「待提取」队列在任务开始时的条数（含此前已在队列中的帖子）。与操作提示里的「重置 N 条」含义不同：后者仅为本次从失败等状态恢复的行数，且可能含需重新抓取、不计入待提取的条目。
-        </p>
-        <div class="extract-trace-box">
-          <div class="extract-trace-title">🧠 实时推理过程</div>
-          <div v-if="extractTraceSteps.length > 0" class="extract-trace-steps">
-            <div v-for="(s, i) in extractTraceSteps" :key="i" class="extract-trace-step" :class="s.type">
-              <span class="step-num">第 {{ s.step }} 步</span>
-              <span class="step-text">{{ s.text }}</span>
-            </div>
-          </div>
-          <div v-else class="extract-trace-placeholder">等待 Miner Agent 推理中…（SSE 实时推送）</div>
-        </div>
       </div>
     </div>
 
@@ -197,7 +150,7 @@
       <div class="section-header">
         <h3 class="section-title">📋 帖子记录</h3>
         <div class="table-toolbar">
-          <el-select v-model="taskFilter" placeholder="状态" clearable size="small" style="width:130px">
+          <el-select v-model="taskFilter" placeholder="状态" clearable size="small" style="width:158px">
             <el-option v-for="opt in STATUS_OPTIONS" :key="opt.value" :label="`${opt.label}`" :value="opt.value" />
           </el-select>
           <el-tooltip placement="bottom" effect="light">
@@ -205,10 +158,11 @@
               <div class="status-help">
                 <div><strong>待抓取</strong>：已发现链接，尚未获取正文</div>
                 <div><strong>待提取</strong>：正文已获取，待 LLM 提取面试题</div>
-                <div><strong>Stage2未提取</strong>：处于待精加工或答案仍为 Stage1 粗答案</div>
                 <div><strong>已完成</strong>：题目已提取并入库</div>
                 <div><strong>无关帖</strong>：LLM 判断正文与面经无关，参与「清洗无关帖」后删除</div>
                 <div><strong>失败</strong>：抓取正文或 LLM 提取时出错</div>
+                <div><strong>Stage2未完成</strong>：任务为已完成且已入库题目，但至少一题尚未精答（raw 空或与当前答相同）</div>
+                <div><strong>Stage2已完成</strong>：已完成且每道有内容的题都已区分粗答/精答</div>
               </div>
             </template>
             <QuestionFilled class="status-help-icon" />
@@ -226,6 +180,11 @@
           <el-tooltip v-if="selectedTaskIds.length > 0" content="对勾选的帖子重新提取题目（单条或多条均可）" placement="bottom">
             <el-button size="small" type="primary" :loading="reExtractBatchLoading" @click="reExtractBatch">
               批量重新提取 ({{ selectedTaskIds.length }})
+            </el-button>
+          </el-tooltip>
+          <el-tooltip v-if="selectedTaskIds.length > 0" content="帖子需已有入库题目；调用 Stage2（豆包等）生成精答并写回题库，依赖 .env 中 MINER_STAGE2_*" placement="bottom">
+            <el-button size="small" type="success" :loading="stage2BatchLoading" @click="stage2EnrichBatch">
+              Stage2 精答更新 ({{ selectedTaskIds.length }})
             </el-button>
           </el-tooltip>
           <el-tooltip v-if="selectedTaskIds.length > 0" content="删除勾选的帖子及题目（不可恢复）" placement="bottom">
@@ -304,7 +263,7 @@
         </el-table-column>
         <el-table-column label="Trace" width="50" align="center">
           <template #default="{ row }">
-            <el-tooltip v-if="row.trace_session_id" content="查看推理过程" placement="top">
+            <el-tooltip v-if="row.trace_session_id" content="查看 Miner 推理过程" placement="top">
               <el-link :href="`/api/crawler/trace/${row.trace_session_id}`" target="_blank" :underline="false">
                 <Document style="width: 18px; height: 18px;" />
               </el-link>
@@ -312,9 +271,19 @@
             <span v-else style="color:#c0c4cc">—</span>
           </template>
         </el-table-column>
+        <el-table-column label="S2 Trace" width="70" align="center">
+          <template #default="{ row }">
+            <el-tooltip v-if="row.stage2_trace_session_id" content="查看 Stage2 精答推理过程" placement="top">
+              <el-link :href="`/api/crawler/trace/${row.stage2_trace_session_id}`" target="_blank" :underline="false">
+                <Document style="width: 18px; height: 18px; color: #e6a23c;" />
+              </el-link>
+            </el-tooltip>
+            <span v-else style="color:#c0c4cc">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="耗时" prop="extract_duration_min" width="85" align="center" sortable="custom">
           <template #default="{ row }">
-            <span v-if="row.extract_duration_min != null" class="duration-value" :title="`两阶段总时间（Stage1+Stage2）`">{{ formatDuration(row.extract_duration_min) }}</span>
+            <span v-if="row.extract_duration_min != null" class="duration-value" title="该帖 LLM 提取耗时">{{ formatDuration(row.extract_duration_min) }}</span>
             <span v-else class="duration-empty" title="未记录（历史记录或提取中）">—</span>
           </template>
         </el-table-column>
@@ -336,10 +305,10 @@
         <!-- 自定义分页器 - 显示所有页码 -->
         <div class="custom-pagination">
           <span class="pagination-total">共 {{ taskTotal }} 条 · 共 {{ totalPages }} 页</span>
-          <button class="pagination-btn" :disabled="taskPage <= 1" @click="taskPage = 1; loadTasks()">
+          <button class="pagination-btn" :disabled="taskPage <= 1" @click="goToPage(1)">
             ◀◀
           </button>
-          <button class="pagination-btn" :disabled="taskPage <= 1" @click="taskPage--; loadTasks()">
+          <button class="pagination-btn" :disabled="taskPage <= 1" @click="goToPage(taskPage - 1)">
             ◀
           </button>
           
@@ -350,16 +319,16 @@
               :key="page"
               class="pagination-page-btn"
               :class="{ active: page === taskPage }"
-              @click="taskPage = page; loadTasks()"
+              @click="goToPage(page)"
             >
               {{ page }}
             </button>
           </div>
           
-          <button class="pagination-btn" :disabled="taskPage >= totalPages" @click="taskPage++; loadTasks()">
+          <button class="pagination-btn" :disabled="taskPage >= totalPages" @click="goToPage(taskPage + 1)">
             ▶
           </button>
-          <button class="pagination-btn" :disabled="taskPage >= totalPages" @click="taskPage = totalPages; loadTasks()">
+          <button class="pagination-btn" :disabled="taskPage >= totalPages" @click="goToPage(totalPages)">
             ▶▶
           </button>
           
@@ -381,36 +350,6 @@
         </div>
       </div>
     </div>
-
-    <!-- 重新提取所有确认弹窗 -->
-    <el-dialog v-model="showReExtractDialog" width="440px" align-center class="clear-all-dialog"
-               :close-on-click-modal="false" :show-close="true">
-      <template #header>
-        <div class="clear-all-header">
-          <div class="clear-all-icon-wrap">
-            <WarningFilled class="warn-icon" />
-          </div>
-          <h3 class="clear-all-title">重新提取所有题目</h3>
-        </div>
-      </template>
-      <div class="clear-all-body">
-        <p class="clear-all-desc">此操作将对所有有正文的帖子重新调用 LLM 提取面试题：</p>
-        <div class="clear-all-items">
-          <div class="clear-all-item">删除所有已提取的面试题</div>
-          <div class="clear-all-item">重置所有帖子状态为「待提取」</div>
-          <div class="clear-all-item">重新调用 LLM 提取所有题目</div>
-        </div>
-        <p class="clear-all-tip">此操作会清除所有已提取的题目信息，请谨慎操作。</p>
-      </div>
-      <template #footer>
-        <div class="clear-all-footer">
-          <el-button size="large" @click="showReExtractDialog = false">取消</el-button>
-          <el-button type="warning" size="large" :loading="reExtractLoading" @click="confirmReExtractAll">
-            确认重新提取
-          </el-button>
-        </div>
-      </template>
-    </el-dialog>
 
     <!-- 清除所有确认弹窗 -->
     <el-dialog v-model="showClearAllDialog" width="440px" align-center class="clear-all-dialog"
@@ -475,28 +414,17 @@
 <script setup>
 import { ref, reactive, computed, watch, onMounted, onUnmounted, onActivated } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { WarningFilled, Loading, QuestionFilled, Document } from '@element-plus/icons-vue'
+import { WarningFilled, QuestionFilled, Document } from '@element-plus/icons-vue'
 import { api } from '../api.js'
 
 const rawStats = ref({})
 /** 当前正文抓取/图片 OCR 来源（local=本地, mcp=MCP），便于区分执行环境 */
 const sourceInfo = ref({})
-const extractPolling = ref(false)
-const extractInitialByPlatform = ref({})  // { nowcoder: 5, xiaohongshu: 17 }
-let extractPollTimer = null
-const extractTraceSteps = ref([])  // Miner Agent 推理过程（Thought/工具调用）
-let extractTraceTimer = null
-let extractTraceEventSource = null
 const tasks    = ref([])
 const statsLoading   = ref(false)
 const ncLoading      = ref(false)
 const xhsLoading     = ref(false)
-const processLoading = ref(false)
-const extractLoading   = ref(false)
-const retryLoading     = ref(false)
-const reExtractLoading = ref(false)
 const cleanLoading     = ref(false)
-const stage2UnfinishedLoading = ref(false)
 const ncResult   = ref(null)
 const ncCrawlLog = ref([])  // 牛客发现链接列表，用于日志展示
 const xhsMsg     = ref(null)
@@ -518,7 +446,6 @@ const contentDialogTitle    = ref('')
 const contentDialogText     = ref('')
 const contentLoading        = ref(false)
 const showClearAllDialog    = ref(false)
-const showReExtractDialog   = ref(false)
 const clearAllLoading       = ref(false)
 const crawlPolling          = ref(false)
 const crawlDiscovered       = ref(0)
@@ -528,6 +455,7 @@ const refetchLoading        = ref(null)  // task_id 正在重抓正文
 const taskTableRef           = ref(null)
 const selectedTaskIds        = ref([])
 const reExtractBatchLoading  = ref(false)
+const stage2BatchLoading     = ref(false)
 const deleteBatchLoading     = ref(false)
 
 const form = reactive({ keywords: '', maxPages: 5, xhsCount: 20 })
@@ -535,8 +463,9 @@ const form = reactive({ keywords: '', maxPages: 5, xhsCount: 20 })
 const STATUS_OPTIONS = [
   { value: 'pending',   label: '待抓取',  desc: '未获取正文' },
   { value: 'fetched',   label: '待提取',  desc: '待 LLM 提取' },
-  { value: 'stage2_unfinished', label: 'Stage2未提取', desc: '待精加工或答案未精加工' },
   { value: 'done',      label: '已完成',  desc: '题目已入库' },
+  { value: 'stage2_incomplete', label: 'Stage2未完成', desc: '已入库但至少一题需 Stage2 精答' },
+  { value: 'stage2_complete',   label: 'Stage2已完成', desc: '全部有内容的题已区分粗/精答' },
   { value: 'unrelated', label: '无关帖',  desc: 'LLM 判断与面经无关' },
   { value: 'error',     label: '失败',    desc: '抓取或提取出错' },
 ]
@@ -554,36 +483,6 @@ const STATUS_TAG   = { pending:'warning', fetched:'', stage2_pending:'warning', 
 const fetchedCount = computed(() => {
   const v = rawStats.value['fetched']
   return typeof v === 'object' ? (v.count ?? 0) : (v ?? 0)
-})
-const fetchedByPlatform = computed(() => {
-  const v = rawStats.value['fetched_by_platform']
-  return v && typeof v === 'object' ? v : {}
-})
-const PLATFORM_LABELS = { nowcoder: '牛客', xiaohongshu: '小红书' }
-const _platformOrder = ['nowcoder', 'xiaohongshu']
-const extractProgressByPlatform = computed(() => {
-  if (!extractPolling.value) return []
-  const initial = extractInitialByPlatform.value || {}
-  const current = fetchedByPlatform.value || {}
-  const keySet = new Set([...Object.keys(initial), ...Object.keys(current)])
-  const platforms = [
-    ..._platformOrder.filter((p) => keySet.has(p)),
-    ...[...keySet].filter((p) => !_platformOrder.includes(p)).sort(),
-  ]
-  return platforms
-    .filter((p) => (initial[p] ?? 0) > 0)
-    .map((p) => {
-      const init = initial[p] ?? 0
-      const cur = current[p] ?? 0
-      const done = Math.max(0, init - cur)
-      const pct = init > 0 ? Math.min(100, Math.round((done / init) * 100)) : 0
-      return {
-        platform: p,
-        label: PLATFORM_LABELS[p] || p,
-        pct,
-        text: `已处理 ${done} / ${init} 条`,
-      }
-    })
 })
 const errorCount = computed(() => {
   const v = rawStats.value['error']
@@ -696,6 +595,11 @@ const visiblePages = computed(() => {
   }
   return pages
 })
+
+const goToPage = (page) => {
+  taskPage.value = Number(page)
+  loadTasks()
+}
 
 const handleJump = () => {
   const page = parseInt(jumpPage.value, 10)
@@ -864,77 +768,6 @@ const crawl = async (platform) => {
   }
 }
 
-const processQueue = async () => {
-  processLoading.value = true
-  try {
-    const d = await api.processQueue(20)
-    ElMessage.success(`处理完成，入库 ${d.questions_added ?? 0} 道题目`)
-    await loadStats(); await loadTasks()
-  } catch {
-    ElMessage.error('处理队列失败')
-  } finally {
-    processLoading.value = false
-  }
-}
-
-/** 与后端 _extraction_initial_by_platform 对齐，供分平台进度条；接口无数据时用当前统计兜底 */
-const syncExtractBaselineFromBackend = async () => {
-  try {
-    const st = await api.getExtractionStatus()
-    const ibp = st?.initial_by_platform
-    if (ibp && typeof ibp === 'object' && Object.keys(ibp).length > 0) {
-      extractInitialByPlatform.value = { ...ibp }
-      return
-    }
-  } catch { /* ignore */ }
-  extractInitialByPlatform.value = { ...(rawStats.value['fetched_by_platform'] || {}) }
-}
-
-const applyInitialByPlatformFromApi = async (d) => {
-  const ibp = d?.initial_by_platform
-  if (ibp && typeof ibp === 'object' && Object.keys(ibp).length > 0) {
-    extractInitialByPlatform.value = { ...ibp }
-    return
-  }
-  await syncExtractBaselineFromBackend()
-}
-
-const extractPending = async () => {
-  extractLoading.value = true
-  extractMsg.value = null
-  extractPolling.value = false
-  try {
-    await loadStats()
-    extractInitialByPlatform.value = { ...(rawStats.value['fetched_by_platform'] || {}) }
-    if (fetchedCount.value <= 0) {
-      ElMessage.info('没有待提取的帖子')
-      extractLoading.value = false
-      return
-    }
-    const d = await api.extractPending()
-    extractMsg.value = { ok: true, text: `✅ ${d.message}` }
-    extractPolling.value = true
-    await loadTasks()
-  } catch {
-    extractMsg.value = { ok: false, text: '启动失败，请确认后端已运行' }
-  } finally {
-    extractLoading.value = false
-  }
-}
-
-const stopExtractPolling = () => {
-  if (extractPollTimer) clearInterval(extractPollTimer)
-  extractPollTimer = null
-  if (extractTraceTimer) clearInterval(extractTraceTimer)
-  extractTraceTimer = null
-  if (extractTraceEventSource) {
-    extractTraceEventSource.close()
-    extractTraceEventSource = null
-  }
-  extractTraceSteps.value = []
-  extractPolling.value = false
-}
-
 const openContentDialog = async (row) => {
   if (!row.task_id) return
   contentDialogVisible.value = true
@@ -972,106 +805,6 @@ const openQuestionsDialog = async (row) => {
     ElMessage.error('加载题目失败')
   } finally {
     questionsLoading.value = false
-  }
-}
-
-const retryErrors = async () => {
-  retryLoading.value = true
-  extractMsg.value = null
-  extractPolling.value = false
-  try {
-    await loadStats()
-    const d = await api.retryErrors()
-    extractMsg.value = { ok: true, text: `🔄 ${d.message}` }
-    if ((d.reset ?? 0) > 0) {
-      await loadStats(true)
-      await applyInitialByPlatformFromApi(d)
-      extractPolling.value = true // 后台处理中：进度条 + 轮询
-    }
-    await loadTasks()
-  } catch {
-    extractMsg.value = { ok: false, text: '重试请求失败，请确认后端已运行' }
-  } finally {
-    retryLoading.value = false
-  }
-}
-
-const reExtractAll = async () => {
-  reExtractLoading.value = true
-  extractMsg.value = null
-  extractPolling.value = false
-  try {
-    await loadStats()
-    const doneCount = typeof rawStats.value['done'] === 'object' ? (rawStats.value['done']?.count ?? 0) : (rawStats.value['done'] ?? 0)
-    const errorCount = typeof rawStats.value['error'] === 'object' ? (rawStats.value['error']?.count ?? 0) : (rawStats.value['error'] ?? 0)
-    if (doneCount <= 0 && errorCount <= 0) {
-      ElMessage.info('没有已完成或失败的帖子可重新提取')
-      reExtractLoading.value = false
-      return
-    }
-    const d = await api.reExtractAll(50)
-    extractMsg.value = { ok: true, text: `🔄 ${d.message}` }
-    if ((d.reset ?? 0) > 0) {
-      await loadStats(true)
-      await applyInitialByPlatformFromApi(d)
-      extractPolling.value = true
-    }
-    await loadStats()
-    await loadTasks()
-  } catch {
-    extractMsg.value = { ok: false, text: '重新提取请求失败，请确认后端已运行' }
-  } finally {
-    reExtractLoading.value = false
-  }
-}
-
-const confirmReExtractAll = async () => {
-  reExtractLoading.value = true
-  extractMsg.value = null
-  extractPolling.value = false
-  try {
-    await loadStats()
-    const d = await api.reExtractAll(50)
-    showReExtractDialog.value = false
-    extractMsg.value = { ok: true, text: `🔄 ${d.message}` }
-    if ((d.reset ?? 0) > 0) {
-      await loadStats(true)
-      await applyInitialByPlatformFromApi(d)
-      extractPolling.value = true
-    }
-    await loadStats()
-    await loadTasks()
-    ElMessage.success(d.message || '已开始重新提取')
-  } catch {
-    extractMsg.value = { ok: false, text: '重新提取请求失败，请确认后端已运行' }
-    ElMessage.error('重新提取失败')
-  } finally {
-    reExtractLoading.value = false
-  }
-}
-
-const reExtractStage2Unfinished = async () => {
-  stage2UnfinishedLoading.value = true
-  extractMsg.value = null
-  try {
-    const d = await api.reExtractStage2Unfinished()
-    if (d?.status === 'ok') {
-      extractMsg.value = { ok: true, text: `🔄 ${d.message || '已提交 Stage2 未完成批量重提取'}` }
-      if ((d?.count ?? 0) > 0) {
-        extractPolling.value = true
-      }
-      await loadStats()
-      await loadTasks()
-      ElMessage.success(d.message || '已启动后台重提取')
-    } else {
-      extractMsg.value = { ok: false, text: d?.message || d?.detail || '提交失败' }
-      ElMessage.warning(d?.message || d?.detail || '提交失败')
-    }
-  } catch {
-    extractMsg.value = { ok: false, text: 'Stage2 未完成批量重提取请求失败，请确认后端已运行' }
-    ElMessage.error('请求失败')
-  } finally {
-    stage2UnfinishedLoading.value = false
   }
 }
 
@@ -1139,6 +872,44 @@ const reExtractBatch = async () => {
   }
 }
 
+const stage2EnrichBatch = async () => {
+  const ids = selectedTaskIds.value
+  if (!ids?.length) {
+    ElMessage.warning('请先勾选帖子')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `对选中的 ${ids.length} 帖已入库题目调用 Stage2（豆包等）生成精答并写回数据库？\n需已配置 MINER_STAGE2_*，每帖可能耗时数分钟。`,
+      'Stage2 精答更新',
+      { confirmButtonText: '开始', cancelButtonText: '取消', type: 'info' },
+    )
+  } catch {
+    return
+  }
+  stage2BatchLoading.value = true
+  try {
+    const d = await api.stage2EnrichBatch(ids)
+    if (d?.status === 'ok') {
+      const lines = (d.results || []).map((r) => `${r.task_id}: ${r.message || (r.ok ? 'ok' : 'fail')}`).join('\n')
+      ElMessage.success(d.message || 'Stage2 处理完成')
+      if (lines && (d.results || []).length <= 8) {
+        ElMessageBox.alert(lines, '各帖结果', { confirmButtonText: '确定' })
+      }
+      taskTableRef.value?.clearSelection()
+      selectedTaskIds.value = []
+      await loadStats()
+      await loadTasks()
+    } else {
+      ElMessage.warning(d?.message || d?.detail || 'Stage2 请求失败')
+    }
+  } catch {
+    ElMessage.error('Stage2 请求失败')
+  } finally {
+    stage2BatchLoading.value = false
+  }
+}
+
 const deleteBatchTasks = async () => {
   const ids = selectedTaskIds.value
   if (!ids?.length) {
@@ -1202,26 +973,6 @@ onMounted(async () => {
   await loadStats()
   await loadTasks()
   loadKeywords()
-  // 刷新后恢复提取进度显示（若后端仍在处理）
-  try {
-    const d = await api.getExtractionStatus()
-    if (d?.running) {
-      extractPolling.value = true
-      const ibp = d.initial_by_platform
-      const fbp = rawStats.value['fetched_by_platform']
-      if (ibp && typeof ibp === 'object' && Object.keys(ibp).length > 0) {
-        extractInitialByPlatform.value = { ...ibp }
-      } else if (fbp && typeof fbp === 'object' && Object.keys(fbp).length > 0) {
-        extractInitialByPlatform.value = { ...fbp }
-      } else if (fetchedCount.value > 0) {
-        extractInitialByPlatform.value = { nowcoder: fetchedCount.value, xiaohongshu: 0 }
-      } else {
-        extractInitialByPlatform.value = {}
-      }
-    }
-  } catch {
-    // 忽略
-  }
 })
 
 // 页面激活时重新加载数据（解决删除后切换页面数据不刷新的问题）
@@ -1230,80 +981,7 @@ onActivated(async () => {
   await loadTasks()
 })
 
-onUnmounted(() => { stopExtractPolling(); stopCrawlPolling() })
-
-// 提取进行中时：轮询进度 + SSE 实时展示推理过程
-watch(extractPolling, (polling) => {
-  if (extractPollTimer) clearInterval(extractPollTimer)
-  extractPollTimer = null
-  if (extractTraceTimer) clearInterval(extractTraceTimer)
-  extractTraceTimer = null
-  if (extractTraceEventSource) {
-    extractTraceEventSource.close()
-    extractTraceEventSource = null
-  }
-  extractTraceSteps.value = []
-  if (polling) {
-    extractPollTimer = setInterval(async () => {
-      await loadStats(true)
-      let running = false
-      try {
-        const st = await api.getExtractionStatus()
-        running = !!st?.running
-      } catch {
-        running = true
-      }
-      const bars = extractProgressByPlatform.value
-      const hasBars = bars.length > 0
-      const barsAllDone = hasBars && bars.every(p => p.pct >= 100)
-      if (!running) {
-        stopExtractPolling()
-        await loadTasks()
-      } else if (hasBars && barsAllDone && fetchedCount.value <= 0) {
-        stopExtractPolling()
-        await loadTasks()
-      }
-    }, 5000)
-    // 连接 SSE 流式获取推理过程（实时展示）
-    const streamUrl = `${import.meta.env.DEV ? '' : ''}/api/crawler/extraction-trace-stream`
-    try {
-      extractTraceEventSource = new EventSource(streamUrl)
-      extractTraceEventSource.addEventListener('trace', (e) => {
-        try {
-          const d = JSON.parse(e.data || '{}')
-          if (d.steps && d.steps.length > 0) extractTraceSteps.value = d.steps
-        } catch { /* ignore */ }
-      })
-      extractTraceEventSource.addEventListener('done', () => {
-        extractTraceEventSource?.close()
-        extractTraceEventSource = null
-      })
-      extractTraceEventSource.onerror = () => {
-        extractTraceEventSource?.close()
-        extractTraceEventSource = null
-        // 降级为轮询
-        const pollTrace = async () => {
-          try {
-            const d = await api.getExtractionTrace()
-            if (d.steps && d.steps.length > 0) extractTraceSteps.value = d.steps
-          } catch { /* ignore */ }
-        }
-        pollTrace()
-        extractTraceTimer = setInterval(pollTrace, 2000)
-      }
-    } catch {
-      // SSE 不可用时降级为轮询
-      const pollTrace = async () => {
-        try {
-          const d = await api.getExtractionTrace()
-          if (d.steps && d.steps.length > 0) extractTraceSteps.value = d.steps
-        } catch { /* ignore */ }
-      }
-      pollTrace()
-      extractTraceTimer = setInterval(pollTrace, 2000)
-    }
-  }
-})
+onUnmounted(() => { stopCrawlPolling() })
 
 // 抓取进行中时轮询显示进度（不自动刷新表格，避免体验差）
 watch(crawlPolling, (polling) => {

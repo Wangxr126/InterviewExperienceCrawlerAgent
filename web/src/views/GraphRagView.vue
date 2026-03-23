@@ -385,8 +385,11 @@ async function openQuestionDetail(q) {
     ElMessage.warning('题目 ID 缺失，无法查看标准答案')
     return
   }
-  // 保持原有行为：点击题目时仍可定位图节点
-  onQuickNodeClick(q)
+  // 只有当节点确实存在于当前图中时才定位（题库知识图无 question 节点，
+  // 强行 setSelectedNode 会使 connectedNodeIds 为空，配合 focusOnly 导致整个图消失）
+  if (nodeById.value[q.id]) {
+    onQuickNodeClick(q)
+  }
   questionDialogVisible.value = true
   questionDialogLoading.value = true
   questionDialogData.value = null

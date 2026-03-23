@@ -203,7 +203,7 @@ def merge_stage2_with_stage1(stage2_output: str, stage1_output: str) -> str:
             elif f == "difficulty":
                 row[f] = "medium"
             elif f == "question_type":
-                row[f] = "基础类"
+                row[f] = "基础-其他"
             else:
                 row[f] = ""
         # raw_answer：若为空，用 Stage1 的 answer_text

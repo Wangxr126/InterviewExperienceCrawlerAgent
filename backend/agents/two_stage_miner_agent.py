@@ -8,7 +8,6 @@
 """
 import json
 import logging
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
@@ -19,7 +18,7 @@ from hello_agents.core.llm import HelloAgentsLLM
 from hello_agents.core.config import Config as HelloAgentsConfig
 from hello_agents.tools import ToolRegistry
 
-from backend.config.config import settings
+from backend.config.config import settings, warn_if_stage2_shares_remote_fallback
 from backend.tools.miner_tools import OcrImagesTool, MarkUnrelatedTool, VerifyExtractionCountTool
 from backend.agents.prompts.miner_prompt import get_miner_prompt, format_miner_user_prompt
 from backend.agents.prompts.two_stage_prompts import (
@@ -442,6 +441,8 @@ class TwoStageExtractor:
                         position=position,
                         user_input_override=retry_prompt,
                         _retry_count=1,
+                        source_url=source_url,
+                        post_title=post_title,
                     )
                 if not rough_questions:
                     raise je
@@ -453,7 +454,11 @@ class TwoStageExtractor:
             return "", self._ocr_called, False
 
         # 规范化字段名：模型可能返回 question/answer/category，需映射为 question_text/answer_text/question_type
-        rough_questions = [self._normalize_question_item(q) for q in rough_questions if isinstance(q, dict)]
+        rough_questions = [
+            self._normalize_question_item(q, post_title=post_title or "")
+            for q in rough_questions
+            if isinstance(q, dict)
+        ]
         rough_questions = [q for q in rough_questions if q]
 
         # 仅当提取到有效题目 > 0 时才执行 Stage 2
@@ -465,68 +470,8 @@ class TwoStageExtractor:
                     q["raw_answer"] = q.get("answer_text", "")
             return json.dumps(rough_questions, ensure_ascii=False), self._ocr_called, False
 
-        # ========== 异步模式：入队 stage2_pending，达到 batch_size 触发 ==========
-        if settings.miner_stage2_async_enabled and self._stage2_models:
-            # 稳定 q_id：Stage1 结束即入库；Stage2 仅 UPDATE 同一 q_id 的 answer_text 等字段
-            for v in valid_questions:
-                if not v.get("q_id"):
-                    v["q_id"] = str(uuid.uuid4())
-                if company and not (str(v.get("company") or "").strip()):
-                    v["company"] = company
-                if position and not (str(v.get("position") or "").strip()):
-                    v["position"] = position
-                _at = v.get("answer_text")
-                _ans = (_at if isinstance(_at, str) else str(_at or "")).strip()
-                v["raw_answer"] = _ans
-            rough_with_ids = json.dumps(valid_questions, ensure_ascii=False)
-            questions_text = "\n".join(
-                f"{i+1}. {q.get('question_text', '')}"
-                for i, q in enumerate(valid_questions)
-            )
-            enrich_input = ENRICH_USER_PROMPT_TEMPLATE.format(questions_text=questions_text)
-            from backend.services.storage import sqlite_service
-            from backend.services.stage2_processor import trigger_stage2_if_ready
-            # 需要 task_id，从 self 获取（TwoStageExtractor 由 MinerAgentV3 创建时传入）
-            task_id = getattr(self, "_task_id", "") or ""
-            trace_session_id = ""
-            try:
-                from backend.services.crawler.question_extractor import _get_latest_trace_session_id
-                trace_session_id = _get_latest_trace_session_id() or ""
-            except Exception:
-                pass
-            if task_id and (source_url or "").strip():
-                _n = sqlite_service.persist_stage1_questions_rough(
-                    task_id=task_id,
-                    source_url=(source_url or "").strip(),
-                    question_items=valid_questions,
-                    ocr_called=self._ocr_called,
-                )
-                if _n > 0:
-                    logger.info(
-                        "[TwoStageExtractor] Stage1 粗题已入库 %d 道（Stage2 将按 q_id 更新精答案）",
-                        _n,
-                    )
-            ok = sqlite_service.add_stage2_pending(
-                task_id=task_id,
-                content=content,
-                stage1_output=rough_with_ids,
-                rough_questions=rough_with_ids,
-                enrich_input=enrich_input,
-                company=company or "",
-                position=position or "",
-                source_url=source_url or "",
-                post_title=post_title or "",
-                trace_session_id=trace_session_id,
-                agent_used_tool=1 if getattr(self, "_agent_used_tool", False) else 0,
-                ocr_called=1 if self._ocr_called else 0,
-            )
-            if ok:
-                trigger_stage2_if_ready()
-                # 返回特殊信号，让上层知道已入队，需更新 task 为 stage2_pending
-                return "__STAGE2_PENDING__", self._ocr_called, False
-            # 入队失败则降级同步执行
-
-        # ========== Stage 2：精加工（多模型回退，额度超限时切换） ==========
+        # ========== Stage 2：精加工（同步执行，多模型回退） ==========
+        warn_if_stage2_shares_remote_fallback()
         if not self._stage2_models:
             logger.info("[TwoStageExtractor] 未配置 Stage 2，直接返回 Stage 1 结果")
             for q in rough_questions:
@@ -550,7 +495,7 @@ class TwoStageExtractor:
                     api_key=cfg["api_key"],
                     base_url=cfg["base_url"],
                     temperature=settings.miner_stage2_temperature,
-                    timeout=settings.miner_stage2_timeout,
+                    timeout=int(cfg.get("timeout") or settings.miner_stage2_timeout),
                     max_tokens=settings.miner_stage2_max_tokens,
                 )
                 enrich_agent = SimpleAgent(
@@ -805,33 +750,60 @@ class TwoStageExtractor:
                 i += 1
         return results
 
-    def _normalize_question_item(self, q: dict) -> dict | None:
+    def _normalize_question_item(self, q: dict, post_title: str = "") -> dict | None:
         """规范化题目字段，仅做最小必要映射（prompt 已规定格式，错误时靠重试+错误信息修正）"""
         if not isinstance(q, dict):
             return None
+        from backend.utils.question_text_cleanup import strip_question_enumeration
+        from backend.utils.text_garbled import (
+            company_should_be_cleared,
+            is_unusable_after_repair,
+            repair_text,
+        )
+
         # 仅保留 question/answer 作为最小兼容（prompt 已禁止，但部分模型仍会误用）
         qt = q.get("question_text") or q.get("question") or ""
         if not qt or not isinstance(qt, str):
             return None
+        qt = strip_question_enumeration(qt.strip())
+        qt, _ = repair_text(qt)
+        if not qt or is_unusable_after_repair(qt):
+            return None
         at = q.get("answer_text") or q.get("answer") or ""
-        # 仅接受标准 question_type 值，非法则置基础类（由重试+错误信息引导修正）
-        qtype = q.get("question_type") or q.get("type") or "基础类"
-        if qtype not in ("算法类", "AI类", "工程类", "基础类", "软技能"):
-            qtype = "基础类"
+        from backend.agents.schemas.miner_schema import (
+            ALLOWED_QUESTION_TYPES,
+            refine_question_type_coarse_to_fine,
+        )
+        from backend.services.tag_normalization import normalize_topic_tags_for_question
+        from backend.services.company_normalization import normalize_company_field
+
+        qtype_raw = (q.get("question_type") or q.get("type") or "").strip()
+        tags = q.get("topic_tags") if isinstance(q.get("topic_tags"), list) else q.get("tags")
+        tags = tags if isinstance(tags, list) else []
+        qtype = refine_question_type_coarse_to_fine(qt, tags, qtype_raw or "基础类")
+        if qtype not in ALLOWED_QUESTION_TYPES:
+            qtype = "基础-其他"
+        tags = normalize_topic_tags_for_question(tags, qt, qtype)
         diff = q.get("difficulty")
         if isinstance(diff, str):
             diff = {"低": "easy", "中": "medium", "高": "hard"}.get(diff.strip(), diff)
         if diff not in ("easy", "medium", "hard"):
             diff = "medium"
-        tags = q.get("topic_tags") if isinstance(q.get("topic_tags"), list) else q.get("tags")
-        tags = tags if isinstance(tags, list) else []
+        co = normalize_company_field(
+            str(q.get("company") or ""),
+            post_title=post_title or "",
+            hint_text=qt[:1200],
+        )
+        co, _ = repair_text(co)
+        if company_should_be_cleared(co):
+            co = ""
         return {
             "question_text": qt.strip(),
             "answer_text": (at if isinstance(at, str) else str(at)).strip() or f"（待补充）{qt[:50]}",
             "difficulty": diff,
             "question_type": qtype,
             "topic_tags": tags,
-            "company": q.get("company") or "",
+            "company": co,
             "position": q.get("position") or q.get("job") or "",
         }
 

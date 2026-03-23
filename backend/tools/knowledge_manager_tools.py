@@ -88,37 +88,52 @@ def generate_embedding(text: str) -> List[float]:
 # ==============================================================================
 
 def _call_llm_json(prompt: str, system: str = "") -> Any:
-    """调用火山引擎 LLM，要求返回 JSON。失败时返回 None。"""
-    try:
-        headers = {
-            "Authorization": f"Bearer {settings.llm_api_key}",
-            "Content-Type": "application/json"
-        }
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-
-        payload = {
-            "model": settings.architect_model,
-            "messages": messages,
-            "temperature": settings.architect_temperature,
-            "max_tokens": settings.architect_max_tokens,
-            "response_format": {"type": "json_object"}
-        }
-        resp = requests.post(
-            f"{settings.llm_base_url}/chat/completions",
-            headers=headers, json=payload, timeout=60
-        )
-        if resp.status_code == 200:
-            content = resp.json()["choices"][0]["message"]["content"]
-            return json.loads(content)
-        else:
-            logger.warning(f"LLM 返回错误: {resp.status_code}")
-            return None
-    except Exception as e:
-        logger.error(f"_call_llm_json 异常: {e}")
+    """调用 OpenAI 兼容 LLM，要求返回 JSON。按 ARCHITECT_REMOTE_FALLBACK_MODELS 依次切换端点。"""
+    endpoints = settings.architect_remote_models or []
+    if not endpoints:
+        logger.warning("_call_llm_json: architect_remote_models 为空，请检查 ARCHITECT_* / LLM_*")
         return None
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    last_err: Exception | None = None
+    for idx, ep in enumerate(endpoints):
+        base = (ep.get("base_url") or "").strip().rstrip("/")
+        api_key = (ep.get("api_key") or "").strip()
+        model = (ep.get("model") or "").strip() or settings.architect_model
+        to = int(ep.get("timeout") or 60)
+        if not base or not model:
+            continue
+        try:
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": settings.architect_temperature,
+                "max_tokens": settings.architect_max_tokens,
+                "response_format": {"type": "json_object"},
+            }
+            resp = requests.post(f"{base}/chat/completions", headers=headers, json=payload, timeout=to)
+            if resp.status_code == 200:
+                content = resp.json()["choices"][0]["message"]["content"]
+                return json.loads(content)
+            err = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:400]}")
+            last_err = err
+            logger.warning("_call_llm_json 端点 %d/%d 失败: %s", idx + 1, len(endpoints), err)
+            if idx + 1 < len(endpoints):
+                continue
+            return None
+        except Exception as e:
+            last_err = e
+            logger.warning("_call_llm_json 端点 %d/%d 异常: %s", idx + 1, len(endpoints), e)
+            if idx + 1 < len(endpoints):
+                continue
+            logger.error(f"_call_llm_json 全部端点失败: {e}")
+            return None
+    if last_err:
+        logger.error("_call_llm_json 失败: %s", last_err)
+    return None
 
 
 # ==============================================================================

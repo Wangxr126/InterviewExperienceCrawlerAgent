@@ -10,6 +10,7 @@ import numpy as np
 import requests
 
 from backend.config.config import settings
+from backend.services.rerank_trace_file import write_similar_rerank_trace
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +293,8 @@ def rerank_candidates(
     candidates: List[Dict[str, Any]],
     text_key: str = "text",
     top_n: Optional[int] = None,
+    trace_slug: Optional[str] = None,
+    trace_meta: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     对候选列表（如题目列表）按 query 重排，保留原有字段并附加 rerank_score。
@@ -301,6 +304,8 @@ def rerank_candidates(
         candidates: 候选列表，每项为 dict，需含 text_key 指定字段作为文档内容
         text_key: 用作文档内容的字段名
         top_n: 返回前 N 条
+        trace_slug: 非空且开启 RERANK_TRACE_ENABLED 时，将初筛与重排结果写入 similar_rerank 目录
+        trace_meta: 写入 JSON 的 meta 字段（如 top_k、threshold）
 
     Returns:
         重排后的候选列表，每项附加 "rerank_score"
@@ -332,4 +337,19 @@ def rerank_candidates(
                     break
         if top_n and len(out) >= top_n:
             break
+
+    if trace_slug and getattr(settings, "rerank_trace_enabled", True):
+        try:
+            write_similar_rerank_trace(
+                slug=trace_slug,
+                query=query,
+                text_key=text_key,
+                pre_candidates=list(candidates),
+                rerank_raw=list(reranked),
+                post_candidates=out,
+                trace_meta=trace_meta,
+            )
+        except Exception as e:
+            logger.debug("[RerankTrace] 落盘跳过: %s", e)
+
     return out

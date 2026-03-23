@@ -10,9 +10,13 @@
 子进程日志写入 batch_extract.log（主进程启动时指定 stdout/stderr 重定向）
 """
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
+
+# 供 scheduler / question_extractor / OCR 等识别「当前在子进程」，打出完整诊断日志
+os.environ.setdefault("WXR_WORKER_SUBPROCESS", "1")
 
 # 子进程独立运行，必须手动加载 .env，否则 MINER_MODE/LLM_PROVIDER 等配置读取不到
 _env_file = Path(__file__).parent.parent.parent.parent / ".env"

@@ -8,7 +8,7 @@ Miner Agent - 信息挖掘师（ReAct版）
 import logging
 import re
 import time
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 from hello_agents import ReActAgent
 from hello_agents.core.llm import HelloAgentsLLM
@@ -16,6 +16,7 @@ from hello_agents.core.config import Config as HelloAgentsConfig
 from hello_agents.tools import ToolRegistry
 
 from backend.config.config import settings
+from backend.llm.chained_hello_llm import ChainedHelloAgentsLLM, build_miner_hello_llm_list
 from backend.agents.prompts.miner_prompt import get_miner_prompt, format_miner_user_prompt
 from backend.services.logging.agent_tool_runtime_stats import (
     agent_tool_runtime_stats,
@@ -44,14 +45,20 @@ class MinerAgent(ReActAgent):
         self._task_id = task_id
         self._ocr_called = False
 
-        # 构建 LLM
-        llm = HelloAgentsLLM(
-            model=settings.miner_model,
-            api_key=settings.miner_api_key,
-            base_url=settings.miner_base_url,
-            temperature=settings.miner_temperature,
-            timeout=settings.miner_timeout,
-        )
+        # 构建 LLM：remote 时按 MINER_REMOTE_FALLBACK_MODELS 多端点故障转移
+        _llms = build_miner_hello_llm_list(settings)
+        if len(_llms) > 1:
+            llm = ChainedHelloAgentsLLM(_llms, chain_name="miner")
+        elif len(_llms) == 1:
+            llm = _llms[0]
+        else:
+            llm = HelloAgentsLLM(
+                model=settings.miner_model,
+                api_key=settings.miner_api_key,
+                base_url=settings.miner_base_url,
+                temperature=settings.miner_temperature,
+                timeout=settings.miner_timeout,
+            )
 
         # 注册业务工具（ReActAgent 内置了 Thought + Finish，无需再注册 FinishTool）
         registry = ToolRegistry()
@@ -105,13 +112,23 @@ class MinerAgent(ReActAgent):
             config=_agent_config,
         )
 
+        _n_ep = len(_llms) if settings.miner_mode == "remote" and _llms else (1 if settings.miner_mode != "remote" else 0)
         logger.info(
-            f"[MinerAgent] 初始化完成 model={settings.miner_model} "
-            f"max_steps={max_steps} trace_enabled"
+            f"[MinerAgent] 初始化完成 miner_mode={settings.miner_mode} model={settings.miner_model} "
+            f"endpoints={_n_ep or 1} max_steps={max_steps} trace_enabled"
         )
 
-    def run(self, content: str, has_image: bool = False, company: str = "", position: str = "",
-              user_input_override: str = None) -> Tuple[str, bool, bool]:
+    def run(
+        self,
+        content: str,
+        has_image: bool = False,
+        company: str = "",
+        position: str = "",
+        user_input_override: str = None,
+        source_url: str = "",
+        post_title: str = "",
+        **kwargs: Any,
+    ) -> Tuple[str, bool, bool]:
         """
         运行 MinerAgent。
 
@@ -121,6 +138,8 @@ class MinerAgent(ReActAgent):
             company: 公司名称
             position: 岗位名称
             user_input_override: 直接覆盖用户输入（用于重试时注入纠错指令），为 None 时自动格式化
+            source_url/post_title: 由 question_extractor 传入，供后续扩展日志；当前不参与 ReAct 循环
+            **kwargs: 吞掉调用方/框架多传参数，避免 TypeError 触发误降级
 
         Returns:
             (answer, ocr_called, is_unrelated)
@@ -128,6 +147,9 @@ class MinerAgent(ReActAgent):
             - ocr_called   : 是否调用了 ocr_images
             - is_unrelated : LLM 是否主动调用了 mark_unrelated 或输出了 unrelated 对象
         """
+        if kwargs:
+            logger.debug("[MinerAgent] run() 忽略额外参数: %s", sorted(kwargs.keys()))
+
         # 格式化用户输入（重试时使用外部传入的 override，含纠错指令）
         user_input = user_input_override or format_miner_user_prompt(content, has_image, company, position)
 

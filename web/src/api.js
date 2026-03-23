@@ -197,61 +197,11 @@ export const api = {
     return r.json()
   },
 
-  async processQueue(batchSize = null) {
-    const url = batchSize ? `${BASE}/api/crawler/process?batch_size=${batchSize}` : `${BASE}/api/crawler/process`
-    const r = await fetch(url, {
-      method: 'POST',
-    })
-    return r.json()
-  },
-
-  async extractPending(batchSize = null) {
-    const url = batchSize ? `${BASE}/api/crawler/extract-pending?batch_size=${batchSize}` : `${BASE}/api/crawler/extract-pending`
-    const r = await fetch(url, {
-      method: 'POST',
-    })
-    return r.json()
-  },
-
-  async retryErrors(batchSize = null) {
-    const url = batchSize ? `${BASE}/api/crawler/retry-errors?batch_size=${batchSize}` : `${BASE}/api/crawler/retry-errors`
-    const r = await fetch(url, {
-      method: 'POST',
-    })
-    return r.json()
-  },
-
-  async reExtractAll(batchSize = null) {
-    const url = batchSize ? `${BASE}/api/crawler/re-extract-all?batch_size=${batchSize}` : `${BASE}/api/crawler/re-extract-all`
-    const r = await fetch(url, {
-      method: 'POST',
-    })
-    return r.json()
-  },
-
-  async reExtractStage2Unfinished() {
-    const r = await fetch(`${BASE}/api/crawler/re-extract-stage2-unfinished`, {
-      method: 'POST',
-    })
-    return r.json()
-  },
-
   async cleanData(batchSize = null) {
     const url = batchSize ? `${BASE}/api/crawler/clean-data?batch_size=${batchSize}` : `${BASE}/api/crawler/clean-data`
     const r = await fetch(url, {
       method: 'POST',
     })
-    return r.json()
-  },
-
-  async getExtractionStatus() {
-    const r = await fetch(`${BASE}/api/crawler/extraction-status`)
-    return r.json()
-  },
-
-  /** 获取当前提取任务的最新推理过程（Miner Agent 的 Thought/工具调用） */
-  async getExtractionTrace() {
-    const r = await fetch(`${BASE}/api/crawler/extraction-trace`)
     return r.json()
   },
 
@@ -312,6 +262,16 @@ export const api = {
   /** 对选中的多个帖子批量重新提取，后台异步执行 */
   async reExtractBatch(taskIds) {
     const r = await fetch(`${BASE}/api/crawler/tasks/re-extract-batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task_ids: taskIds }),
+    })
+    return r.json()
+  },
+
+  /** 对已入库题目批量跑 Stage2 精答（豆包等），更新库内答案 */
+  async stage2EnrichBatch(taskIds) {
+    const r = await fetch(`${BASE}/api/crawler/tasks/stage2-enrich-batch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ task_ids: taskIds }),

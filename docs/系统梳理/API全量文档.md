@@ -73,14 +73,11 @@
 | 方法 | 路径 | 功能 |
 |---|---|---|
 | POST | `/api/crawler/trigger` | 触发发现任务（牛客/小红书） |
-| POST | `/api/crawler/process` | 拉取并处理任务队列 |
-| POST | `/api/crawler/extract-pending` | 对 fetched/pending 数据做提取 |
-| POST | `/api/crawler/stage2-process` | 触发 stage2 阶段处理 |
+| POST | `/api/crawler/process` | 拉取并处理任务队列（定时任务与手动调试用） |
 | POST | `/api/crawler/clean-data` | 清洗无关/噪声数据 |
-| POST | `/api/crawler/retry-errors` | 重试失败任务 |
-| POST | `/api/crawler/re-extract-all` | 全量重提取 |
-| POST | `/api/crawler/re-extract-stage2-unfinished` | Stage2 未完成项重提取 |
 | POST | `/api/crawler/clear-all` | 清空采集相关数据 |
+
+> 已移除（原过渡能力）：`/api/crawler/extract-pending`、`/api/crawler/retry-errors`、`/api/crawler/re-extract-all`、`/api/crawler/stage2-process`、`/api/crawler/re-extract-stage2-unfinished`。批量/单条重提取请用 `tasks/re-extract-batch` 与 `tasks/{id}/re-extract`。
 
 ### 6.3 小红书登录与修复
 

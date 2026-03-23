@@ -20,6 +20,7 @@ from backend.utils.time_utils import now_beijing_str, timestamp_to_beijing, time
 from backend.services.crawler.question_extractor import MinerFatalApiError
 import logging
 import json
+import os
 import time
 import uuid
 from datetime import datetime
@@ -337,36 +338,27 @@ def _process_pending_tasks(batch_size: int = None):
                     logger.info("")
                     continue
 
-                # 两阶段异步：Stage1 完成已入队，待 Stage2 批量处理
-                if status == "stage2_pending":
-                    _qc = 0
-                    if url:
-                        try:
-                            with sqlite_service._get_conn() as _conn:
-                                _cr = _conn.execute(
-                                    "SELECT COUNT(*) AS c FROM questions WHERE source_url=?",
-                                    (url,),
-                                ).fetchone()
-                                _qc = int(_cr["c"]) if _cr else 0
-                        except Exception:
-                            _qc = 0
-                    sqlite_service.update_task_status(
-                        task_id, "stage2_pending",
-                        raw_content=raw_content,
-                        agent_used_tool=agent_used_tool,
-                        extract_duration_min=round((time.time() - _t0) / 60, 2),
-                        trace_session_id=trace_session_id,
-                        questions_count=_qc,
-                    )
-                    logger.info(f"  📤 Stage1 完成已入队，待 Stage2 批量处理（batch_size={getattr(settings, 'miner_stage2_batch_size', 10)} 触发）")
-                    logger.info("")
-                    continue
-
                 # LLM 解析失败 → 标记 error
                 if status == "parse_error":
                     extract_error += 1
                     sqlite_service.update_task_status(task_id, "error", error_msg="LLM 返回无法解析为 JSON", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time()-_t0)/60, 2), trace_session_id=trace_session_id)
                     logger.error(f"  ❌ LLM 返回无法解析为 JSON")
+                    logger.info("")
+                    continue
+
+                # 空列表 / 无有效题干：与单任务处理一致，按无关帖入库，避免整页 error
+                if status == "empty" and not questions:
+                    extract_unrelated += 1
+                    sqlite_service.update_task_status(
+                        task_id,
+                        "unrelated",
+                        error_msg="LLM 未输出可入库题目（空列表或无效项）",
+                        raw_content=raw_content,
+                        agent_used_tool=agent_used_tool,
+                        extract_duration_min=round((time.time() - _t0) / 60, 2),
+                        trace_session_id=trace_session_id,
+                    )
+                    logger.warning(f"  ⚠️ 无可入库题目，已标记 unrelated")
                     logger.info("")
                     continue
 
@@ -377,11 +369,10 @@ def _process_pending_tasks(batch_size: int = None):
                     extraction_src = "image" if agent_used_tool else "content"
                     crawl_task_id = row["id"] if "id" in row.keys() else None
                     count = _save_questions(questions, crawl_task_id=crawl_task_id, skip_neo4j=not agent_succeeded)
-                    # 耗时 = 两阶段总时间（Stage1 远程粗提取 + Stage2 豆包），单位分钟
                     _dur = round(time.time() - _t0, 1)
                     _dur_min = round(_dur / 60, 2)
                     sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=_dur_min, trace_session_id=trace_session_id)
-                    logger.info(f"  ✅ 提取完成: {count} 道题目入库，耗时 {_dur_min}min（两阶段总时间）" + ("（仅 SQLite，未写入 Graph）" if not agent_succeeded else "") + (f"（来源：{'图片' if agent_used_tool else '正文'}）" if agent_used_tool else ""))
+                    logger.info(f"  ✅ 提取完成: {count} 道题目入库，耗时 {_dur_min}min" + ("（仅 SQLite，未写入 Graph）" if not agent_succeeded else "") + (f"（来源：{'图片' if agent_used_tool else '正文'}）" if agent_used_tool else ""))
                     logger.info("")
                     processed += count
                     continue
@@ -479,6 +470,20 @@ def process_single_task(task_id: str) -> Dict:
 
     logger.info(f"[SingleTask] 开始处理 task_id={task_id}, 图片数={len(image_paths)}, 正文={len(raw_content)}字")
 
+    if os.environ.get("WXR_WORKER_SUBPROCESS") == "1":
+        _lim = settings.worker_subprocess_log_body_max_chars
+        _body_out = raw_content
+        if _lim > 0 and len(_body_out) > _lim:
+            _body_out = (
+                _body_out[:_lim]
+                + f"\n…(正文已截断，全文共 {len(raw_content)} 字，WORKER_SUBPROCESS_LOG_BODY_MAX_CHARS={_lim})"
+            )
+        logger.info("[SingleTask][子进程详情] source_url=%s", url)
+        logger.info("[SingleTask][子进程详情] platform=%s company=%s position=%s", platform, task.get("company") or "", task.get("position") or "")
+        logger.info("[SingleTask][子进程详情] post_title=%s", post_title)
+        logger.info("[SingleTask][子进程详情] image_paths(%d)=%s", len(image_paths), image_paths)
+        logger.info("[SingleTask][子进程详情] 帖子正文:\n%s", _body_out if _body_out else "(空)")
+
     # 先删除该任务已有的旧题目，再重新提取（避免重复）
     with sqlite_service._get_conn() as conn:
         old_count = conn.execute(
@@ -489,7 +494,7 @@ def process_single_task(task_id: str) -> Dict:
             conn.commit()
             logger.info(f"[SingleTask] 已删除旧题目 {old_count} 道")
 
-    # 重置状态为 fetched，清空耗时（后续提取完成时会重新记录两阶段总时间）
+    # 重置状态为 fetched，清空耗时（后续提取完成时会重新记录）
     sqlite_service.update_task_status(task_id, "fetched", raw_content=raw_content, image_paths=image_paths, clear_extract_duration=True)
 
     _t0 = time.time()
@@ -521,38 +526,21 @@ def process_single_task(task_id: str) -> Dict:
         sqlite_service.update_task_status(task_id, "error", error_msg="LLM 返回无法解析为 JSON", raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=round((time.time() - _t0) / 60, 2), trace_session_id=trace_session_id)
         return {"status": "error", "message": "LLM 返回格式错误，无法解析", "questions_added": 0, "ocr_called": agent_used_tool}
 
-    # two_stage：Stage1 已入队 stage2_pending；粗题已写入 questions，Stage2 仅 UPDATE 精答案
-    if status == "stage2_pending":
-        _qc = 0
-        if url:
-            try:
-                with sqlite_service._get_conn() as _c:
-                    _r = _c.execute(
-                        "SELECT COUNT(*) AS c FROM questions WHERE source_url=?",
-                        (url,),
-                    ).fetchone()
-                    _qc = int(_r["c"]) if _r else 0
-            except Exception:
-                _qc = 0
+    # 空数组 / 无有效题干：属于「无可入库题目」，不应落 error（否则列表里全是失败红标）
+    if status == "empty" and not questions:
         sqlite_service.update_task_status(
             task_id,
-            "stage2_pending",
+            "unrelated",
+            error_msg="LLM 未输出可入库题目（空列表或无效项）",
             raw_content=raw_content,
             agent_used_tool=agent_used_tool,
             extract_duration_min=round((time.time() - _t0) / 60, 2),
             trace_session_id=trace_session_id,
-            questions_count=_qc,
-        )
-        logger.info(
-            "[SingleTask] Stage1 完成已入队 Stage2 task_id=%s 粗题入库=%d trace=%s",
-            task_id,
-            _qc,
-            (trace_session_id or "")[:16] + ("…" if trace_session_id and len(trace_session_id) > 16 else ""),
         )
         return {
             "status": "ok",
-            "message": f"Stage1 完成：已入库 {_qc} 道粗题，已入队待 Stage2 精加工",
-            "questions_added": _qc,
+            "message": "未提取到可入库题目（按无关帖处理）",
+            "questions_added": 0,
             "ocr_called": agent_used_tool,
         }
 
@@ -561,7 +549,6 @@ def process_single_task(task_id: str) -> Dict:
         extraction_src = "image" if agent_used_tool else "content"
         crawl_task_id = task.get("id") if isinstance(task, dict) else None
         count = _save_questions(questions, crawl_task_id=crawl_task_id, skip_neo4j=not agent_succeeded)
-        # 耗时 = 两阶段总时间（Stage1 + Stage2），单位分钟
         _dur_min = round((time.time() - _t0) / 60, 2)
         sqlite_service.update_task_status(task_id, "done", questions_count=count, extraction_source=extraction_src, raw_content=raw_content, agent_used_tool=agent_used_tool, extract_duration_min=_dur_min, trace_session_id=trace_session_id)
         logger.info(f"[SingleTask] 完成 task_id={task_id}: {count} 道题目入库, 耗时 {_dur_min}min, ocr_called={agent_used_tool}" + ("（仅 SQLite）" if not agent_succeeded else ""))
@@ -608,7 +595,7 @@ def _save_questions(questions: List[Dict], crawl_task_id: Optional[int] = None, 
             )
 
             # ── SQLite（主存储，必须成功）───────────────────
-            # answer_text=豆包答案（展示用），raw_answer=原答案（Stage1，two_stage 时）
+            # answer_text / raw_answer：单阶段通常仅填 answer_text；raw_answer 保留兼容历史数据
             extraction_source = q.get("extraction_source", "content")
             with sqlite_service._get_conn() as conn:
                 conn.execute("""

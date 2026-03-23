@@ -3,42 +3,97 @@
     <div class="card">
       <div class="card-title">📚 题库浏览</div>
 
-      <!-- 筛选行 -->
+      <!-- 筛选行（各列宽度见 .filter-*） -->
       <div class="filter-row">
-        <el-select v-model="filters.question_type" placeholder="题目类型" clearable>
-          <el-option v-for="t in (props.meta.question_types || ['技术题','算法题','系统设计','行为题','HR问题'])" :key="t" :label="t" :value="t" />
+        <el-select
+          v-model="filters.question_type"
+          class="filter-field filter-qtype"
+          placeholder="题目类型"
+          clearable
+        >
+          <el-option v-for="t in (props.meta.question_types || [])" :key="t" :label="t" :value="t" />
         </el-select>
-        <el-select v-model="filters.company" placeholder="公司" clearable filterable>
+        <el-select
+          v-model="filters.company"
+          class="filter-field filter-company"
+          placeholder="公司"
+          clearable
+          filterable
+        >
           <el-option v-for="c in (props.meta.companies || []).filter(c => c)" :key="c" :label="c" :value="c" />
         </el-select>
-        <el-select v-model="filters.difficulty" placeholder="难度" clearable>
+        <el-select
+          v-model="filters.difficulty"
+          class="filter-field filter-difficulty"
+          placeholder="难度"
+          clearable
+        >
           <el-option label="简单" value="easy" />
           <el-option label="中等" value="medium" />
           <el-option label="困难" value="hard" />
         </el-select>
-        <el-select v-model="filters.tag" placeholder="技术标签" clearable filterable>
+        <el-select
+          v-model="filters.tag"
+          class="filter-field filter-tag"
+          placeholder="技术标签"
+          clearable
+          filterable
+        >
           <el-option v-for="t in (props.meta.tags || []).filter(t => t)" :key="t" :label="t" :value="t" />
         </el-select>
-        <el-input v-model="filters.keyword" placeholder="关键词搜索" clearable
-                  @keyup.enter="onSearch" />
-        <el-select v-model="filters.source_platform" placeholder="来源平台" clearable>
+        <el-input
+          v-model="filters.keyword"
+          class="filter-field filter-keyword"
+          placeholder="关键词搜索"
+          clearable
+          @keyup.enter="onSearch"
+        />
+        <el-select
+          v-model="filters.source_platform"
+          class="filter-field filter-platform"
+          placeholder="来源平台"
+          clearable
+        >
           <el-option label="牛客网" value="nowcoder" />
           <el-option label="小红书" value="xiaohongshu" />
         </el-select>
       </div>
 
-      <!-- 操作行：搜索 | 智能练习 | 重置 -->
-      <div class="action-row">
-        <el-button type="primary" @click="onSearch" :loading="loading">🔍 搜索</el-button>
-        <el-button
-          class="btn-smart-practice"
-          :loading="smartPracticeLoading"
-          @click="loadSmartPractice"
-        >
-          <span v-if="!smartPracticeLoading" class="btn-sp-icon" aria-hidden="true">✨</span>
-          <span>智能练习</span>
-        </el-button>
-        <el-button @click="resetFilters">重置</el-button>
+      <!-- 操作区：按钮组 + 智能练习薄弱提示（紧凑一排，避免左右甩开） -->
+      <div class="action-toolbar">
+        <div class="action-toolbar-btns">
+          <el-button
+            class="btn-browse-search"
+            type="primary"
+            size="large"
+            :loading="loading"
+            @click="onSearch"
+          >
+            <span class="btn-ico" aria-hidden="true">🔍</span>
+            搜索
+          </el-button>
+          <el-button
+            class="btn-smart-practice"
+            size="large"
+            :loading="smartPracticeLoading"
+            @click="loadSmartPractice"
+          >
+            <span v-if="!smartPracticeLoading" class="btn-sp-icon" aria-hidden="true">✨</span>
+            智能练习
+          </el-button>
+          <el-button class="btn-browse-reset" size="large" @click="resetFilters">
+            <span class="btn-ico" aria-hidden="true">↺</span>
+            重置筛选
+          </el-button>
+        </div>
+        <div v-if="userIdForHint" class="action-toolbar-hint">
+          <span class="hint-ico" aria-hidden="true">🎯</span>
+          <template v-if="weakTagLabels.length">
+            <span class="hint-label">智能练习会优先结合薄弱标签</span>
+            <span v-for="tag in weakTagLabels" :key="tag" class="hint-chip">{{ tag }}</span>
+          </template>
+          <span v-else-if="weakHintLoaded" class="hint-muted">暂无薄弱标签记录，将按复习计划 + 随机题组卷</span>
+        </div>
       </div>
 
       <!-- 统计 + 每页条数 -->
@@ -48,8 +103,11 @@
         </span>
         <div class="page-size-selector">
           <span>每页</span>
-          <el-select v-model="pagination.pageSize" size="small" style="width:80px;margin:0 6px"
-                     @change="onPageSizeChange">
+          <el-select
+            v-model="pagination.pageSize"
+            class="filter-page-size"
+            @change="onPageSizeChange"
+          >
             <el-option :value="10" label="10 题" />
             <el-option :value="20" label="20 题" />
             <el-option :value="50" label="50 题" />
@@ -96,6 +154,11 @@
             <span v-if="q.last_score != null" class="score-chip" :class="q.last_score >= 3 ? 'score-ok' : 'score-low'">
               {{ typeof q.last_score === 'number' ? q.last_score.toFixed(1) : q.last_score }}/5
             </span>
+            <span
+              v-if="q.next_review_at"
+              class="review-chip"
+              title="下次复习时间（SM-2）"
+            >📅 {{ formatNextReviewShort(q.next_review_at) }}</span>
             <span v-if="q.company" class="meta-chip">🏢 {{ q.company }}</span>
             <span v-if="q.position" class="meta-chip">💼 {{ q.position }}</span>
             <span v-if="q.source_platform" class="meta-chip">{{ platformLabel(q.source_platform) }}</span>
@@ -117,6 +180,7 @@
         </div>
         <el-pagination
           v-model:current-page="pagination.page"
+          class="browse-pagination"
           :page-size="pagination.pageSize"
           :total="pagination.total"
           :pager-count="11"
@@ -133,6 +197,7 @@
         :question="selectedQ"
         :user-id="userId"
         @send-to-chat="handleSendToChat"
+        @run-model-bench="handleRunModelBench"
         @submit-complete="handleSubmitComplete"
       />
 
@@ -171,7 +236,7 @@ const props = defineProps({
   isActive: { type: Boolean, default: false },
   userId: { type: String, default: 'user_001' },
 })
-const emit = defineEmits(['send-to-chat', 'submit-complete'])
+const emit = defineEmits(['send-to-chat', 'run-model-bench', 'submit-complete'])
 
 const filters = reactive({ question_type: '', company: '', difficulty: '', tag: '', keyword: '', source_platform: '' })
 const pagination = reactive({ page: 1, pageSize: 20, total: 0, totalPages: 1 })
@@ -180,6 +245,7 @@ const sortOrder = ref('desc')
 
 const SORT_COLUMNS = [
   { key: 'created_at',    label: '时间' },
+  { key: 'next_review_at', label: '待复习时间' },
   { key: 'difficulty',    label: '难度' },
   { key: 'company',       label: '公司' },
   { key: 'question_type', label: '类型' },
@@ -191,7 +257,8 @@ const toggleSort = (colKey) => {
     sortOrder.value = sortOrder.value === 'asc' ? 'desc' : 'asc'
   } else {
     sortBy.value = colKey
-    sortOrder.value = 'desc'
+    // 待复习：默认越早到期越靠前（升序）；其它列默认降序
+    sortOrder.value = colKey === 'next_review_at' ? 'asc' : 'desc'
   }
   pagination.page = 1
   loadQuestions(1)
@@ -202,6 +269,33 @@ const smartPracticeLoading = ref(false)
 const dialogVisible = ref(false)           // 普通题目弹窗
 const selectedQ     = ref(null)
 
+/** 智能练习旁展示的薄弱标签（与后端组卷逻辑一致，来自 mastery） */
+const weakTagLabels = ref([])
+const weakHintLoaded = ref(false)
+const userIdForHint = computed(
+  () => !!(props.userId && String(props.userId).trim())
+)
+
+const loadWeakHint = async () => {
+  if (!userIdForHint.value) {
+    weakTagLabels.value = []
+    weakHintLoaded.value = false
+    return
+  }
+  try {
+    const d = await api.getMastery(props.userId)
+    const rows = d.weak_tags || []
+    weakTagLabels.value = rows
+      .map((r) => (typeof r === 'string' ? r : r?.tag))
+      .filter(Boolean)
+      .slice(0, 6)
+  } catch {
+    weakTagLabels.value = []
+  } finally {
+    weakHintLoaded.value = true
+  }
+}
+
 // 智能练习专用状态：批次 + 当前索引 + 弹窗显隐
 const practiceBatch = ref([])
 const practiceStats = ref({ practiced_count: 0, total_count: 0, all_learned: false })
@@ -211,6 +305,11 @@ const allLearnedVisible = ref(false)
 
 const diffLabel     = (d) => ({ easy: '简单', medium: '中等', hard: '困难' }[d] || '中等')
 const platformLabel = (p) => ({ nowcoder: '牛客', xiaohongshu: '小红书' }[p] || p)
+/** 列表卡片展示下次复习时间（接口返回多为 SQLite 时间字符串） */
+const formatNextReviewShort = (s) => {
+  if (s == null || s === '') return ''
+  return String(s).replace('T', ' ').trim().slice(0, 16)
+}
 const questionTypeClass = (t) => {
   const m = { '技术题': 'type-tech', '算法题': 'type-algo', '系统设计': 'type-design', '行为题': 'type-behavior', 'HR问题': 'type-hr' }
   return m[t] || 'type-tech'
@@ -304,6 +403,7 @@ const loadSmartPractice = async () => {
     ElMessage.error('智能练习取题失败')
   } finally {
     smartPracticeLoading.value = false
+    if (props.isActive) loadWeakHint()
   }
 }
 
@@ -320,6 +420,10 @@ const openDialog = (q) => {
 
 const handleSendToChat = (event) => {
   emit('send-to-chat', event)
+}
+
+const handleRunModelBench = (event) => {
+  emit('run-model-bench', event)
 }
 
 const handlePrevQuestion = () => {
@@ -362,10 +466,21 @@ const handleSmartSubmitComplete = (payload) => {
       if (practiceStats.value.all_learned) allLearnedVisible.value = true
     }).catch(() => {})
   }
+  loadWeakHint()
   emit('submit-complete', payload)
 }
 
-onMounted(() => loadQuestions(1))
+onMounted(() => {
+  loadQuestions(1)
+  if (props.isActive) loadWeakHint()
+})
+
+watch(
+  () => [props.isActive, props.userId],
+  () => {
+    if (props.isActive) loadWeakHint()
+  }
+)
 
 watch(() => props.isActive, (newVal, oldVal) => {
   if (newVal && !oldVal) {
@@ -375,35 +490,151 @@ watch(() => props.isActive, (newVal, oldVal) => {
 </script>
 
 <style scoped>
-.filter-row { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 8px; }
-.filter-row .el-select { width: 100px; }
-.filter-row .el-input { width: 130px; }
-
-.action-row {
+.filter-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: 10px;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+/* 筛选控件统一拉长：按需改下列 width / min-width */
+.filter-row .filter-field {
+  flex: 0 0 auto;
+}
+.filter-row .filter-qtype {
+  width: 148px;
+  min-width: 128px;
+}
+.filter-row .filter-company {
+  width: 188px;
+  min-width: 160px;
+}
+.filter-row .filter-difficulty {
+  width: 118px;
+  min-width: 104px;
+}
+.filter-row .filter-tag {
+  width: 200px;
+  min-width: 168px;
+}
+.filter-row .filter-keyword {
+  width: 240px;
+  min-width: 200px;
+}
+.filter-row .filter-platform {
+  width: 140px;
+  min-width: 124px;
+}
+
+.action-toolbar {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
   gap: 8px;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 45%, #eef2ff 100%);
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+}
+.action-toolbar-btns {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.action-toolbar-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  width: 100%;
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px dashed #cbd5e1;
+}
+.hint-ico {
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.9;
+}
+.hint-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #475569;
+}
+.hint-chip {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: #fff;
+  color: #7c3aed;
+  border: 1px solid #c4b5fd;
+  box-shadow: 0 1px 2px rgba(124, 58, 237, 0.08);
+}
+.hint-muted {
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.5;
+}
+.btn-browse-search {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 6px;
+  min-width: 112px;
+  font-weight: 600 !important;
+  font-size: 15px !important;
+  padding: 12px 22px !important;
+  border-radius: 12px !important;
+  box-shadow: 0 4px 14px rgba(91, 110, 245, 0.35);
+}
+.btn-browse-search .btn-ico {
+  font-size: 16px;
+  line-height: 1;
+}
+.btn-browse-reset {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600 !important;
+  font-size: 15px !important;
+  padding: 12px 20px !important;
+  border-radius: 12px !important;
+  color: #475569 !important;
+  background: #fff !important;
+  border: 2px solid #cbd5e1 !important;
+}
+.btn-browse-reset:hover {
+  color: var(--primary) !important;
+  border-color: var(--primary) !important;
+  background: var(--primary-light) !important;
+}
+.btn-browse-reset .btn-ico {
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0.85;
 }
 .btn-smart-practice {
   display: inline-flex !important;
   align-items: center;
-  gap: 6px;
-  padding: 8px 16px !important;
-  background: linear-gradient(135deg, var(--primary) 0%, #7c8cff 100%) !important;
+  gap: 8px;
+  padding: 14px 28px !important;
+  min-height: 48px !important;
+  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 55%, #6366f1 100%) !important;
   color: #fff !important;
   border: none !important;
-  border-radius: 10px;
-  font-weight: 600;
-  font-size: 14px;
-  box-shadow: 0 2px 8px rgba(91, 110, 245, 0.35);
+  border-radius: 14px;
+  font-weight: 700;
+  font-size: 16px !important;
+  letter-spacing: 0.02em;
+  box-shadow: 0 6px 20px rgba(79, 70, 229, 0.4);
   transition: transform 0.15s ease, box-shadow 0.2s ease;
 }
 .btn-smart-practice:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 14px rgba(91, 110, 245, 0.45);
-  background: linear-gradient(135deg, #4a5ef5 0%, #6b7bff 100%) !important;
+  transform: translateY(-2px);
+  box-shadow: 0 10px 28px rgba(79, 70, 229, 0.48);
+  background: linear-gradient(135deg, #4338ca 0%, #6d28d9 55%, #4f46e5 100%) !important;
   color: #fff !important;
   border: none !important;
 }
@@ -411,9 +642,13 @@ watch(() => props.isActive, (newVal, oldVal) => {
   transform: translateY(0);
 }
 .btn-smart-practice .btn-sp-icon {
-  font-size: 15px;
+  font-size: 20px;
   line-height: 1;
   opacity: 0.95;
+}
+.filter-page-size {
+  width: 92px;
+  margin: 0 6px;
 }
 .stats-bar {
   display: flex;
@@ -428,49 +663,54 @@ watch(() => props.isActive, (newVal, oldVal) => {
 .col-header-bar {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   flex-wrap: wrap;
-  padding: 6px 2px;
+  padding: 8px 4px;
   margin-bottom: 10px;
   border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, #fafbfc 0%, transparent 100%);
+  border-radius: 8px 8px 0 0;
 }
 .col-header-label {
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 600;
   color: var(--text-sub);
-  margin-right: 2px;
+  margin-right: 4px;
 }
 .col-sort-btn {
   display: inline-flex;
   align-items: center;
-  gap: 1px;
-  padding: 2px 7px;
-  border-radius: 4px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--text-sub);
-  font-size: 12px;
+  gap: 2px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 500;
   cursor: pointer;
-  transition: all .15s;
+  transition: all 0.15s;
   white-space: nowrap;
-  line-height: 1.6;
+  line-height: 1.4;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }
 .col-sort-btn:hover {
   background: var(--primary-light);
   color: var(--primary);
-  border-color: var(--primary);
+  border-color: #c7d2fe;
 }
 .col-sort-btn.active {
-  background: var(--primary-light);
-  color: var(--primary);
-  border-color: var(--primary);
+  background: linear-gradient(180deg, #eef2ff 0%, #e0e7ff 100%);
+  color: #4338ca;
+  border-color: #a5b4fc;
   font-weight: 600;
 }
 .col-sort-icon {
   display: inline-flex;
   flex-direction: column;
   line-height: 1;
-  font-size: 9px;
-  margin-left: 1px;
+  font-size: 10px;
+  margin-left: 2px;
   gap: 0;
 }
 .col-sort-icon .arrow {
@@ -529,6 +769,15 @@ watch(() => props.isActive, (newVal, oldVal) => {
 .score-chip.score-low { background: #fee2e2; color: #991b1b; }
 .tag-chip  { font-size: 11px; background: #f0fdf4; color: #166534;
              padding: 2px 8px; border-radius: 10px; }
+.review-chip {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fcd34d;
+}
 .empty-state { text-align: center; padding: 60px 20px; color: var(--text-sub); }
 .empty-icon  { font-size: 48px; margin-bottom: 16px; }
 .browse-list-hint {
@@ -541,15 +790,40 @@ watch(() => props.isActive, (newVal, oldVal) => {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   margin-top: 14px;
-  padding-top: 10px;
+  padding-top: 14px;
   border-top: 1px solid var(--border);
 }
 .pagination-info {
   font-size: 13px;
   color: var(--text-sub);
   text-align: center;
+}
+.browse-pagination :deep(.btn-prev),
+.browse-pagination :deep(.btn-next) {
+  min-width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+.browse-pagination :deep(.el-pager li) {
+  min-width: 38px;
+  height: 38px;
+  line-height: 38px;
+  font-size: 14px;
+  font-weight: 600;
+  border-radius: 10px;
+  margin: 0 3px;
+}
+.browse-pagination :deep(.el-pagination__jump) {
+  margin-left: 12px;
+  font-size: 13px;
+  font-weight: 500;
+}
+.browse-pagination :deep(.el-input__inner) {
+  height: 34px;
+  border-radius: 8px;
 }
 .all-learned-content { text-align: center; padding: 20px 0; }
 .celebration-emoji { font-size: 64px; margin-bottom: 16px; animation: bounce 0.6s ease infinite; }

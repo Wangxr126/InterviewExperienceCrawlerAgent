@@ -4,6 +4,7 @@
 修改配置请直接编辑 /.env 文件。
 """
 import json
+import logging
 import os
 from pathlib import Path
 from typing import List, Dict, Any
@@ -58,6 +59,53 @@ def _get_list(key: str, default: str = "") -> list:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
+def _remote_chain_with_fallback(
+    primary_model: str,
+    primary_key: str,
+    primary_base: str,
+    primary_timeout: int,
+    fallback_json_raw: str,
+) -> List[Dict[str, Any]]:
+    """主端点 + *._FALLBACK_MODELS（单行 JSON 数组）→ 统一端点列表，格式与 MINER_STAGE2_FALLBACK_MODELS 一致。"""
+    pm = (primary_model or "").strip()
+    pb = (primary_base or "").strip().rstrip("/")
+    pk = (primary_key or "").strip()
+    if not pm or not pb:
+        return []
+    to = int(primary_timeout or 0) or 120
+    result: List[Dict[str, Any]] = [
+        {"model": pm, "api_key": pk or "sk-dummy", "base_url": pb, "timeout": to}
+    ]
+    raw = (fallback_json_raw or "").strip()
+    if not raw:
+        return result
+    try:
+        fallbacks = json.loads(raw)
+        if not isinstance(fallbacks, list):
+            return result
+        for item in fallbacks:
+            if not isinstance(item, dict) or not item.get("model"):
+                continue
+            item_base = str(item.get("base_url") or pb).strip().rstrip("/")
+            item_to = to
+            if item.get("timeout") is not None:
+                try:
+                    item_to = int(item["timeout"])
+                except (TypeError, ValueError):
+                    pass
+            result.append(
+                {
+                    "model": str(item["model"]),
+                    "api_key": str(item.get("api_key") or pk or "sk-dummy"),
+                    "base_url": item_base,
+                    "timeout": item_to,
+                }
+            )
+    except json.JSONDecodeError:
+        pass
+    return result
+
+
 class _Settings:
     """运行时只读配置对象（属性懒加载，确保 load_dotenv 先执行）"""
 
@@ -109,6 +157,19 @@ class _Settings:
     @property
     def llm_remote_timeout(self) -> int:
         return _get_int("LLM_REMOTE_TIMEOUT", 300)
+
+    @property
+    def llm_remote_models(self) -> List[Dict[str, Any]]:
+        """全局 LLM_MODE=remote 时：主端点 + LLM_REMOTE_FALLBACK_MODELS（练习对话等）。"""
+        if self.llm_mode != "remote":
+            return []
+        return _remote_chain_with_fallback(
+            self.llm_remote_model,
+            self.llm_remote_api_key,
+            self.llm_remote_base_url,
+            self.llm_remote_timeout,
+            _get("LLM_REMOTE_FALLBACK_MODELS", ""),
+        )
 
     # ── 1.3 当前使用的配置（根据mode自动选择）──
     @property
@@ -221,6 +282,44 @@ class _Settings:
     def knowledge_manager_max_tokens(self) -> int:
         return _get_int("KNOWLEDGE_MANAGER_MAX_TOKENS", 0) or self.llm_max_tokens
 
+    @property
+    def architect_model(self) -> str:
+        """与 knowledge_manager_model 相同（兼容 knowledge_manager_tools 等旧引用）。"""
+        return self.knowledge_manager_model
+
+    @property
+    def architect_temperature(self) -> float:
+        return self.knowledge_manager_temperature
+
+    @property
+    def architect_max_tokens(self) -> int:
+        return self.knowledge_manager_max_tokens
+
+    @property
+    def architect_remote_models(self) -> List[Dict[str, Any]]:
+        """Architect / 知识管理 JSON 调用：主端点 + ARCHITECT_REMOTE_FALLBACK_MODELS。"""
+        if self.architect_mode == "local":
+            m = (self.architect_local_model or "").strip()
+            b = (self.architect_local_base_url or "").strip().rstrip("/")
+            if not m or not b:
+                return []
+            lk = _get("ARCHITECT_LOCAL_API_KEY") or self.llm_local_api_key or "ollama"
+            return [
+                {
+                    "model": m,
+                    "api_key": lk,
+                    "base_url": b,
+                    "timeout": self.architect_local_timeout,
+                }
+            ]
+        return _remote_chain_with_fallback(
+            self.architect_remote_model,
+            (_get("ARCHITECT_REMOTE_API_KEY") or self.llm_remote_api_key),
+            self.architect_remote_base_url,
+            self.architect_remote_timeout,
+            _get("ARCHITECT_REMOTE_FALLBACK_MODELS", ""),
+        )
+
     # ── 4. Interviewer Agent ──────────────────────────────────────
     @property
     def interviewer_mode(self) -> str:
@@ -291,6 +390,30 @@ class _Settings:
     @property
     def interviewer_max_tokens(self) -> int:
         return _get_int("INTERVIEWER_MAX_TOKENS", 0) or self.llm_max_tokens
+
+    @property
+    def interviewer_remote_models(self) -> List[Dict[str, Any]]:
+        """面试官：local 单端点；remote 时主端点 + INTERVIEWER_REMOTE_FALLBACK_MODELS。"""
+        if self.interviewer_mode == "local":
+            m = (self.interviewer_local_model or "").strip()
+            b = (self.interviewer_local_base_url or "").strip().rstrip("/")
+            if not m or not b:
+                return []
+            return [
+                {
+                    "model": m,
+                    "api_key": (_get("INTERVIEWER_LOCAL_API_KEY") or self.llm_local_api_key or "ollama"),
+                    "base_url": b,
+                    "timeout": self.interviewer_local_timeout,
+                }
+            ]
+        return _remote_chain_with_fallback(
+            self.interviewer_remote_model,
+            self.interviewer_api_key,
+            self.interviewer_remote_base_url,
+            self.interviewer_remote_timeout,
+            _get("INTERVIEWER_REMOTE_FALLBACK_MODELS", ""),
+        )
 
     @property
     def interviewer_history_max_messages(self) -> int:
@@ -380,6 +503,30 @@ class _Settings:
         return self.finetune_local_timeout if self.finetune_mode == "local" else self.finetune_remote_timeout
 
     @property
+    def finetune_remote_models(self) -> List[Dict[str, Any]]:
+        """微调「AI 辅助标注」等：主端点 + FINETUNE_REMOTE_FALLBACK_MODELS。"""
+        if self.finetune_mode == "local":
+            m = (self.finetune_local_model or "").strip()
+            b = (self.finetune_local_base_url or "").strip().rstrip("/")
+            if not m or not b:
+                return []
+            return [
+                {
+                    "model": m,
+                    "api_key": (_get("FINETUNE_LOCAL_API_KEY") or self.llm_local_api_key or "ollama"),
+                    "base_url": b,
+                    "timeout": self.finetune_local_timeout,
+                }
+            ]
+        return _remote_chain_with_fallback(
+            self.finetune_remote_model,
+            self.finetune_llm_api_key,
+            self.finetune_llm_base_url,
+            self.finetune_remote_timeout,
+            _get("FINETUNE_REMOTE_FALLBACK_MODELS", ""),
+        )
+
+    @property
     def finetune_llm_temperature(self) -> float:
         return _get_float("FINETUNE_LLM_TEMPERATURE", 0.1)
 
@@ -395,10 +542,13 @@ class _Settings:
     # ── 4.6 Miner Agent（题目提取器）──────────────────────────────────
     @property
     def miner_mode(self) -> str:
-        """Miner使用模式：local/remote/two_stage，留空则使用全局LLM_MODE。
-        two_stage：Stage1 粗提取由 MINER_STAGE1_MODE（local/remote）与 MINER_STAGE1_* 决定；
-        Stage2 精加工仍用 MINER_STAGE2_*。"""
-        return _get("MINER_MODE") or self.llm_mode
+        """Miner 使用模式：local | remote | two_stage（两阶段同步：Stage1 粗提 + Stage2 精加工），留空则 LLM_MODE。"""
+        raw = (_get("MINER_MODE") or self.llm_mode or "local").strip().lower()
+        if raw == "two_stage":
+            return "two_stage"
+        if raw in ("remote", "local"):
+            return raw
+        return "local"
 
     # 本地配置
     @property
@@ -443,6 +593,36 @@ class _Settings:
     def miner_remote_api_key(self) -> str:
         # 未单独配 MINER_REMOTE_API_KEY 时可用 Stage2 / 全局远程 Key（同一 Ark 账号时常共用）
         return _get("MINER_REMOTE_API_KEY") or self.llm_remote_api_key or _get("MINER_STAGE2_API_KEY")
+
+    @property
+    def miner_remote_models(self) -> List[Dict[str, Any]]:
+        """
+        单阶段 remote / 直连降级 LLM：主端点 MINER_REMOTE_* + MINER_REMOTE_FALLBACK_MODELS（JSON 数组）。
+        格式同 MINER_STAGE2_FALLBACK_MODELS：[{"model":"...","api_key":"..." , "base_url":"..." 可选, "timeout": 可选}]
+        local / 未配置 base 时返回空列表。
+        """
+        if self.miner_mode == "local":
+            m = (self.miner_local_model or "").strip()
+            b = (self.miner_local_base_url or "").strip().rstrip("/")
+            if not m or not b:
+                return []
+            to = self.miner_local_timeout
+            _lk = (_get("MINER_LOCAL_API_KEY") or self.llm_local_api_key or "ollama").strip() or "ollama"
+            return [
+                {
+                    "model": m,
+                    "api_key": _lk,
+                    "base_url": b,
+                    "timeout": to,
+                }
+            ]
+        return _remote_chain_with_fallback(
+            self.miner_remote_model,
+            self.miner_remote_api_key,
+            self.miner_remote_base_url,
+            self.miner_remote_timeout,
+            _get("MINER_REMOTE_FALLBACK_MODELS", ""),
+        )
 
     @property
     def miner_remote_enable_thinking(self) -> bool:
@@ -564,60 +744,49 @@ class _Settings:
         if not pm or not pb:
             return []
         to = self.miner_stage1_remote_timeout
-        result: List[Dict[str, Any]] = [
-            {"model": pm, "api_key": pk or "sk-dummy", "base_url": pb.rstrip("/"), "kind": "remote", "timeout": to}
-        ]
-        raw = _get("MINER_STAGE1_FALLBACK_MODELS", "").strip()
-        if not raw:
-            return result
-        try:
-            fallbacks = json.loads(raw)
-            if not isinstance(fallbacks, list):
-                return result
-            for item in fallbacks:
-                if not isinstance(item, dict) or not item.get("model"):
-                    continue
-                item_base = str(item.get("base_url") or pb).strip().rstrip("/")
-                item_to = to
-                if item.get("timeout") is not None:
-                    try:
-                        item_to = int(item["timeout"])
-                    except (TypeError, ValueError):
-                        pass
-                result.append(
-                    {
-                        "model": str(item["model"]),
-                        "api_key": str(item.get("api_key") or pk or "sk-dummy"),
-                        "base_url": item_base,
-                        "kind": "remote",
-                        "timeout": item_to,
-                    }
-                )
-        except json.JSONDecodeError:
-            pass
-        return result
+        chain = _remote_chain_with_fallback(pm, pk, pb, to, _get("MINER_STAGE1_FALLBACK_MODELS", ""))
+        return [{**d, "kind": "remote", "base_url": (d.get("base_url") or "").rstrip("/")} for d in chain]
 
     # 当前使用的配置（根据mode选择）
     @property
     def miner_provider(self) -> str:
+        if self.miner_mode == "two_stage":
+            return f"two_stage/{self.miner_stage1_mode}"
         return self.miner_local_provider if self.miner_mode == "local" else self.miner_remote_provider
 
     @property
     def miner_model(self) -> str:
+        if self.miner_mode == "two_stage":
+            s1 = self.miner_stage1_models
+            if s1:
+                return str(s1[0].get("model") or "").strip() or "two_stage"
+            return "two_stage"
         return self.miner_local_model if self.miner_mode == "local" else self.miner_remote_model
 
     @property
     def miner_api_key(self) -> str:
         local_key = _get("MINER_LOCAL_API_KEY") or self.llm_local_api_key
         remote_key = self.miner_remote_api_key
+        if self.miner_mode == "two_stage":
+            if self.miner_stage1_mode == "local":
+                return self.miner_stage1_local_api_key or local_key
+            return self.miner_stage1_remote_api_key or remote_key
         return local_key if self.miner_mode == "local" else remote_key
 
     @property
     def miner_base_url(self) -> str:
+        if self.miner_mode == "two_stage":
+            if self.miner_stage1_mode == "local":
+                return self.miner_stage1_local_base_url or self.miner_local_base_url
+            return self.miner_stage1_remote_base_url or self.miner_remote_base_url
         return self.miner_local_base_url if self.miner_mode == "local" else self.miner_remote_base_url
 
     @property
     def miner_timeout(self) -> int:
+        if self.miner_mode == "two_stage":
+            if self.miner_stage1_mode == "local":
+                return self.miner_stage1_local_timeout
+            return self.miner_stage1_remote_timeout
         return self.miner_local_timeout if self.miner_mode == "local" else self.miner_remote_timeout
 
     @property
@@ -660,13 +829,18 @@ class _Settings:
 
     @property
     def miner_max_retries(self) -> int:
-        """题目提取失败时的最大重试次数（返回空或格式错误时重试）"""
-        return _get_int("MINER_MAX_RETRIES", 3)
+        """题目提取单轮循环次数：1=只请求 1 次 LLM，2=失败后再试 1 次，以此类推"""
+        return max(1, _get_int("MINER_MAX_RETRIES", 1))
 
     @property
     def miner_refusal_retries(self) -> int:
         """Miner 模型拒绝时，重试 Miner 的次数，用尽后再降级为直接 LLM 调用"""
-        return _get_int("MINER_REFUSAL_RETRIES", 3)
+        return max(0, _get_int("MINER_REFUSAL_RETRIES", 1))
+
+    @property
+    def worker_subprocess_log_body_max_chars(self) -> int:
+        """子进程（WXR_WORKER_SUBPROCESS=1）日志中帖子正文最大字符数；0=不截断"""
+        return _get_int("WORKER_SUBPROCESS_LOG_BODY_MAX_CHARS", 100_000)
 
     @property
     def miner_enforce_chinese_output(self) -> bool:
@@ -685,8 +859,17 @@ class _Settings:
 
     # ── 两阶段 Miner：Stage 2 豆包配置（精加工阶段）────────────────────────
     @property
+    def miner_stage2_env_explicit(self) -> bool:
+        """是否在 .env 中单独声明了 Stage2（任一即可触发独立端点，不再仅依赖回退）。"""
+        return (
+            _env_nonempty("MINER_STAGE2_MODEL")
+            or _env_nonempty("MINER_STAGE2_BASE_URL")
+            or _env_nonempty("MINER_STAGE2_API_KEY")
+        )
+
+    @property
     def miner_stage2_model(self) -> str:
-        """Stage 2 精加工模型（豆包），留空则用 MINER_REMOTE_MODEL"""
+        """Stage 2 精加工模型（建议豆包/Ark 等与 Stage1 不同的端点）；留空则用 MINER_REMOTE_MODEL"""
         return _get("MINER_STAGE2_MODEL") or self.miner_remote_model
 
     @property
@@ -745,8 +928,8 @@ class _Settings:
 
     @property
     def miner_stage2_async_enabled(self) -> bool:
-        """是否启用 Stage1/Stage2 异步解耦（MQ 队列，达到 batch_size 触发），默认 True"""
-        return _get("MINER_STAGE2_ASYNC_ENABLED", "true").lower() in ("1", "true", "yes")
+        """已废弃：Stage2 仅支持同步执行（同一请求内跑完），始终为 False。"""
+        return False
 
     @property
     def miner_stage2_run_mode(self) -> str:
@@ -767,32 +950,18 @@ class _Settings:
         primary_base = self.miner_stage2_base_url
         if not primary_model or not primary_base:
             return []
-        result: List[Dict[str, Any]] = [
-            {"model": primary_model, "api_key": primary_key or "sk-dummy", "base_url": primary_base}
-        ]
-        raw = _get("MINER_STAGE2_FALLBACK_MODELS", "").strip()
-        if not raw:
-            return result
-        try:
-            fallbacks = json.loads(raw)
-            if not isinstance(fallbacks, list):
-                return result
-            for item in fallbacks:
-                if not isinstance(item, dict) or not item.get("model"):
-                    continue
-                result.append({
-                    "model": str(item["model"]),
-                    "api_key": str(item.get("api_key") or primary_key or "sk-dummy"),
-                    "base_url": str(item.get("base_url") or primary_base),
-                })
-        except json.JSONDecodeError:
-            pass
-        return result
+        return _remote_chain_with_fallback(
+            primary_model,
+            primary_key,
+            primary_base,
+            self.miner_stage2_timeout,
+            _get("MINER_STAGE2_FALLBACK_MODELS", ""),
+        )
 
     @property
     def extract_retries_on_failure(self) -> int:
-        """有图片时，提取失败（0题/parse_error）后的整体重试次数，用尽后 warning"""
-        return _get_int("EXTRACT_RETRIES_ON_FAILURE", 3)
+        """有图片时，整段 extract 失败后的额外重试次数：0=只跑 1 轮 extract；1=失败再跑 1 轮"""
+        return max(0, _get_int("EXTRACT_RETRIES_ON_FAILURE", 0))
 
     @property
     def crawler_fetch_max_retries(self) -> int:
@@ -884,6 +1053,24 @@ class _Settings:
     def rerank_timeout(self) -> int:
         """重排请求超时（秒）"""
         return _get_int("RERANK_TIMEOUT", 60)
+
+    @property
+    def rerank_trace_enabled(self) -> bool:
+        """是否将向量候选与重排结果写入单独目录（见 rerank_trace_dir）"""
+        return _get_bool("RERANK_TRACE_ENABLED", True)
+
+    @property
+    def rerank_trace_dir(self) -> str:
+        """重排追踪 JSON 目录，默认 backend/logs/similar_rerank"""
+        d = _get("RERANK_TRACE_DIR", "").strip()
+        if d:
+            return _resolve_data_path(d)
+        return str(_PROJECT_ROOT / "backend" / "logs" / "similar_rerank")
+
+    @property
+    def rerank_trace_text_max_len(self) -> int:
+        """追踪文件中单段题目正文最大字符数，避免单文件过大"""
+        return _get_int("RERANK_TRACE_TEXT_MAX_LEN", 4000)
 
     @property
     def retrieval_search_top_k(self) -> int:
@@ -999,6 +1186,14 @@ class _Settings:
     def log_dir(self) -> str:
         p = _get("LOG_DIR", "").strip()
         return str(_PROJECT_ROOT / "backend" / "logs") if not p else _resolve_data_path(p)
+
+    @property
+    def subprocess_log_dir(self) -> str:
+        """后台子进程专用日志根目录；默认 LOG_DIR/subprocess。相对路径基于项目根。"""
+        p = _get("SUBPROCESS_LOG_DIR", "").strip()
+        if not p:
+            return str(Path(self.log_dir) / "subprocess")
+        return _resolve_data_path(p)
 
     @property
     def post_images_dir(self) -> Path:
@@ -1222,7 +1417,7 @@ class _Settings:
 
     @property
     def crawler_background_run_mode(self) -> str:
-        """后台任务执行模式：process(子进程) / thread(线程)。process 时凡经 task_executor 触发的 process_tasks（定时、API、extract/retry/re-extract 等）均走子进程，避免主进程阻塞与刷屏。"""
+        """后台任务执行模式：process(子进程) / thread(线程)。process 时凡经 task_executor 触发的 process_tasks（定时、API 等）均走子进程，避免主进程阻塞与刷屏。"""
         mode = _get("CRAWLER_BACKGROUND_RUN_MODE", "process").lower()
         return mode if mode in ("process", "thread") else "process"
 
@@ -1281,3 +1476,21 @@ class _Settings:
 
 # 全局单例（懒加载，main.py 中 load_dotenv 先于任何 import settings 执行）
 settings = _Settings()
+
+_stage2_remote_fallback_warned = False
+
+
+def warn_if_stage2_shares_remote_fallback() -> None:
+    """
+    若未在 .env 中单独声明 MINER_STAGE2_*，Stage2 与单阶段 Miner 共用 MINER_REMOTE_*。
+    进程内只告警一次，便于发现「精答与粗提取抢同一模型额度」。
+    """
+    global _stage2_remote_fallback_warned
+    if _stage2_remote_fallback_warned or settings.miner_stage2_env_explicit:
+        return
+    _stage2_remote_fallback_warned = True
+    logging.getLogger("backend.config").warning(
+        "[Stage2] 未单独配置 MINER_STAGE2_MODEL / MINER_STAGE2_BASE_URL / MINER_STAGE2_API_KEY，"
+        "精加工与单阶段 Miner 共用 MINER_REMOTE_*（当前 model=%s）。若需独立额度或火山豆包等，请在 .env 填写 MINER_STAGE2_*。",
+        (settings.miner_stage2_model or "")[:120] or "(空)",
+    )

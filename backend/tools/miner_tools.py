@@ -184,7 +184,7 @@ class FinishTool(Tool):
                 "question_text（问题文本）、answer_text（答案文本）、difficulty（难度）、"
                 "question_type（题目类型）、topic_tags（标签数组）、company（公司）、position（岗位）。"
                 "示例：[{\"question_text\":\"Redis持久化方式有哪些？\",\"answer_text\":\"RDB和AOF\","
-                "\"difficulty\":\"medium\",\"question_type\":\"基础类\",\"topic_tags\":[\"Redis\",\"持久化\"],"
+                "\"difficulty\":\"medium\",\"question_type\":\"工程-缓存与Redis\",\"topic_tags\":[\"Redis\",\"持久化\"],"
                 "\"company\":\"字节跳动\",\"position\":\"后端开发\"}]"
                 "调用后任务立即结束，无需再调用其他工具。"
             ),

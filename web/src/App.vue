@@ -33,6 +33,7 @@
                      :user-id="userId"
                      :is-active="currentView === 'browse'"
                      @send-to-chat="onSendToChat"
+                     @run-model-bench="onRunModelBench"
                      @submit-complete="onSubmitComplete" />
         <ChatView    v-show="currentView === 'chat'"   ref="chatViewRef"
                      :user-id="userId" :is-active="currentView === 'chat'" />
@@ -50,6 +51,7 @@
                       :user-id="userId"
                       :is-active="currentView === 'graph_rag'" />
         <ModelCompareView v-show="currentView === 'model_compare'" />
+        <ModelBenchView v-show="currentView === 'model_bench'" :prefill="modelBenchPrefill" />
       </main>
     </div>
 
@@ -75,6 +77,7 @@ import FinetuneView from './views/FinetuneView.vue'
 import ToolUsageView from './views/ToolUsageView.vue'
 import GraphRagView from './views/GraphRagView.vue'
 import ModelCompareView from './views/ModelCompareView.vue'
+import ModelBenchView from './views/ModelBenchView.vue'
 import MasteryDialog from './components/MasteryDialog.vue'
 
 const chatStore   = useChatStore()
@@ -83,6 +86,7 @@ const userId      = ref('')
 const currentView = ref(localStorage.getItem('currentView') || 'chat')
 const showMastery = ref(false)
 const chatViewRef = ref(null)
+const modelBenchPrefill = ref(null)
 const meta        = ref({ total: 0, companies: [], tags: [], positions: [], difficulties: [] })
 
 // 始终使用 chatStore 中的固定 session，若尚未初始化则生成一个稳定的 session
@@ -104,6 +108,7 @@ const navItems = [
   { key: 'tool_usage', icon: '🧰', label: '工具统计' },
   { key: 'graph_rag', icon: '🕸️', label: 'GraphRAG' },
   { key: 'model_compare', icon: '⚖️', label: '模型对比' },
+  { key: 'model_bench',   icon: '🔬', label: '推理评测' },
 ]
 
 const loadMeta = async () => {
@@ -179,6 +184,18 @@ const onQuickRecommend = (tags) => {
   )
 }
 
+const onRunModelBench = ({ question } = {}) => {
+  if (!question?.question_text) {
+    ElMessage.error('题目数据为空，无法进入推理评测')
+    return
+  }
+  modelBenchPrefill.value = {
+    question: { ...question },
+    ts: Date.now(),
+  }
+  currentView.value = 'model_bench'
+}
+
 onMounted(async () => {
   await loadConfig()
   await loadMeta()
@@ -229,12 +246,21 @@ body {
              padding: 2px 8px; border-radius: 20px; }
 .topbar-right { display: flex; align-items: center; gap: 12px; }
 .user-badge {
-  cursor: pointer; padding: 6px 14px; border-radius: 20px;
-  background: var(--primary-light); color: var(--primary);
-  font-size: 13px; font-weight: 500;
-  transition: background .2s;
+  cursor: pointer;
+  padding: 8px 16px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--primary-light) 0%, #e0e7ff 100%);
+  color: var(--primary);
+  font-size: 13px;
+  font-weight: 600;
+  border: 1px solid rgba(91, 110, 245, 0.25);
+  transition: background 0.2s, box-shadow 0.2s, transform 0.15s;
 }
-.user-badge:hover { background: #dde1fd; }
+.user-badge:hover {
+  background: #dde1fd;
+  box-shadow: 0 4px 12px rgba(91, 110, 245, 0.2);
+  transform: translateY(-1px);
+}
 
 /* 主体 */
 .main-layout { display: flex; flex: 1; min-height: 0; }
@@ -248,15 +274,32 @@ body {
   display: flex; flex-direction: column; gap: 2px;
 }
 .nav-item {
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 14px; cursor: pointer;
-  border-radius: 7px; margin: 0 6px;
-  font-size: 13px; color: var(--text-sub);
-  transition: all .15s;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  cursor: pointer;
+  border-radius: 10px;
+  margin: 0 8px;
+  font-size: 14px;
+  color: var(--text-sub);
+  font-weight: 500;
+  border: 1px solid transparent;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, box-shadow 0.15s;
 }
-.nav-item:hover { background: var(--primary-light); color: var(--primary); }
-.nav-item.active { background: var(--primary-light); color: var(--primary); font-weight: 600; }
-.nav-icon { font-size: 16px; }
+.nav-item:hover {
+  background: var(--primary-light);
+  color: var(--primary);
+  border-color: rgba(91, 110, 245, 0.15);
+}
+.nav-item.active {
+  background: linear-gradient(90deg, #eef0fe 0%, #e0e7ff 100%);
+  color: var(--primary);
+  font-weight: 700;
+  border-color: rgba(91, 110, 245, 0.35);
+  box-shadow: 0 2px 8px rgba(91, 110, 245, 0.12);
+}
+.nav-icon { font-size: 17px; line-height: 1; }
 
 /* 内容区 */
 .content { flex: 1; overflow-y: auto; padding: 10px 14px; min-height: 0; }

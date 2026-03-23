@@ -9,11 +9,11 @@
 | 层级 | 典型模块 | 说明 |
 |------|----------|------|
 | 任务执行 | `backend/services/crawler/task_executor.py` | 按钮/定时任务统一入口 `execute()` |
-| 单任务处理 | `backend/services/crawler/question_extractor.py` | 单帖 OCR、调用 Miner、入库、Stage2 入队等 |
-| ReAct / 两阶段 | `backend/agents/miner_react_agent.py`、`two_stage_miner_agent.py` | ReAct 循环与 Stage1/Stage2 编排 |
-| Agent 基类 | `backend/agents/miner_agent.py`（及 `miner_agent_v3.py` 等变体） | 工具注册与 ReAct 步进 |
+| 单任务处理 | `backend/services/crawler/question_extractor.py` | 单帖 OCR、调用 MinerAgent、解析 JSON、入库 |
+| ReAct 封装 | `backend/agents/miner_react_agent.py` | ReAct 循环（Thought / 工具 / Finish） |
+| Agent 实现 | `backend/agents/miner_agent.py` | 工具注册与 ReAct 步进（**当前唯一采集提取路径**） |
 
-下文以 **`backend/agents/miner_agent.py`** 中的 MinerAgent 为核心描述工具与行为；若你使用 `MINER_MODE=two_stage`，Stage2 富化在 `backend/services/stage2_processor.py` 与队列表 `stage2_pending` 上运行，详见进程与配置文档。
+下文以 **`backend/agents/miner_agent.py`** 中的 MinerAgent 为核心。历史「两阶段 + `stage2_pending` 队列」已移除；`MINER_MODE=two_stage` 在配置层会回退为与全局 `LLM_MODE` 一致的 local/remote 单阶段。
 
 ## 1. Agent 定位
 
@@ -106,12 +106,11 @@ flowchart TD
 - `crawl_tasks` 正文抓取后触发 Miner。
 - Miner 输出进入：
   - 题库入库流程（`questions`）
-  - 或 `stage2_pending` 队列（两阶段补充）
   - 或 `error/unrelated` 状态。
 
 ## 8. 与上层模块协作
 
-- 与 `task_executor/stage2_processor` 协作，形成批处理链路。
+- 与 `task_executor.execute("process_tasks")`、定时调度协作，形成队列批处理链路。
 - 与 `agent_tool_runtime_stats` 协作记录工具耗时。
 - 与 trace 系统协作，支持前端“提取过程回放”。
 

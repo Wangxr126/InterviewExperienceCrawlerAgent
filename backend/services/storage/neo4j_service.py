@@ -5,7 +5,7 @@ Neo4j 服务层 v2.0
 关系：HAS_TAG / FROM_COMPANY / FOR_POSITION / COVERS_CONCEPT / RELATED_TO / VARIANT_OF
 """
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from neo4j import GraphDatabase
 from backend.config.config import settings
 
@@ -134,6 +134,84 @@ class Neo4jService:
             logger.warning("Neo4j 按平台删除题目失败: %s", e)
             return 0
 
+    def delete_question_by_id(self, q_id: str) -> bool:
+        """按 q_id 删除单个 Question 节点及全部关联边。"""
+        if not self._check_available("delete_question_by_id"):
+            return False
+        if not q_id:
+            return False
+        query = """
+        MATCH (q:Question {id: $q_id})
+        DETACH DELETE q
+        """
+        try:
+            with self.driver.session(database=self.db_name) as session:
+                session.run(query, q_id=q_id)
+            logger.debug("[Graph] 删除: delete_question_by_id q_id=%s", q_id[:24])
+            return True
+        except Exception as e:
+            logger.warning("Neo4j delete_question_by_id %s: %s", q_id[:24], e)
+            return False
+
+    def update_question_text_property(self, q_id: str, text: str) -> bool:
+        """更新题目节点题干 q.text（不自动重算 embedding）。"""
+        if not self._check_available("update_question_text_property"):
+            return False
+        if not q_id:
+            return False
+        query = """
+        MATCH (q:Question {id: $q_id})
+        SET q.text = $text
+        RETURN q.id AS id
+        """
+        try:
+            with self.driver.session(database=self.db_name) as session:
+                rec = session.run(query, q_id=q_id, text=text or "").single()
+            ok = bool(rec and rec.get("id"))
+            if ok:
+                logger.debug("[Graph] 更新: update_question_text_property q_id=%s", q_id[:24])
+            return ok
+        except Exception as e:
+            logger.warning("Neo4j update_question_text_property %s: %s", q_id[:24], e)
+            return False
+
+    def sync_question_company(self, q_id: str, company: str) -> bool:
+        """设置 q.company，并重建 FROM_COMPANY（空则仅删边）。"""
+        if not self._check_available("sync_question_company"):
+            return False
+        if not q_id:
+            return False
+        co = (company or "").strip()
+        try:
+            with self.driver.session(database=self.db_name) as session:
+                session.run(
+                    "MATCH (q:Question {id: $q_id}) SET q.company = $co",
+                    q_id=q_id,
+                    co=co,
+                )
+                session.run(
+                    """
+                    MATCH (q:Question {id: $q_id})
+                    OPTIONAL MATCH (q)-[r:FROM_COMPANY]->()
+                    DELETE r
+                    """,
+                    q_id=q_id,
+                )
+                if co:
+                    session.run(
+                        """
+                        MATCH (q:Question {id: $q_id})
+                        MERGE (c:Company {name: $co})
+                        MERGE (q)-[:FROM_COMPANY]->(c)
+                        """,
+                        q_id=q_id,
+                        co=co,
+                    )
+            return True
+        except Exception as e:
+            logger.warning("Neo4j sync_question_company %s: %s", q_id[:24], e)
+            return False
+
     def add_question(self, q_id: str, text: str, answer: str,
                      tags: List[str], embedding: List[float],
                      metadata: Dict = None) -> bool:
@@ -146,7 +224,7 @@ class Neo4jService:
         meta = metadata or {}
         source = meta.get("source", "")
         difficulty = meta.get("difficulty", "medium")
-        question_type = meta.get("question_type", "技术题")
+        question_type = meta.get("question_type", "基础-其他")
         source_platform = meta.get("source_platform", "")
         company = meta.get("company", "")
         position = meta.get("position", "")
@@ -190,6 +268,94 @@ class Neo4jService:
                         source_platform=source_platform, source=source,
                         company=company, position=position)
         logger.info("[Graph] 保存: add_question 完成 q_id=%s", q_id)
+
+    def update_question_answer_fields(self, q_id: str, answer: str, raw_answer: str = "") -> bool:
+        """已存在 Question 节点时更新答案字段（Stage2 后同步）；不存在则跳过。"""
+        if not self._check_available("update_question_answer_fields"):
+            return False
+        if not q_id:
+            return False
+        query = """
+        MATCH (q:Question {id: $q_id})
+        SET q.answer = $answer,
+            q.raw_answer = $raw_answer
+        RETURN q.id AS id
+        """
+        try:
+            with self.driver.session(database=self.db_name) as session:
+                rec = session.run(
+                    query,
+                    q_id=q_id,
+                    answer=answer or "",
+                    raw_answer=raw_answer or "",
+                ).single()
+            ok = bool(rec and rec.get("id"))
+            if ok:
+                logger.debug("[Graph] 更新: update_question_answer_fields q_id=%s", q_id[:16])
+            return ok
+        except Exception as e:
+            logger.warning("Neo4j 更新题目答案失败 %s: %s", q_id[:16], e)
+            return False
+
+    def batch_sync_question_types(
+        self, pairs: List[Tuple[str, str]], batch_size: int = 500
+    ) -> Dict[str, int]:
+        """
+        将 SQLite 侧的 question_type 批量写回 Neo4j 的 Question 节点（按 id 对齐）。
+        图中不存在的 q_id 会被跳过；仅更新已存在的节点。
+        返回 {"batches": 批次数, "matched": 本 run 中 MATCH 到的节点总数}。
+        """
+        if not self._check_available("batch_sync_question_types"):
+            return {"batches": 0, "matched": 0}
+        if not pairs:
+            return {"batches": 0, "matched": 0}
+        query = """
+        UNWIND $rows AS row
+        MATCH (q:Question {id: row.id})
+        SET q.question_type = row.qt
+        RETURN count(q) AS c
+        """
+        total_matched = 0
+        batches = 0
+        for i in range(0, len(pairs), batch_size):
+            chunk = pairs[i : i + batch_size]
+            rows = [{"id": a, "qt": b} for a, b in chunk]
+            with self.driver.session(database=self.db_name) as session:
+                rec = session.run(query, rows=rows).single()
+                c = int(rec["c"]) if rec and rec["c"] is not None else 0
+                total_matched += c
+            batches += 1
+        logger.info(
+            "[Graph] batch_sync_question_types: batches=%s matched_nodes=%s (input_pairs=%s)",
+            batches,
+            total_matched,
+            len(pairs),
+        )
+        return {"batches": batches, "matched": total_matched}
+
+    def replace_question_tags(self, q_id: str, tags: List[str]) -> bool:
+        """
+        删除该题全部 HAS_TAG 后按新列表重建，使 Neo4j 与 SQLite 的 topic_tags 一致。
+        tags 为空则仅删除边，不创建新 Tag。
+        """
+        if not self._check_available("replace_question_tags"):
+            return False
+        del_q = """
+        MATCH (q:Question {id: $q_id})
+        OPTIONAL MATCH (q)-[r:HAS_TAG]->()
+        DELETE r
+        """
+        add_q = """
+        MATCH (q:Question {id: $q_id})
+        UNWIND $tags AS tag_name
+        MERGE (t:Tag {name: tag_name})
+        MERGE (q)-[:HAS_TAG]->(t)
+        """
+        with self.driver.session(database=self.db_name) as session:
+            session.run(del_q, q_id=q_id)
+            if tags:
+                session.run(add_q, q_id=q_id, tags=list(tags))
+        return True
 
     def link_concept(self, q_id: str, concept_name: str, description: str = ""):
         if not self._check_available("link_concept"):

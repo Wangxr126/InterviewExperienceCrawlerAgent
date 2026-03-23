@@ -79,8 +79,7 @@ python run.py
 ├────────────────────────────────────────────────────────────┤
 │  采集与提取链路                                             │
 │  · task_executor.execute() 统一按钮/定时入口               │
-│  · question_extractor / Miner（ReAct + OCR，可选 two_stage）│
-│  · stage2_processor：Stage2 富化队列（火山等，可进程/线程）   │
+│  · question_extractor / MinerAgent（单阶段 ReAct + OCR）    │
 │  · 可选 MCP：正文抓取、图片 OCR（见 .env CRAWLER_SOURCE 等） │
 └────────────────────────────┬───────────────────────────────┘
      ┌───────────────────────┼───────────────────────┐
@@ -287,10 +286,9 @@ wxr_agent/
 │   │   └── schemas/              # Miner JSON schema
 │   ├── services/
 │   │   ├── crawler/              # 牛客/小红书爬取、任务执行、OCR 适配
-│   │   ├── scheduling/           # APScheduler、子进程 worker（批量提取 / process_tasks / stage2）
+│   │   ├── scheduling/           # APScheduler、子进程 worker（批量提取 / process_tasks）
 │   │   ├── storage/              # SQLite、Neo4j、推理轨迹、会话存储
 │   │   ├── knowledge/            # 知识管理（KnowledgeManager）
-│   │   ├── stage2_processor.py # Stage2 队列消费
 │   │   ├── finetune/             # 微调样本与导入
 │   │   ├── warmup/               # LLM / Embedding / Rerank 预热
 │   │   └── ...                   # rerank、多路召回推荐等

@@ -57,6 +57,9 @@ loguru>=0.7.0
 # ── 环境配置 ─────────────────────────────────────────────────
 python-dotenv==1.2.1
 
+# ── 可选：题库乱码修复（cleanup_garbled_questions）更强编码纠正 ──
+# ftfy>=6.0.0
+
 # ── MCP 服务器（content-extractor 等）──────────────────────
 fastmcp>=2.0.0
 

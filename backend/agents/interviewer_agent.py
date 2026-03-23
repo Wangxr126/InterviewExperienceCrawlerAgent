@@ -22,6 +22,7 @@ from hello_agents.core.config import Config as HelloAgentsConfig
 from hello_agents.tools import ToolRegistry
 
 from backend.config.config import settings
+from backend.llm.chained_hello_llm import ChainedHelloAgentsLLM, build_interviewer_hello_llm_list
 from backend.tools.interviewer_tools import get_interviewer_tools, KnowledgeRecommender
 from backend.agents.prompts.interviewer_prompt import interviewer_prompt
 from backend.llm.deepseek_thinking_adapter import DeepSeekThinkingOpenAIAdapter
@@ -340,27 +341,44 @@ class InterviewerAgent(ReActAgent):
     def __init__(self, user_id: str = "default"):
         self.user_id = user_id
 
-        # ── LLM 配置 ──────────────────────────────────────────────
+        # ── LLM 配置：INTERVIEWER_REMOTE_FALLBACK_MODELS 多端点故障转移 ─
+        _llms = build_interviewer_hello_llm_list(settings)
         _model = settings.interviewer_model or settings.llm_model_id
-        llm = HelloAgentsLLM(
-            model=_model,
-            api_key=settings.interviewer_api_key or settings.llm_api_key,
-            base_url=settings.interviewer_base_url or settings.llm_base_url,
-            temperature=settings.interviewer_temperature,
-            timeout=settings.interviewer_timeout or settings.llm_timeout,
-        )
-
-        try:
-            if DeepSeekThinkingOpenAIAdapter(None, None, 1, "")._is_thinking_model(_model):
-                llm._adapter = DeepSeekThinkingOpenAIAdapter(
-                    api_key=llm.api_key,
-                    base_url=llm.base_url,
-                    timeout=llm.timeout,
-                    model=llm.model,
-                )
-                logger.info(f"[InterviewerAgent] 使用 DeepSeekThinkingOpenAIAdapter：{_model}")
-        except Exception as e:
-            logger.warning(f"[InterviewerAgent] DeepSeekThinkingOpenAIAdapter 初始化失败: {e}")
+        if not _llms:
+            llm = HelloAgentsLLM(
+                model=_model,
+                api_key=settings.interviewer_api_key or settings.llm_api_key,
+                base_url=settings.interviewer_base_url or settings.llm_base_url,
+                temperature=settings.interviewer_temperature,
+                timeout=settings.interviewer_timeout or settings.llm_timeout,
+            )
+        elif len(_llms) > 1:
+            for _h in _llms:
+                try:
+                    _mn = (_h.model or "").strip()
+                    if _mn and DeepSeekThinkingOpenAIAdapter(None, None, 1, "")._is_thinking_model(_mn):
+                        _h._adapter = DeepSeekThinkingOpenAIAdapter(
+                            api_key=_h.api_key,
+                            base_url=_h.base_url,
+                            timeout=_h.timeout,
+                            model=_h.model,
+                        )
+                except Exception as _e:
+                    logger.debug("[InterviewerAgent] DeepSeek adapter 跳过: %s", _e)
+            llm = ChainedHelloAgentsLLM(_llms, chain_name="interviewer")
+        else:
+            llm = _llms[0]
+            try:
+                if DeepSeekThinkingOpenAIAdapter(None, None, 1, "")._is_thinking_model(_model):
+                    llm._adapter = DeepSeekThinkingOpenAIAdapter(
+                        api_key=llm.api_key,
+                        base_url=llm.base_url,
+                        timeout=llm.timeout,
+                        model=llm.model,
+                    )
+                    logger.info(f"[InterviewerAgent] 使用 DeepSeekThinkingOpenAIAdapter：{_model}")
+            except Exception as e:
+                logger.warning(f"[InterviewerAgent] DeepSeekThinkingOpenAIAdapter 初始化失败: {e}")
 
         # ── 工具注册 ──────────────────────────────────────────────
         registry = ToolRegistry()
@@ -427,8 +445,9 @@ class InterviewerAgent(ReActAgent):
         # 懒加载 KnowledgeManager（避免循环导入）
         self._knowledge_manager = None
 
+        _ep_n = len(_llms) if _llms else 1
         logger.info(
-            f"[InterviewerAgent] 初始化完成 model={_model} "
+            f"[InterviewerAgent] 初始化完成 endpoints={_ep_n} model={_model} "
             f"base_url={settings.interviewer_base_url or settings.llm_base_url} "
             f"max_steps={max_steps} streamable={settings.interviewer_streamable}"
         )
@@ -702,12 +721,21 @@ class InterviewerAgent(ReActAgent):
         if pipeline_result.meta:
             meta_hint = f"[元信息提示] {json.dumps(pipeline_result.meta, ensure_ascii=False)}\n\n"
 
-        loop = asyncio.get_event_loop()
-        report = await loop.run_in_executor(
-            None,
-            self.knowledge_manager.run,
-            f"请处理以下文本并存入数据库:\n\n{meta_hint}{pipeline_result.text[:5000]}"
-        )
+        # 兼容两套 KnowledgeManager 接口：
+        # - 旧版：knowledge_manager.run(prompt)
+        # - 新版：仅保留 process_question，无 run（爬虫流程已完成题目入库）
+        km = self.knowledge_manager
+        if hasattr(km, "run") and callable(getattr(km, "run")):
+            loop = asyncio.get_event_loop()
+            report = await loop.run_in_executor(
+                None,
+                km.run,
+                f"请处理以下文本并存入数据库:\n\n{meta_hint}{pipeline_result.text[:5000]}"
+            )
+        else:
+            q_added = (pipeline_result.meta or {}).get("questions_added", 0)
+            t_id = (pipeline_result.meta or {}).get("task_id", "")
+            report = f"收录完成：task_id={t_id}，新增题目 {q_added} 道"
         if user_id:
             ocr_note = "（含OCR图片识别）" if pipeline_result.ocr_triggered else ""
             self._write_episodic(

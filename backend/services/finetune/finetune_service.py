@@ -564,22 +564,35 @@ def assist_generate(content: str, title: str = "", model: str = None, api_key: s
                     base_url: str = None, temperature: float = None) -> Dict:
     """
     调用远程大模型对面经原文生成高质量标注结果。
-    返回 {"output": "JSON字符串", "model": "..."}
+    返回 {"output": "JSON字符串", "model": "..."}；按 FINETUNE_REMOTE_FALLBACK_MODELS 依次切换端点。
     """
-    _model = model or settings.finetune_llm_model
-    _api_key = api_key or settings.finetune_llm_api_key
-    _base_url = base_url or settings.finetune_llm_base_url
     _temp = temperature if temperature is not None else settings.finetune_llm_temperature
-    to = float(settings.finetune_llm_timeout or 120)
-    return openai_miner_style_extract(
-        content=content,
-        title=title,
-        model=_model,
-        api_key=_api_key,
-        base_url=_base_url,
-        temperature=_temp,
-        timeout=to,
-    )
+    # 显式传入单端点时仍只调该端点（兼容旧调用）
+    if model and base_url:
+        return openai_miner_style_extract(
+            content=content,
+            title=title,
+            model=model,
+            api_key=api_key or settings.finetune_llm_api_key,
+            base_url=base_url,
+            temperature=_temp,
+            timeout=float(settings.finetune_llm_timeout or 120),
+        )
+    last_err: Optional[str] = None
+    for ep in settings.finetune_remote_models or []:
+        r = openai_miner_style_extract(
+            content=content,
+            title=title,
+            model=ep.get("model") or "",
+            api_key=ep.get("api_key"),
+            base_url=ep.get("base_url") or "",
+            temperature=_temp,
+            timeout=float(ep.get("timeout") or settings.finetune_llm_timeout or 120),
+        )
+        if r.get("output"):
+            return r
+        last_err = r.get("error")
+    return {"error": last_err or "assist_generate：未配置端点或全部失败", "model": "", "output": ""}
 
 
 def list_model_compare_presets() -> List[Dict]:

@@ -15,6 +15,8 @@ except Exception:
 # 须在 import unsloth 之前：降低 Windows 上 inductor/triton 相关问题
 os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# 避免 Unsloth 向 HF 拉取统计信息导致国内/镜像网络下 120s 超时（见 get_statistics）
+os.environ.setdefault("UNSLOTH_DISABLE_STATISTICS", "1")
 # 国内网络：拉取 HuggingFace 模型（可设 HF_ENDPOINT 覆盖）
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
@@ -33,7 +35,18 @@ def tlog(msg: str) -> None:
 
 # 路径相对本脚本目录，避免 Windows 下反斜杠转义导致路径错误
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_OUTPUT_SUBDIR = "qwen3-4b-miner-lora"
+_osub = os.environ.get("FINETUNE_OUTPUT_SUBDIR", "").strip()
+# 未指定时自动生成含参数信息的目录名，便于多次实验区分权重
+# 格式：qwen3-4b-miner_r{R}_seq{SEQ}_bs{BS}x{GA}_ep{EP}_lr{LR}
+def _auto_subdir() -> str:
+    _bs_v = int(os.environ.get("FINETUNE_BATCH_SIZE", "").strip() or 2)
+    _ga_v = int(os.environ.get("FINETUNE_GRAD_ACCUM", "").strip() or 8)
+    _seq_v = int(os.environ.get("FINETUNE_MAX_SEQ_LENGTH", "").strip() or 4096)
+    _lr_str = f"{0.0002:.0e}".replace("e+0", "e").replace("e-0", "e-")  # "2e-4"
+    _ld_v = float(os.environ.get("FINETUNE_LORA_DROPOUT", "").strip() or 0.0)
+    _drop = f"_do{_ld_v}" if _ld_v > 0 else ""
+    return f"qwen3-4b-miner_r16_seq{_seq_v}_bs{_bs_v}x{_ga_v}_ep3_lr{_lr_str}{_drop}"
+_OUTPUT_SUBDIR = _osub if _osub else _auto_subdir()
 OUTPUT_DIR = str(_SCRIPT_DIR / "lora_output" / _OUTPUT_SUBDIR)
 DATA_PATH = str(_SCRIPT_DIR / "training_data_alpaca.jsonl")
 
@@ -42,20 +55,36 @@ BASE_MODEL = "unsloth/Qwen3-4B"
 # 8GB 显存建议 True（QLoRA）；有足够显存可改 False
 LOAD_IN_4BIT = True
 # 长 JSON 面经数据：2048 会大量截断；8GB 本机建议先 4096，仍截断可试 8192 且 BATCH_SIZE=1
-MAX_SEQ_LENGTH = 4096
+_msl = os.environ.get("FINETUNE_MAX_SEQ_LENGTH", "").strip()
+MAX_SEQ_LENGTH = int(_msl) if _msl.isdigit() else 4096
 LORA_R = 16
 LORA_ALPHA = 32
-LORA_DROPOUT = 0.05
+_ld = os.environ.get("FINETUNE_LORA_DROPOUT", "").strip()
+LORA_DROPOUT = float(_ld) if _ld else 0.0  # Unsloth fast kernel 要求 dropout=0；若需正则化可设 FINETUNE_LORA_DROPOUT=0.05（会禁用快速内核）
 LEARNING_RATE = 0.0002
 NUM_EPOCHS = 3
 # 每卡 batch；显存不足可改为 1。有效 batch = BATCH_SIZE × GRAD_ACCUM × GPU 数（与显存、速度强相关）
-BATCH_SIZE = 2
-GRAD_ACCUM = 8
+_bs = os.environ.get("FINETUNE_BATCH_SIZE", "").strip()
+BATCH_SIZE = int(_bs) if _bs.isdigit() else 2
+_ga = os.environ.get("FINETUNE_GRAD_ACCUM", "").strip()
+GRAD_ACCUM = int(_ga) if _ga.isdigit() else 8
 WARMUP_RATIO = 0.1
 WEIGHT_DECAY = 0.01
 USE_RSLORA = True
-BF16 = True
-FP16 = False
+# 训练精度：V100 / 多数 Volta 卡不支持 bf16 训练，需 fp16；Ampere+ 可用 bf16。
+# 可显式覆盖：FINETUNE_BF16=1/0 或 FINETUNE_FP16=1/0（二选一即可）
+_bf = os.environ.get("FINETUNE_BF16", "").strip().lower()
+_fp = os.environ.get("FINETUNE_FP16", "").strip().lower()
+if _bf in ("1", "true", "yes"):
+    BF16, FP16 = True, False
+elif _bf in ("0", "false", "no"):
+    BF16, FP16 = False, True
+elif _fp in ("1", "true", "yes"):
+    BF16, FP16 = False, True
+elif _fp in ("0", "false", "no"):
+    BF16, FP16 = True, False
+else:
+    BF16, FP16 = True, False  # 占位；main() 里按 GPU 能力覆盖
 _DATASET_NUM_PROC = 0 if sys.platform == "win32" else 2
 _fin_ms = os.environ.get("FINETUNE_MAX_STEPS", "").strip()
 TRAIN_MAX_STEPS = int(_fin_ms) if _fin_ms.isdigit() else -1
@@ -72,10 +101,18 @@ else:
     REPORT_TO = "none"
 
 def main():
+    global BF16, FP16
     if not Path(DATA_PATH).is_file():
         raise SystemExit(f"数据文件不存在: {DATA_PATH}")
     if not torch.cuda.is_available():
         raise SystemExit("未检测到 CUDA：请安装 GPU 版 PyTorch（如 2.5.1+cu124）后再训练。")
+    # 未通过环境变量指定时，按 GPU 是否支持 bf16 训练自动选择（避免 V100 上报 bf16 校验失败）
+    if os.environ.get("FINETUNE_BF16", "").strip() == "" and os.environ.get("FINETUNE_FP16", "").strip() == "":
+        if torch.cuda.is_bf16_supported():
+            BF16, FP16 = True, False
+        else:
+            BF16, FP16 = False, True
+            tlog("当前 GPU 不支持 bf16 训练，已改用 fp16（与 QLoRA 常见配置一致）。")
     tlog("加载模型...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=BASE_MODEL,
@@ -224,11 +261,12 @@ def main():
             bf16=BF16,
             fp16=FP16,
             logging_steps=LOGGING_STEPS,
-            save_strategy="epoch",
+            save_strategy="no",   # 只保存最终权重，不存中间 checkpoint（含优化器状态会占数 GB）
             report_to=REPORT_TO,
             logging_dir=str(Path(OUTPUT_DIR) / "tensorboard")
             if REPORT_TO == "tensorboard"
             else None,
+            gradient_checkpointing=True,
             dataloader_pin_memory=False,
             max_steps=TRAIN_MAX_STEPS,
             disable_tqdm=False,

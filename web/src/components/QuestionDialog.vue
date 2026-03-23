@@ -34,7 +34,11 @@
           <div class="q-full-text">{{ question.question_text }}</div>
 
           <div v-if="showAnswer && standardAnswer" class="section">
-            <div class="section-title">📋 标准答案</div>
+            <div class="section-title">
+              📋 标准答案
+              <span v-if="question.raw_answer" class="answer-source-badge stage2">Stage2 精答</span>
+              <span v-else class="answer-source-badge stage1">Stage1 粗提取</span>
+            </div>
             <div class="ref-answer" v-html="formattedAnswerHtml"></div>
           </div>
 
@@ -118,6 +122,7 @@
           >
             🔗 查看原帖
           </el-button>
+          <el-button type="primary" plain @click.stop="handleRunModelBench">🔬 推理评测</el-button>
           <el-button type="info" @click.stop="handleSendToChat">💬 去对话练习</el-button>
           <el-button type="primary" :loading="submitting" @click="submit">提交作答</el-button>
         </div>
@@ -140,7 +145,7 @@ const props  = defineProps({
   sessionId: { type: String, default: '' },
   practiceProgress: { type: Object, default: null }, // { current, total } 如 { 1, 10 }
 })
-const emit   = defineEmits(['update:modelValue', 'send-to-chat', 'submit-complete', 'prev-question', 'next-question'])
+const emit   = defineEmits(['update:modelValue', 'send-to-chat', 'run-model-bench', 'submit-complete', 'prev-question', 'next-question'])
 const visible = computed({
   get: () => props.modelValue,
   set: (v) => emit('update:modelValue', v)
@@ -304,6 +309,17 @@ const handleSendToChat = () => {
     }, 500)
   }, 100)
 }
+
+const handleRunModelBench = () => {
+  if (!props.question?.question_text) {
+    ElMessage.warning('题目内容为空，无法发起推理评测')
+    return
+  }
+  visible.value = false
+  setTimeout(() => {
+    emit('run-model-bench', { question: props.question })
+  }, 100)
+}
 </script>
 
 <style scoped>
@@ -312,7 +328,14 @@ const handleSendToChat = () => {
                padding: 12px; background: var(--bg); border-radius: 8px; }
 .section { margin-bottom: 16px; }
 .section-title { font-size: 13px; font-weight: 600; color: var(--text-sub);
-                 margin-bottom: 8px; text-transform: uppercase; letter-spacing: .05em; }
+                 margin-bottom: 8px; text-transform: uppercase; letter-spacing: .05em;
+                 display: flex; align-items: center; gap: 8px; }
+.answer-source-badge {
+  font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 10px;
+  text-transform: none; letter-spacing: 0; vertical-align: middle;
+}
+.answer-source-badge.stage2 { background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe; }
+.answer-source-badge.stage1 { background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0; }
 .ref-answer { font-size: 14px; line-height: 1.6; color: var(--text-sub);
               padding: 10px 12px; background: var(--bg); border-radius: 8px; }
 .ref-answer :deep(p) { margin: 0 0 8px; }

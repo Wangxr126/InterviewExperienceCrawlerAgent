@@ -393,6 +393,13 @@ class FindSimilarQuestionsTool(Tool):
                                     candidates=vec_results,
                                     text_key="text",
                                     top_n=limit,
+                                    trace_slug="find_similar",
+                                    trace_meta={
+                                        "retrieval_search_top_k": search_top_k,
+                                        "retrieval_score_threshold": score_threshold,
+                                        "exclude_ids": exclude_ids,
+                                        "return_limit": limit,
+                                    },
                                 )
 
                                 # 打印重排后的结果顺序及分数，便于排查「为何这道题排在前面」

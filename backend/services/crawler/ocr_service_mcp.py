@@ -345,12 +345,15 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
         return t
 
     results = []
+    failed_detail: list[str] = []
     for idx, rel_path in enumerate(image_paths):
         if not rel_path or ".." in rel_path:
+            failed_detail.append(f"图片{idx + 1}: 非法路径 rel={rel_path!r}")
             continue
         full_path = post_images_dir / rel_path
         if not full_path.exists():
             logger.warning(f"[OCR] 跳过不存在的图片: {full_path}")
+            failed_detail.append(f"图片{idx + 1}: 文件不存在 {full_path}")
             continue
 
         text = None
@@ -377,10 +380,31 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
         if text and text.strip():
             results.append(f"[图片{idx + 1} OCR结果]\n{text.strip()}")
         else:
-            logger.warning(f"[OCR] 图片 {idx + 1} 重试 {max_retries} 次后仍未识别到有效文字: {rel_path}")
+            _sz = full_path.stat().st_size if full_path.exists() else -1
+            logger.warning(
+                f"[OCR] 图片 {idx + 1} 重试 {max_retries} 次后仍未识别到有效文字: {rel_path} (文件约 {_sz} bytes)"
+            )
+            failed_detail.append(
+                f"图片{idx + 1}: rel={rel_path} bytes={_sz} 无有效OCR文字"
+            )
 
     if not results:
+        logger.warning(
+            "[OCR] 本任务无可用 OCR 文本 | task=%s | 共 %d 张路径 | 明细: %s",
+            task_id,
+            len(image_paths),
+            "; ".join(failed_detail) if failed_detail else "(无明细)",
+        )
         return ""
+
+    if len(results) < len(image_paths):
+        logger.info(
+            "[OCR] 部分成功 %d/%d 张 | task=%s | 未出字明细: %s",
+            len(results),
+            len(image_paths),
+            task_id,
+            "; ".join(failed_detail) if failed_detail else "-",
+        )
 
     logger.info(f"[OCR] 完成，成功识别 {len(results)}/{len(image_paths)} 张")
     return "\n\n".join(results)

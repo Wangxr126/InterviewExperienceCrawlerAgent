@@ -80,12 +80,59 @@ function normalizeAnswerText(raw) {
     .replace(/\\n/g, '\n')
     .replace(/\\t/g, '  ')
 
+  // 把内联列表（全在一行的 "1. xxx；2. xxx"）展开为 Markdown 列表
+  // 仅当文本中没有真实换行时才做此处理，避免破坏已有多行格式
+  s = expandInlineList(s)
+
   // 兼容 LaTeX 的 \( ... \) / \[ ... \] 分隔符（部分模型常用），统一转换为 $...$ / $$...$$
   s = normalizeMathDelimiters(s)
 
   // 规整一下极端情况下的“全是空白”
   s = s.trim()
   return s
+}
+
+/**
+ * 把「全在一行的数字/中文编号列表」展开为真正的 Markdown 有序列表。
+ * 例如："步骤如下：1. 打开页面；2. 点击按钮；3. 提交。" 
+ * →  步骤如下：\n1. 打开页面\n2. 点击按钮\n3. 提交。
+ *
+ * 触发条件：文本中没有真实换行，且含有 "1." 或 "（1）" 或 "一、" 等编号模式，
+ * 且编号之间用 "；"、";"、" 或空格隔开。
+ */
+function expandInlineList(text) {
+  if (!text) return text
+  // 已有换行的文本不处理
+  if (text.includes('\n')) return text
+
+  // 模式1：阿拉伯数字列表 "1. xxx；2. xxx" 或 "1) xxx; 2) xxx"
+  // 用非 /g 正则检测，避免 lastIndex 污染
+  if (/[；;]\s*\d+[.)、]/.test(text) || /^\d+[.)、]/.test(text)) {
+    let result = text
+      // 把「；2.」「; 2.」等替换为换行+编号
+      .replace(/[；;]\s*(\d+)[.)、]\s*/g, '\n$1. ')
+      // 处理开头就是编号的情况（如「1. xxx」直接开头）
+      .replace(/^(\d+)[.)、]\s*/, '$1. ')
+    if (result.includes('\n')) return result
+  }
+
+  // 模式2：中文括号编号 "（1）xxx（2）xxx"
+  if (/（\d+）/.test(text)) {
+    return text.replace(/（(\d+)）\s*/g, (_, n) => (n === '1' ? `${n}. ` : `\n${n}. `))
+  }
+
+  // 模式3：中文序号 "一、xxx二、xxx"
+  const chineseNums = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十']
+  const chinesePattern = new RegExp(`([${chineseNums.join('')}]+)[、:]`, 'g')
+  if (chinesePattern.test(text)) {
+    let idx = 0
+    return text.replace(new RegExp(`([${chineseNums.join('')}]+)[、:]\\s*`, 'g'), (_, cn) => {
+      idx++
+      return (idx === 1 ? '' : '\n') + `**${cn}、** `
+    })
+  }
+
+  return text
 }
 
 function normalizeMathDelimiters(text) {

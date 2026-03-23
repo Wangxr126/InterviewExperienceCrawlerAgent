@@ -1,7 +1,7 @@
 <template>
   <el-dialog
     v-model="visible"
-    width="720px"
+    width="820px"
     align-center
     destroy-on-close
     :show-close="false"
@@ -26,6 +26,28 @@
       <div class="sp-wrapper">
         <!-- 可滚动内容区 -->
         <div class="sp-body">
+          <div
+            class="sp-reason-banner"
+            :class="smartReasonLine.variant === 'random' ? 'variant-random' : 'variant-recommend'"
+          >
+            <div class="sp-reason-head">
+              <span class="sp-reason-icon" aria-hidden="true">{{
+                smartReasonLine.variant === 'random' ? '🎲' : '🎯'
+              }}</span>
+              <span class="sp-reason-label">推荐理由</span>
+            </div>
+            <p class="sp-reason-text">{{ smartReasonLine.text }}</p>
+            <div v-if="smartReasonLine.tags.length" class="sp-weak-tags">
+              <span class="sp-weak-tags-label">关联薄弱标签</span>
+              <span
+                v-for="t in smartReasonLine.tags"
+                :key="t"
+                class="sp-weak-chip"
+                >{{ t }}</span
+              >
+            </div>
+          </div>
+
           <div class="sp-question-section">
             <div class="q-full-text">{{ question.question_text }}</div>
             <div class="meta-row">
@@ -83,8 +105,8 @@
             <el-input
               v-model="myAnswer"
               type="textarea"
-              :rows="5"
-              :autosize="{ minRows: 5, maxRows: 10 }"
+              :rows="4"
+              :autosize="{ minRows: 4, maxRows: 9 }"
               placeholder="输入你的回答..."
               class="answer-input"
             />
@@ -152,6 +174,7 @@
                 placement="top"
               >
                 <el-button
+                  size="large"
                   plain
                   :disabled="!standardAnswer"
                   @click="showAnswer = !showAnswer"
@@ -161,13 +184,22 @@
               </el-tooltip>
               <el-button
                 v-if="question?.source_url"
+                size="large"
                 plain
                 @click="openSourceUrl"
               >
                 查看原帖
               </el-button>
-              <el-button link type="primary" @click.stop="handleSendToChat">去对话练习</el-button>
-              <el-button type="primary" :loading="submitting" @click="submit">
+              <el-button
+                class="btn-chat-link"
+                link
+                type="primary"
+                size="large"
+                @click.stop="handleSendToChat"
+              >
+                去对话练习
+              </el-button>
+              <el-button type="primary" size="large" :loading="submitting" @click="submit">
                 提交作答
               </el-button>
             </div>
@@ -215,6 +247,24 @@ const visible = computed({
 const showSmartRankLine = computed(
   () => props.question?.smart_type === 'recommend'
 )
+
+/** 后端 smart_recommend_reason / smart_weak_tags；旧数据无字段时兜底文案 */
+const smartReasonLine = computed(() => {
+  const q = props.question
+  if (!q) {
+    return { text: '', tags: [], variant: 'recommend' }
+  }
+  const tags = Array.isArray(q.smart_weak_tags) ? q.smart_weak_tags.filter(Boolean) : []
+  let text = (q.smart_recommend_reason || '').trim()
+  if (!text) {
+    text =
+      q.smart_type === 'random'
+        ? '随机拓展练习，均衡覆盖面'
+        : '结合薄弱点与到期复习的知识点补强推荐'
+  }
+  const variant = q.smart_type === 'random' ? 'random' : 'recommend'
+  return { text, tags, variant }
+})
 
 const rerankScoreDisplay = computed(() =>
   formatRankScore(props.question?.rerank_score)
@@ -347,13 +397,13 @@ const handleNextClick = () => {
 
 <style scoped>
 .smart-practice-dialog :deep(.el-dialog) {
-  width: min(720px, 96vw) !important;
-  border-radius: var(--radius, 12px);
-  box-shadow: var(--shadow, 0 8px 32px rgba(0, 0, 0, 0.12));
+  width: min(820px, 96vw) !important;
+  border-radius: 14px;
+  box-shadow: 0 20px 50px rgba(79, 70, 229, 0.18), 0 8px 24px rgba(0, 0, 0, 0.08);
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  border: 1px solid var(--border, #e5e7eb);
+  border: 1px solid rgba(99, 102, 241, 0.35);
 }
 
 .smart-practice-dialog :deep(.el-overlay) {
@@ -362,7 +412,7 @@ const handleNextClick = () => {
 
 .smart-practice-dialog :deep(.el-dialog__header) {
   padding: 0;
-  border-bottom: 1px solid var(--border, #e5e7eb);
+  border-bottom: none;
   flex-shrink: 0;
 }
 
@@ -384,7 +434,8 @@ const handleNextClick = () => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  max-height: min(78vh, 820px);
+  max-height: min(82vh, 860px);
+  background: linear-gradient(180deg, #f8faff 0%, #ffffff 48px);
 }
 
 .sp-body {
@@ -392,23 +443,24 @@ const handleNextClick = () => {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 28px;
-  padding: 26px 28px 30px;
+  gap: 14px;
+  padding: 12px 16px 16px;
 }
 
 .sp-footer-fixed {
   flex-shrink: 0;
-  border-top: 1px solid var(--border, #e5e7eb);
-  background: var(--card-bg, #fff);
-  padding: 16px 24px 18px;
+  border-top: 1px solid rgba(99, 102, 241, 0.12);
+  background: linear-gradient(180deg, #fafbff 0%, #fff 100%);
+  padding: 12px 16px 14px;
 }
 
 .sp-header-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 18px 24px;
-  background: var(--card-bg, #fff);
+  padding: 12px 16px;
+  background: linear-gradient(115deg, #4f46e5 0%, #7c3aed 42%, #6366f1 100%);
+  color: #fff;
 }
 
 .sp-header-title {
@@ -418,32 +470,33 @@ const handleNextClick = () => {
 }
 
 .sp-title {
-  font-size: 17px;
+  font-size: 18px;
   font-weight: 700;
-  color: var(--text-main, #1a1a2e);
-  letter-spacing: 0.02em;
+  color: #fff;
+  letter-spacing: 0.03em;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
 }
 
 .sp-progress-badge {
   font-size: 12px;
   font-weight: 600;
-  color: var(--primary, #5b6ef5);
-  background: var(--primary-light, #eef0fe);
+  color: #312e81;
+  background: rgba(255, 255, 255, 0.92);
   padding: 4px 10px;
   border-radius: 999px;
-  border: 1px solid rgba(91, 110, 245, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.5);
   display: inline-block;
 }
 
 .sp-close-btn {
-  width: 32px;
-  height: 32px;
+  width: 36px;
+  height: 36px;
   border: none;
-  background: transparent;
-  font-size: 20px;
-  color: #9ca3af;
+  background: rgba(255, 255, 255, 0.15);
+  font-size: 22px;
+  color: #fff;
   cursor: pointer;
-  border-radius: 6px;
+  border-radius: 8px;
   transition: all 0.2s ease;
   display: flex;
   align-items: center;
@@ -454,24 +507,118 @@ const handleNextClick = () => {
 }
 
 .sp-close-btn:hover {
-  color: #ef4444;
-  background: #fee2e2;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.sp-reason-banner {
+  border-radius: 12px;
+  padding: 10px 12px 12px;
+  border: 1px solid transparent;
+}
+
+.sp-reason-banner.variant-recommend {
+  background: linear-gradient(135deg, #eef2ff 0%, #e0e7ff 55%, #f5f3ff 100%);
+  border-color: rgba(99, 102, 241, 0.35);
+}
+
+.sp-reason-banner.variant-random {
+  background: linear-gradient(135deg, #ecfeff 0%, #cffafe 50%, #f0fdfa 100%);
+  border-color: rgba(14, 165, 233, 0.35);
+}
+
+.sp-reason-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.sp-reason-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.sp-reason-label {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #4338ca;
+}
+
+.variant-random .sp-reason-label {
+  color: #0e7490;
+}
+
+.sp-reason-text {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.55;
+  font-weight: 600;
+  color: #1e1b4b;
+}
+
+.variant-random .sp-reason-text {
+  color: #134e4a;
+}
+
+.sp-weak-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(99, 102, 241, 0.25);
+}
+
+.variant-random .sp-weak-tags {
+  border-top-color: rgba(14, 165, 233, 0.25);
+}
+
+.sp-weak-tags-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #6366f1;
+  margin-right: 2px;
+}
+
+.variant-random .sp-weak-tags-label {
+  color: #0891b2;
+}
+
+.sp-weak-chip {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: #fff;
+  color: #4f46e5;
+  border: 1px solid rgba(99, 102, 241, 0.45);
+  box-shadow: 0 1px 2px rgba(79, 70, 229, 0.08);
+}
+
+.variant-random .sp-weak-chip {
+  color: #0e7490;
+  border-color: rgba(14, 165, 233, 0.45);
 }
 
 .sp-question-section {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 22px 22px 20px;
-  background: #fafbfc;
-  border: 1px solid var(--border, #e5e7eb);
-  border-radius: var(--radius, 12px);
+  gap: 10px;
+  padding: 12px 14px 12px;
+  background: #fff;
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(15, 23, 42, 0.04);
 }
 
 .q-full-text {
   font-size: 15px;
   font-weight: 600;
-  line-height: 1.72;
+  line-height: 1.65;
   color: var(--text-main, #1a1a2e);
 }
 
@@ -483,11 +630,11 @@ const handleNextClick = () => {
 }
 
 .sp-rank-line {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text-sub, #64748b);
-  line-height: 1.6;
-  padding-top: 12px;
-  margin-top: 4px;
+  line-height: 1.5;
+  padding-top: 8px;
+  margin-top: 2px;
   border-top: 1px dashed #e2e8f0;
   display: flex;
   flex-wrap: wrap;
@@ -527,11 +674,11 @@ const handleNextClick = () => {
 }
 
 .section-title {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
-  color: var(--text-sub, #6b7280);
+  color: #6366f1;
   letter-spacing: 0.02em;
-  margin-bottom: 2px;
+  margin-bottom: 0;
 }
 
 .ref-answer {
@@ -561,19 +708,19 @@ const handleNextClick = () => {
 .sp-input-section {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 8px;
 }
 
 .answer-input :deep(.el-textarea__inner) {
   font-size: 14px;
-  line-height: 1.65;
+  line-height: 1.6;
   border-radius: 10px;
-  border: 1px solid var(--border, #e5e7eb);
-  background: #fff;
+  border: 1px solid #c7d2fe;
+  background: #fafbff;
   transition: border-color 0.2s ease, box-shadow 0.2s ease;
-  min-height: 120px;
+  min-height: 100px;
   resize: vertical;
-  padding: 14px 16px;
+  padding: 10px 12px;
 }
 
 .answer-input :deep(.el-textarea__inner::placeholder) {
@@ -592,10 +739,10 @@ const handleNextClick = () => {
   align-items: center;
   flex-wrap: wrap;
   gap: 6px 10px;
-  padding: 12px 16px;
-  background: #f3f4f6;
+  padding: 8px 12px;
+  background: linear-gradient(90deg, #f5f3ff 0%, #faf5ff 100%);
   border-radius: 10px;
-  border: 1px solid var(--border, #e5e7eb);
+  border: 1px solid #e9d5ff;
 }
 
 .sp-score-strip.score-high {
@@ -745,15 +892,15 @@ const handleNextClick = () => {
 }
 
 .btn-nav {
-  width: 36px;
-  height: 36px;
-  border: 1.5px solid #d1d5db;
-  background: white;
-  color: #6b7280;
-  border-radius: 8px;
+  width: 44px;
+  height: 44px;
+  border: 2px solid #c7d2fe;
+  background: linear-gradient(180deg, #fff 0%, #f5f3ff 100%);
+  color: #4f46e5;
+  border-radius: 10px;
   cursor: pointer;
-  font-size: 18px;
-  font-weight: 600;
+  font-size: 22px;
+  font-weight: 700;
   transition: all 0.25s ease;
   display: flex;
   align-items: center;
@@ -774,16 +921,16 @@ const handleNextClick = () => {
 }
 
 .footer-progress {
-  font-size: 13px;
-  color: #6b7280;
-  font-weight: 600;
-  min-width: 50px;
+  font-size: 14px;
+  color: #4338ca;
+  font-weight: 700;
+  min-width: 56px;
   text-align: center;
 }
 
 .footer-buttons {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
   justify-content: flex-end;
   align-items: center;
@@ -791,16 +938,29 @@ const handleNextClick = () => {
 }
 
 .footer-buttons :deep(.el-button) {
-  border-radius: 8px;
+  border-radius: 10px;
   font-weight: 600;
-  font-size: 13px;
-  padding: 8px 16px;
+  font-size: 15px;
+  padding: 10px 18px;
   white-space: nowrap;
 }
 
 .footer-buttons :deep(.el-button--primary) {
-  padding-left: 18px;
-  padding-right: 18px;
+  padding-left: 22px;
+  padding-right: 22px;
+  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+  border: none;
+  box-shadow: 0 4px 14px rgba(79, 70, 229, 0.35);
+}
+
+.footer-buttons :deep(.el-button--primary:hover) {
+  background: linear-gradient(135deg, #4338ca 0%, #6d28d9 100%);
+}
+
+.btn-chat-link {
+  font-size: 15px !important;
+  font-weight: 600 !important;
+  padding: 8px 12px !important;
 }
 
 .sp-body::-webkit-scrollbar {
@@ -826,38 +986,41 @@ const handleNextClick = () => {
   }
 
   .sp-body {
-    padding: 16px;
-    gap: 12px;
+    padding: 10px 12px 12px;
+    gap: 10px;
   }
 
   .sp-footer-fixed {
-    padding: 12px 16px;
+    padding: 10px 12px;
   }
 
   .footer-row {
-    flex-direction: row;
-    align-items: center;
-    gap: 8px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
   }
 
   .footer-nav {
-    gap: 6px;
+    gap: 8px;
+    justify-content: center;
   }
 
   .btn-nav {
-    width: 32px;
-    height: 32px;
-    font-size: 16px;
+    width: 40px;
+    height: 40px;
+    font-size: 20px;
   }
 
   .footer-buttons {
     gap: 6px;
+    justify-content: center;
   }
 
   .footer-buttons :deep(.el-button) {
-    height: 32px;
-    padding: 0 10px;
-    font-size: 12px;
+    flex: 1;
+    min-width: 0;
+    font-size: 14px;
+    padding: 8px 12px;
   }
 }
 </style>

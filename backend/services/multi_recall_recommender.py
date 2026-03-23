@@ -153,6 +153,12 @@ class MultiRecallRecommender:
                     candidates=candidates,
                     text_key="question_text",
                     top_n=top_n,
+                    trace_slug="multi_recall",
+                    trace_meta={
+                        "top_n": top_n,
+                        "user_id": user_id,
+                        "exclude_count": len(exclude_ids),
+                    },
                 )
                 return _normalize_output(reranked)
             except Exception as e:
@@ -275,6 +281,12 @@ class MultiRecallRecommender:
                     candidates=knowledge_gap_candidates,
                     text_key="question_text",
                     top_n=kg_count,
+                    trace_slug="smart_practice",
+                    trace_meta={
+                        "kg_count": kg_count,
+                        "recall_k": recall_k,
+                        "user_id": user_id,
+                    },
                 )
             except Exception as e:
                 logger.warning("[SmartPractice] Rerank 失败，降级按分数取 top: %s", e)
@@ -288,6 +300,7 @@ class MultiRecallRecommender:
         # 标记智能练习类型：推荐题（知识点不足）
         for q in knowledge_gap_list:
             q.setdefault("smart_type", "recommend")
+            _attach_smart_practice_meta(q, effective_tags)
         chosen_ids = {q.get("q_id", "") for q in knowledge_gap_list if q.get("q_id")}
         chosen_ids |= seen_ids
         chosen_ids = {x for x in chosen_ids if x}
@@ -309,6 +322,7 @@ class MultiRecallRecommender:
             random_list = _normalize_output(extra)
             for q in random_list:
                 q.setdefault("smart_type", "random")
+                _attach_smart_practice_meta(q, effective_tags)
 
         result = knowledge_gap_list + random_list
         is_review_mode = any(
@@ -345,6 +359,34 @@ def _normalize_output(items: List[Dict]) -> List[Dict]:
                 o["topic_tags"] = []
         out.append(o)
     return out
+
+
+def _attach_smart_practice_meta(q: Dict[str, Any], effective_tags: List[str]) -> None:
+    """
+    为智能练习题目附加推荐理由与薄弱标签上下文，供前端展示「为何推荐本题」。
+    """
+    st = q.get("smart_type") or "recommend"
+    if st == "random":
+        q["smart_weak_tags"] = []
+        q["smart_recommend_reason"] = "随机拓展练习，均衡覆盖面"
+        return
+    sources = list(q.get("recall_sources") or [])
+    tags_clean = [t for t in (effective_tags or []) if t]
+    q["smart_weak_tags"] = tags_clean
+    parts: List[str] = []
+    if "vector" in sources:
+        if tags_clean:
+            shown = "、".join(tags_clean[:8])
+            parts.append(f"结合你的薄弱标签「{shown}」做的相似题召回")
+        else:
+            parts.append("向量语义相似召回（当前筛选条件）")
+    if "review" in sources:
+        parts.append("遗忘曲线到期，适合巩固复习")
+    if "popular" in sources and not parts:
+        parts.append("在当前筛选条件下的标签/热门补充")
+    if not parts:
+        parts.append("知识点补强推荐")
+    q["smart_recommend_reason"] = "；".join(parts)
 
 
 multi_recall_recommender = MultiRecallRecommender()

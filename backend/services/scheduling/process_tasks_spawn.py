@@ -2,7 +2,7 @@
 启动 process_tasks 子进程（定时任务、API 恢复、main 启动恢复共用）。
 
 与 main 解耦，避免 task_executor ↔ main 循环依赖。
-子进程 stderr 追加写入 process_tasks_worker.log，便于排查（stdout 仍丢弃）。
+子进程 stderr 追加写入 SUBPROCESS_LOG_DIR/process_tasks/ 下按时间戳命名的 .log（stdout 仍丢弃）。
 启动后会挂一个 daemon 线程 wait 子进程，结束时在主进程打一条「已结束 pid=… exit=…」日志（便于与仅打印「▶ 启动」对照）。
 """
 from __future__ import annotations
@@ -23,11 +23,9 @@ def _project_root() -> Path:
 
 
 def spawn_process_tasks_worker(batch_size: int, reason: str) -> subprocess.Popen:
-    from backend.config.config import settings
+    from backend.services.scheduling.subprocess_log_paths import new_subprocess_log_file
 
-    log_dir = Path(getattr(settings, "log_dir", "") or _project_root() / "backend" / "logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "process_tasks_worker.log"
+    log_path = new_subprocess_log_file("process_tasks")
     err_f = open(log_path, "a", encoding="utf-8", buffering=1)  # noqa: SIM115
 
     cmd = [

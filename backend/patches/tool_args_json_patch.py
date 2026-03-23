@@ -100,7 +100,7 @@ def apply_patch():
             "hello_agents.agents.simple_agent",
             "hello_agents.agents.reflection_agent",
             "hello_agents.agents.plan_solve_agent",
-            "backend.agents.two_stage_miner_agent",
+            "backend.agents.miner_agent",
         ):
             try:
                 import importlib

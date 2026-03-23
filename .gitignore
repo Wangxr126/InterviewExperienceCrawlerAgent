@@ -40,6 +40,7 @@ test_nowcoder_output/
 思路/
 # 微调流水线 LLM 日志（jsonl）
 微调/llm_logs/
+微调/adapter
 # ━━━ 前端构建与依赖 ━━━
 node_modules/
 frontend/dist/
@@ -102,6 +103,7 @@ HelloAgents-1.0.0/
 
 # ━━━ PAI-DSW 本机打包产物（可重复生成）━━━
 微调/dsw/finetune_dsw_bundle.zip
+微调/dsw/finetune_dsw_bundle_*.zip
 微调/dsw/_pack_staging/
 微调/.venv_finetune/
 

@@ -20,9 +20,6 @@ ActionType = Literal[
     "nowcoder_discovery",
     "xhs_discovery",
     "process_tasks",
-    "extract_pending",
-    "retry_errors",
-    "re_extract_all",
     "clean_data",
 ]
 TriggerSource = Literal["button", "scheduled"]
@@ -105,7 +102,7 @@ def execute(
                 "queue_stats": stats,
                 "message": (
                     f"已提交子进程处理队列（batch_size={_batch}），"
-                    f"详见日志目录下 process_tasks_worker.log"
+                    f"详见 SUBPROCESS_LOG_DIR/process_tasks/ 下按时间戳命名的 .log"
                 ),
                 "source_info": source_info,
             }
@@ -120,229 +117,12 @@ def execute(
             "source_info": source_info,
         }
 
-    if action == "extract_pending":
-        return _execute_extract_pending(_batch, source_info, trigger_source)
-
-    if action == "retry_errors":
-        return _execute_retry_errors(_batch, source_info, trigger_source)
-
-    if action == "re_extract_all":
-        return _execute_re_extract_all(_batch, source_info, trigger_source)
-
     if action == "clean_data":
         return _execute_clean_data(_batch, source_info)
 
     return {
         "status": "error",
         "message": f"未知 action: {action}",
-        "source_info": source_info,
-    }
-
-
-def prepare_extract_pending() -> tuple[int, Dict[str, int]]:
-    """查询待提取数量及按平台分布，供 API 异步启动前使用。返回 (pending_count, initial_by_platform)"""
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT COUNT(*) as c FROM crawl_tasks WHERE status='fetched'").fetchone()
-        pending = row["c"] if row else 0
-        if pending == 0:
-            return 0, {}
-        rows = conn.execute(
-            "SELECT source_platform, COUNT(*) as cnt FROM crawl_tasks WHERE status='fetched' GROUP BY source_platform"
-        ).fetchall()
-        initial = {r["source_platform"]: r["cnt"] for r in rows}
-    return pending, initial
-
-
-def get_fetched_task_ids(batch_size: int) -> list[str]:
-    """获取 fetched 状态的 task_id 列表（供子进程批量提取使用）"""
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT task_id FROM crawl_tasks WHERE status='fetched' LIMIT ?",
-            (batch_size,),
-        ).fetchall()
-        return [r["task_id"] for r in rows if r["task_id"]]
-
-
-def _execute_extract_pending(
-    batch_size: int, source_info: Dict[str, str], trigger_source: TriggerSource
-) -> Dict[str, Any]:
-    """仅提取 fetched 状态帖子（无 DB 变更，走 process_tasks 统一调度）"""
-    pending, _ = prepare_extract_pending()
-    if pending == 0:
-        return {
-            "status": "ok",
-            "message": "没有待提取的帖子（状态为 fetched 的记录为 0）",
-            "pending": 0,
-            "source_info": source_info,
-        }
-    r = execute(
-        "process_tasks",
-        trigger_source,
-        batch_size=batch_size,
-        force_inline_process_tasks=False,
-    )
-    return {
-        "status": "ok",
-        "message": r.get("message", ""),
-        "pending": pending,
-        "questions_added": r.get("questions_added", -1),
-        "queue_stats": r.get("queue_stats"),
-        "source_info": source_info,
-    }
-
-
-def prepare_retry_errors() -> tuple[int, int, int, Dict[str, int]]:
-    """
-    重试失败项：执行 DB 重置，返回 (to_extract, to_fetch, total, initial_by_platform)。
-    供 API 异步启动前使用；若 total>0，再调用 execute("process_tasks")。
-    """
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-        conn.execute("""
-            UPDATE crawl_tasks SET status='unrelated', error_msg='LLM 判断与面经无关'
-            WHERE status='error' AND (
-              error_msg LIKE '%正文无有效面试题%'
-              OR error_msg LIKE '%正文无面试题%'
-              OR error_msg LIKE '%LLM 判断与面经无关%'
-            )
-        """)
-        r1 = conn.execute("""
-            UPDATE crawl_tasks SET status='fetched', error_msg=NULL
-            WHERE status='error' AND (
-              raw_content IS NOT NULL
-              OR (image_paths IS NOT NULL AND image_paths != '[]')
-            )
-        """)
-        to_extract = r1.rowcount
-        r2 = conn.execute("""
-            UPDATE crawl_tasks SET status='pending', error_msg=NULL
-            WHERE status='error'
-            AND (raw_content IS NULL OR trim(raw_content) = '')
-            AND (image_paths IS NULL OR image_paths = '[]')
-        """)
-        to_fetch = r2.rowcount
-        conn.commit()
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT source_platform, COUNT(*) as cnt FROM crawl_tasks WHERE status='fetched' GROUP BY source_platform"
-        ).fetchall()
-        initial = {r["source_platform"]: r["cnt"] for r in rows} if rows else {}
-    return to_extract, to_fetch, to_extract + to_fetch, initial
-
-
-def _execute_retry_errors(
-    batch_size: int, source_info: Dict[str, str], trigger_source: TriggerSource
-) -> Dict[str, Any]:
-    """重试失败项：重置 error→fetched/pending，再触发 process_tasks"""
-    to_extract, to_fetch, total, _ = prepare_retry_errors()
-    if total == 0:
-        return {
-            "status": "ok",
-            "message": "没有可重试的帖子（error 记录为 0）",
-            "reset": 0,
-            "source_info": source_info,
-        }
-    r = execute(
-        "process_tasks",
-        trigger_source,
-        batch_size=batch_size,
-        force_inline_process_tasks=False,
-    )
-    stats = r.get("queue_stats") or sqlite_service.get_crawl_stats()
-    cnt = r.get("questions_added", -1)
-    msg_parts = []
-    if to_fetch:
-        msg_parts.append(f"{to_fetch} 条待重新抓取")
-    if to_extract:
-        msg_parts.append(f"{to_extract} 条待重新提取")
-    tail = (
-        r.get("message", "")
-        if cnt < 0
-        else f"入库 {cnt} 道题目"
-    )
-    return {
-        "status": "ok",
-        "message": "已重置 " + "、".join(msg_parts) + "；" + tail,
-        "reset": total,
-        "questions_added": cnt,
-        "queue_stats": stats,
-        "source_info": source_info,
-    }
-
-
-def prepare_re_extract_all() -> tuple[int, int, Dict[str, int]]:
-    """
-    重新提取所有：删除旧题目、将 done/error 重置为 fetched，返回 (reset_count, deleted_questions, initial_by_platform)。
-    供 API 异步启动前使用；若 reset>0，再调用 execute("process_tasks")。
-    """
-    _re_extract_cond = "status IN ('done','error') AND raw_content IS NOT NULL"
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            f"SELECT task_id, source_url FROM crawl_tasks WHERE {_re_extract_cond}"
-        ).fetchall()
-    if not rows:
-        return 0, 0, {}
-    urls = [r["source_url"] for r in rows]
-    deleted_questions = 0
-    try:
-        from backend.services.storage.neo4j_service import neo4j_service
-        for url in urls:
-            neo4j_service.delete_questions_by_source_url(url)
-    except Exception as e:
-        logger.warning("Neo4j 删除题目失败（SQLite 将照常删除）: %s", e)
-    with sqlite3.connect(sqlite_service.db_path) as conn:
-        for url in urls:
-            cur = conn.execute("DELETE FROM questions WHERE source_url=?", (url,))
-            deleted_questions += cur.rowcount
-        conn.execute(
-            f"""UPDATE crawl_tasks SET status='fetched', questions_count=0, error_msg=NULL,
-                extraction_source=NULL, extract_duration_min=NULL
-            WHERE {_re_extract_cond} AND source_url IN (""" + ",".join("?" * len(urls)) + ")",
-            urls,
-        )
-        conn.commit()
-        conn.row_factory = sqlite3.Row
-        rows2 = conn.execute(
-            "SELECT source_platform, COUNT(*) as cnt FROM crawl_tasks WHERE status='fetched' GROUP BY source_platform"
-        ).fetchall()
-        initial = {r["source_platform"]: r["cnt"] for r in rows2} if rows2 else {}
-    return len(rows), deleted_questions, initial
-
-
-def _execute_re_extract_all(
-    batch_size: int, source_info: Dict[str, str], trigger_source: TriggerSource
-) -> Dict[str, Any]:
-    """重新提取所有：删除旧题目、将 done/error 重置为 fetched，再触发 process_tasks"""
-    reset_count, deleted_questions, _ = prepare_re_extract_all()
-    if reset_count == 0:
-        return {
-            "status": "ok",
-            "message": "没有可重新提取的帖子",
-            "reset": 0,
-            "source_info": source_info,
-        }
-    r = execute(
-        "process_tasks",
-        trigger_source,
-        batch_size=batch_size,
-        force_inline_process_tasks=False,
-    )
-    cnt = r.get("questions_added", -1)
-    stats = r.get("queue_stats") or sqlite_service.get_crawl_stats()
-    tail = (
-        r.get("message", "")
-        if cnt < 0
-        else f"重新提取完成，入库 {cnt} 道题目"
-    )
-    return {
-        "status": "ok",
-        "message": f"已重置 {reset_count} 条（删除 {deleted_questions} 道旧题），{tail}",
-        "reset": reset_count,
-        "questions_deleted": deleted_questions,
-        "questions_added": cnt,
-        "queue_stats": stats,
         "source_info": source_info,
     }
 

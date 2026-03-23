@@ -337,6 +337,9 @@ class SqliteService:
             # 迁移：为 crawl_tasks 添加 trace_session_id（Miner Agent 推理 trace 的 session_id，用于链接查看）
             if "trace_session_id" not in cols:
                 conn.execute("ALTER TABLE crawl_tasks ADD COLUMN trace_session_id TEXT")
+            # 迁移：为 crawl_tasks 添加 stage2_trace_session_id（Stage2 精答 trace 的 session_id）
+            if "stage2_trace_session_id" not in cols:
+                conn.execute("ALTER TABLE crawl_tasks ADD COLUMN stage2_trace_session_id TEXT")
             # 迁移：为 crawl_tasks 添加 post_time（帖子发表时间，替代发现时间展示）
             if "post_time" not in cols:
                 conn.execute("ALTER TABLE crawl_tasks ADD COLUMN post_time TEXT")
@@ -390,6 +393,22 @@ class SqliteService:
                 conn.execute("ALTER TABLE stage2_pending ADD COLUMN attempts INTEGER DEFAULT 0")
             if "last_error" not in stage2_cols:
                 conn.execute("ALTER TABLE stage2_pending ADD COLUMN last_error TEXT DEFAULT ''")
+            # 弃用两阶段：遗留 stage2_pending 状态回到待提取，并清空 stage2 队列表
+            try:
+                r = conn.execute(
+                    "UPDATE crawl_tasks SET status='fetched' WHERE status='stage2_pending'"
+                )
+                if r.rowcount:
+                    logger.info(
+                        "迁移：已将 %s 条 crawl_tasks.stage2_pending → fetched（单阶段重新提取）",
+                        r.rowcount,
+                    )
+            except Exception as _e:
+                logger.debug("stage2_pending 状态迁移跳过: %s", _e)
+            try:
+                conn.execute("DELETE FROM stage2_pending")
+            except Exception:
+                pass
             conn.commit()
         logger.info("✅ SQLite 所有表初始化完成")
         self._seed_knowledge_resources()
@@ -511,26 +530,65 @@ class SqliteService:
                          tags: List[str] = None, source_platform: str = None,
                          date_from: str = None, date_to: str = None,
                          keyword: str = None, limit: int = 20, offset: int = 0,
-                         sort_by: str = "created_at", sort_order: str = "desc") -> List[Dict]:
+                         sort_by: str = "created_at", sort_order: str = "desc",
+                         user_id: str = None) -> List[Dict]:
         """
         纯 SQL 过滤题目，不需要 LLM。支持按公司/岗位/难度/标签/时间/关键词过滤，支持分页和排序。
+        sort_by=next_review_at 时需传入 user_id：按该用户对每题最近一次作答的 next_review_at 排序，
+        无作答记录的题目排在有日期题目之后（SQLite 下用 IS NULL 排序实现）。
         """
-        _ALLOWED_SORT_COLS = {"created_at", "difficulty", "company", "question_type", "question_text"}
-        _col = sort_by if sort_by in _ALLOWED_SORT_COLS else "created_at"
+        _ALLOWED_SORT_COLS = {
+            "created_at", "difficulty", "company", "question_type", "question_text",
+            "next_review_at",
+        }
         _order = "ASC" if sort_order and sort_order.lower() == "asc" else "DESC"
+        use_review_sort = (
+            sort_by == "next_review_at"
+            and user_id
+            and str(user_id).strip()
+        )
+        if sort_by not in _ALLOWED_SORT_COLS or (sort_by == "next_review_at" and not use_review_sort):
+            _col = "created_at"
+            use_review_sort = False
+        else:
+            _col = sort_by if not use_review_sort else None
 
         where_clause, params = self._build_question_conditions(
             company=company, position=position, difficulty=difficulty,
             question_type=question_type, tags=tags, source_platform=source_platform,
             date_from=date_from, date_to=date_to, keyword=keyword
         )
-        params.extend([limit, offset])
 
         with self._get_conn() as conn:
-            cursor = conn.execute(
-                f"SELECT * FROM questions WHERE {where_clause} ORDER BY {_col} {_order} LIMIT ? OFFSET ?",
-                params
-            )
+            if use_review_sort:
+                uid = str(user_id).strip()
+                # rev.next_review_at：用户对该题最新一条 study_records 的复习时间
+                sql = f"""
+                    SELECT q.*
+                    FROM questions q
+                    LEFT JOIN (
+                        SELECT sr.question_id, sr.next_review_at
+                        FROM study_records sr
+                        INNER JOIN (
+                            SELECT question_id, MAX(studied_at) AS max_at
+                            FROM study_records
+                            WHERE user_id = ?
+                            GROUP BY question_id
+                        ) t ON sr.question_id = t.question_id AND sr.studied_at = t.max_at
+                        WHERE sr.user_id = ?
+                    ) rev ON q.q_id = rev.question_id
+                    WHERE {where_clause}
+                    ORDER BY (rev.next_review_at IS NULL) ASC, rev.next_review_at {_order}
+                    LIMIT ? OFFSET ?
+                """
+                qparams = [uid, uid] + list(params) + [limit, offset]
+                cursor = conn.execute(sql, qparams)
+            else:
+                qparams = list(params) + [limit, offset]
+                cursor = conn.execute(
+                    f"SELECT * FROM questions WHERE {where_clause} ORDER BY {_col} {_order} LIMIT ? OFFSET ?",
+                    qparams,
+                )
             return [dict(row) for row in cursor.fetchall()]
 
     def get_question_by_id(self, q_id: str) -> Optional[Dict]:
@@ -548,6 +606,51 @@ class SqliteService:
                 (source_url,)
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def ensure_raw_answer_backup_for_source_url(self, source_url: str) -> int:
+        """Stage2 前备份：raw_answer 为空时用当前 answer_text 作为粗答（Stage1）。"""
+        if not source_url:
+            return 0
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE questions
+                SET raw_answer = answer_text
+                WHERE source_url = ?
+                  AND (raw_answer IS NULL OR TRIM(raw_answer) = '')
+                  AND (answer_text IS NOT NULL AND TRIM(answer_text) != '')
+                """,
+                (source_url,),
+            )
+            conn.commit()
+            return cur.rowcount or 0
+
+    def apply_stage2_to_question(self, q_id: str, answer_text: str, raw_answer: str) -> bool:
+        """用 Stage2 合并结果更新单题（answer_text / raw_answer）。"""
+        if not q_id:
+            return False
+        ra = raw_answer if (raw_answer or "").strip() else None
+        with self._get_conn() as conn:
+            if ra is not None:
+                cur = conn.execute(
+                    """
+                    UPDATE questions
+                    SET answer_text = ?, raw_answer = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE q_id = ?
+                    """,
+                    (answer_text or "", ra, q_id),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE questions
+                    SET answer_text = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE q_id = ?
+                    """,
+                    (answer_text or "", q_id),
+                )
+            conn.commit()
+            return (cur.rowcount or 0) > 0
 
     def filter_questions_random_exclude(
         self,
@@ -1719,12 +1822,14 @@ class SqliteService:
                            extraction_source: str = "", agent_used_tool: Optional[bool] = None,
                            extract_duration_min: Optional[float] = None,
                            trace_session_id: Optional[str] = None,
+                           stage2_trace_session_id: Optional[str] = None,
                            clear_extract_duration: bool = False):
         """更新任务状态。raw_content/image_paths 为 None 时不更新该列（保留原文），避免误覆盖。
         extraction_source: content=正文提取, image=图片OCR提取（帖子维度）
         agent_used_tool: MinerAgent 是否进行了工具调用（True/False/None=不更新）
         extract_duration_min: LLM 提取耗时（分钟，含两阶段总时间），None=不更新
         trace_session_id: Miner Agent 推理 trace 的 session_id，用于链接查看 HTML
+        stage2_trace_session_id: Stage2 精答 trace 的 session_id，用于链接查看 HTML
         clear_extract_duration: 为 True 时清空 extract_duration_min（重置待提取时用）"""
         import json as _json
         sets = ["status=?", "questions_count=?", "error_msg=?", "extraction_source=?", "processed_at=CURRENT_TIMESTAMP"]
@@ -1732,6 +1837,9 @@ class SqliteService:
         if trace_session_id is not None:
             sets.append("trace_session_id=?")
             params.append(trace_session_id or None)
+        if stage2_trace_session_id is not None:
+            sets.append("stage2_trace_session_id=?")
+            params.append(stage2_trace_session_id or None)
         if raw_content is not None:
             sets.append("raw_content=?")
             params.append(raw_content or "")
