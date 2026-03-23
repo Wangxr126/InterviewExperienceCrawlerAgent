@@ -1330,7 +1330,7 @@ def import_faq(
     返回 {"parsed": N, "bank_saved": N, "finetune_saved": N, "errors": [...]}
     """
     from backend.services.storage.sqlite_service import sqlite_service
-    from backend.tools.knowledge_manager_tools import generate_embedding
+    from backend.services.knowledge.knowledge_tools import generate_embedding
 
     rows, err = parse_faq_file(content, filename)
     if err:

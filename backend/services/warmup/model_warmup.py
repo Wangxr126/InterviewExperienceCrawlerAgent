@@ -157,7 +157,7 @@ def _warmup_reranker_model(base_url: str, model: str, timeout: int) -> bool:
 def _rerank_embedding_fallback_ok(timeout: int) -> bool:
     """Ollama 无 /api/rerank 时，用当前配置的 Embedding 探测是否可做余弦重排。"""
     try:
-        from backend.tools.knowledge_manager_tools import generate_embedding
+        from backend.services.knowledge.knowledge_tools import generate_embedding
     except ImportError:
         return False
     try:

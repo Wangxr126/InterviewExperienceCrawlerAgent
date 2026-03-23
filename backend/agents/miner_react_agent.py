@@ -181,17 +181,28 @@ class MinerReActAgent(ReActAgent):
                             success=tool_execution_success_for_stats(result_content),
                             execution_time_ms=(time.time() - _t0) * 1000.0,
                             user_id=get_current_user_id(),
+                            params_input=arguments if isinstance(arguments, dict) else {},
                         )
                         print(f"🔧 {tool_name}: {result_content}")
                     else:
-                        _t0 = time.time()
-                        result_content = self._execute_tool_call(tool_name, arguments)
+                        tool = self.tool_registry.get_tool(tool_name)
+                        if not tool:
+                            result_content = f"❌ 工具 {tool_name} 不存在"
+                            _time_ms = 0.0
+                            _status = None
+                        else:
+                            tool_response = tool.run_with_timing(arguments)
+                            result_content = tool_response.text
+                            _status = getattr(tool_response, "status", None)
+                            _stats = getattr(tool_response, "stats", None)
+                            _time_ms = float(_stats.get("time_ms")) if isinstance(_stats, dict) and _stats.get("time_ms") is not None else 0.0
                         agent_tool_runtime_stats.record(
                             agent_name=self.name,
                             tool_name=tool_name,
-                            success=tool_execution_success_for_stats(result_content),
-                            execution_time_ms=(time.time() - _t0) * 1000.0,
+                            success=tool_execution_success_for_stats(result_content, response_status=_status),
+                            execution_time_ms=_time_ms,
                             user_id=get_current_user_id(),
+                            params_input=arguments if isinstance(arguments, dict) else {},
                         )
                         if not result_content.startswith("❌"):
                             print(f"👀 观察: {result_content}")
@@ -280,6 +291,7 @@ class MinerReActAgent(ReActAgent):
                         success=False,
                         execution_time_ms=0.0,
                         user_id=get_current_user_id(),
+                        params_input={},
                     )
                     messages.append({
                         "role": "tool",
@@ -311,6 +323,7 @@ class MinerReActAgent(ReActAgent):
                         ),
                         execution_time_ms=(time.time() - _t0) * 1000.0,
                         user_id=get_current_user_id(),
+                        params_input=arguments if isinstance(arguments, dict) else {},
                     )
 
                     if self.trace_logger:
@@ -355,14 +368,24 @@ class MinerReActAgent(ReActAgent):
                 else:
                     print(f"🎬 调用工具: {tool_name}({arguments})")
 
-                    _t0 = time.time()
-                    result = self._execute_tool_call(tool_name, arguments)
+                    tool = self.tool_registry.get_tool(tool_name)
+                    if not tool:
+                        result = f"❌ 工具 {tool_name} 不存在"
+                        _status = None
+                        _time_ms = 0.0
+                    else:
+                        tool_response = tool.run_with_timing(arguments)
+                        result = tool_response.text
+                        _status = getattr(tool_response, "status", None)
+                        _stats = getattr(tool_response, "stats", None)
+                        _time_ms = float(_stats.get("time_ms")) if isinstance(_stats, dict) and _stats.get("time_ms") is not None else 0.0
                     agent_tool_runtime_stats.record(
                         agent_name=self.name,
                         tool_name=tool_name,
-                        success=tool_execution_success_for_stats(str(result)),
-                        execution_time_ms=(time.time() - _t0) * 1000.0,
+                        success=tool_execution_success_for_stats(str(result), response_status=_status),
+                        execution_time_ms=_time_ms,
                         user_id=get_current_user_id(),
+                        params_input=arguments if isinstance(arguments, dict) else {},
                     )
 
                     if self.trace_logger:

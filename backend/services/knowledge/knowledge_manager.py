@@ -8,7 +8,7 @@ Knowledge Manager 服务
 """
 import logging
 from backend.config.config import settings
-from backend.tools.knowledge_manager_tools import (
+from backend.services.knowledge.knowledge_tools import (
     MetaExtractor,
     KnowledgeStructurer,
     DuplicateChecker,

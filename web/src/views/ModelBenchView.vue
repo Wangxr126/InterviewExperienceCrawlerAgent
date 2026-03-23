@@ -2,10 +2,10 @@
   <div class="mb-wrap">
     <!-- ── Hero ── -->
     <header class="mb-hero">
-      <div class="mb-badge">🔬 实时推理对比</div>
-      <h1 class="mb-title">多模型并行评测</h1>
+      <div class="mb-badge">🔬 URL 维度对比</div>
+      <h1 class="mb-title">训练模型并行对比</h1>
       <p class="mb-lead">
-        从题库选题后，点击 <strong>运行对比</strong>，在原始模型与三组微调权重上
+        基于同一篇帖子（URL）正文，在原始模型与不同微调权重上
         <strong>并行推理</strong>，逐 token 流式展示四列回答。
       </p>
     </header>
@@ -40,14 +40,14 @@
 
     <!-- ── 两列布局：左侧选题 / 右侧配置 ── -->
     <div class="mb-config-grid">
-      <!-- 左：题库选题 -->
+      <!-- 左：帖子（URL）选择 -->
       <section class="mb-panel mb-panel-questions">
-        <div class="mb-section-title"><span>📚</span><span>题库选题</span></div>
+        <div class="mb-section-title"><span>🔗</span><span>帖子选择（URL 维度）</span></div>
 
         <div class="mb-q-toolbar">
           <el-input
             v-model="qSearch"
-            placeholder="搜索关键词…"
+            placeholder="搜索帖子标题…"
             clearable
             class="mb-q-search"
             @input="debounceSearch"
@@ -55,11 +55,11 @@
           <el-select
             v-model="qType"
             clearable
-            placeholder="题目类型"
+            placeholder="平台"
             class="mb-q-type"
             @change="loadQs"
           >
-            <el-option v-for="t in qTypes" :key="t" :label="t" :value="t" />
+            <el-option v-for="t in qTypes" :key="t.value" :label="t.label" :value="t.value" />
           </el-select>
           <el-button :icon="Refresh" circle :loading="loadingQs" @click="loadQs" />
         </div>
@@ -67,19 +67,23 @@
         <div class="mb-q-list" v-loading="loadingQs">
           <div
             v-for="q in questions"
-            :key="q.q_id"
+            :key="q.task_id"
             class="mb-q-item"
-            :class="{ selected: selectedQ?.q_id === q.q_id }"
+            :class="{ selected: selectedQ?.task_id === q.task_id }"
             @click="selectQ(q)"
           >
-            <div class="mb-q-text">{{ q.question_text }}</div>
+            <div class="mb-q-text">{{ q.post_title || q.source_url }}</div>
             <div class="mb-q-meta">
-              <el-tag size="small" type="info" effect="plain">{{ q.question_type || '未分类' }}</el-tag>
-              <el-tag v-if="q.difficulty" size="small" :type="diffColor(q.difficulty)" effect="light">{{ q.difficulty }}</el-tag>
-              <el-tag v-if="q.company" size="small" effect="plain">{{ q.company }}</el-tag>
+              <el-tag size="small" type="info" effect="plain">
+                {{ q.source_platform === 'xiaohongshu' ? '小红书' : '牛客' }}
+              </el-tag>
+              <el-tag v-if="q.questions_count" size="small" type="success" effect="light">
+                {{ q.questions_count }} 题
+              </el-tag>
+              <el-tag v-if="q.source_url" size="small" effect="plain">URL</el-tag>
             </div>
           </div>
-          <div v-if="!loadingQs && !questions.length" class="mb-q-empty">暂无题目，调整搜索条件后重试</div>
+          <div v-if="!loadingQs && !questions.length" class="mb-q-empty">暂无帖子，调整筛选后重试</div>
         </div>
 
         <el-pagination
@@ -96,14 +100,14 @@
 
       <!-- 右：手动输入 + 模型槽位 + 运行 -->
       <div class="mb-right-col">
-        <!-- 手动输入 -->
+        <!-- 输入预览（可编辑） -->
         <section class="mb-panel">
-          <div class="mb-section-title"><span>✏️</span><span>或手动输入题目</span></div>
+          <div class="mb-section-title"><span>✏️</span><span>帖子正文输入（可编辑）</span></div>
           <el-input
             v-model="customQ"
             type="textarea"
             :rows="3"
-            placeholder="直接输入任意题目文本…"
+            placeholder="选择帖子后会自动填充正文；也可手工编辑"
           />
         </section>
 
@@ -139,11 +143,11 @@
           </div>
         </section>
 
-        <!-- 当前题目 + 运行 -->
+        <!-- 当前帖子 + 运行 -->
         <section class="mb-panel mb-run-panel">
           <div class="mb-current-q">
-            <span class="mb-q-label">当前题目</span>
-            <span class="mb-q-preview" :class="{ placeholder: !activeQ }">{{ activeQ || '（未选择题目）' }}</span>
+            <span class="mb-q-label">当前输入</span>
+            <span class="mb-q-preview" :class="{ placeholder: !activeQ }">{{ activeQ || '（未选择帖子）' }}</span>
           </div>
           <div class="mb-run-actions">
             <el-button
@@ -257,7 +261,10 @@ const qPageSize  = ref(12)
 const loadingQs  = ref(false)
 const qSearch    = ref('')
 const qType      = ref('')
-const qTypes     = ref([])
+const qTypes     = ref([
+  { label: '牛客', value: 'nowcoder' },
+  { label: '小红书', value: 'xiaohongshu' },
+])
 const selectedQ  = ref(null)
 const customQ    = ref('')
 
@@ -271,35 +278,39 @@ const loadQs = async () => {
   loadingQs.value = true
   try {
     const p = new URLSearchParams()
-    p.set('page', qPage.value)
-    p.set('page_size', qPageSize.value)
-    if (qSearch.value.trim()) p.set('keyword', qSearch.value.trim())
-    if (qType.value) p.set('question_type', qType.value)
-    const r = await fetch(`/api/questions?${p}`)
+    p.set('status', 'done')
+    p.set('limit', String(qPageSize.value))
+    p.set('offset', String((qPage.value - 1) * qPageSize.value))
+    if (qSearch.value.trim()) p.set('title', qSearch.value.trim())
+    if (qType.value) p.set('platform', qType.value)
+    const r = await fetch(`/api/crawler/tasks?${p}`)
     const data = await r.json()
-    questions.value = data.items || data.questions || []
+    questions.value = data.tasks || []
     qTotal.value = data.total || 0
   } catch (e) {
-    ElMessage.error('加载题目失败：' + e.message)
+    ElMessage.error('加载帖子失败：' + e.message)
   } finally {
     loadingQs.value = false
   }
 }
 
-const loadMeta = async () => {
-  try {
-    const r = await fetch('/api/questions/meta')
-    const d = await r.json()
-    qTypes.value = d.question_types || []
-  } catch { /* ignore */ }
-}
-
 const selectQ = (q) => {
   selectedQ.value = q
-  customQ.value = ''
+  customQ.value = `【帖子标题】\n${q.post_title || '（无）'}\n\n【帖子URL】\n${q.source_url || '（无）'}\n\n【帖子正文】\n加载中...`
+  fetch(`/api/crawler/tasks/${encodeURIComponent(q.task_id)}`)
+    .then(res => res.ok ? res.json() : null)
+    .then(task => {
+      const prompt = buildPostPrompt(task)
+      if (selectedQ.value?.task_id === q.task_id) {
+        customQ.value = prompt || `【帖子标题】\n${q.post_title || '（无）'}\n\n【帖子URL】\n${q.source_url || '（无）'}`
+      }
+    })
+    .catch(() => {
+      if (selectedQ.value?.task_id === q.task_id) {
+        customQ.value = `【帖子标题】\n${q.post_title || '（无）'}\n\n【帖子URL】\n${q.source_url || '（无）'}`
+      }
+    })
 }
-
-const diffColor = (d) => ({ easy: 'success', medium: 'warning', hard: 'danger' }[d] || 'info')
 
 // ── 模型槽位 ─────────────────────────────────────────────
 const defaultModelIds = ['base', 'seq2048', 'seq4096', 'seq8192']
@@ -315,7 +326,7 @@ const slots = ref(
 // ── 当前题目 ─────────────────────────────────────────────
 const activeQ = computed(() => {
   if (customQ.value.trim()) return customQ.value.trim()
-  return selectedQ.value?.question_text || ''
+  return selectedQ.value?.post_title || ''
 })
 
 const canRun = computed(() => !!activeQ.value && !!serverUrl.value)
@@ -372,7 +383,7 @@ const runCompare = () => {
   params.set('question', activeQ.value)
   params.set('models', modelIds.join(','))
   params.set('server_url', serverUrl.value)
-  if (selectedQ.value?.q_id) params.set('question_id', selectedQ.value.q_id)
+  if (selectedQ.value?.task_id) params.set('question_id', selectedQ.value.task_id)
 
   const url = `/api/model-bench/stream?${params}`
 
@@ -399,12 +410,19 @@ const runCompare = () => {
         running.value = false
         allDone.value = true
         _es.close(); _es = null
-        ElMessage.success('四模型推理完成 ✓')
+        const errorCount = columns.value.filter(c => c.status === 'error').length
+        if (errorCount > 0) {
+          ElMessage.warning(`推理完成，但有 ${errorCount}/${columns.value.length} 路失败`)
+        } else {
+          ElMessage.success('四模型推理完成 ✓')
+        }
       }
     } catch { /* ignore parse err */ }
   }
 
   _es.onerror = () => {
+    // 已正常结束或已手动停止时，忽略浏览器触发的后续 onerror
+    if (!running.value) return
     running.value = false
     if (_es) { _es.close(); _es = null }
     ElMessage.error('SSE 连接断开，请检查推理服务是否正常运行')
@@ -413,9 +431,10 @@ const runCompare = () => {
 
 const buildPostPrompt = (task) => {
   const title = task?.post_title || ''
+  const url = task?.source_url || ''
   const body = task?.raw_content || ''
   if (!body.trim()) return ''
-  return `【帖子标题】\n${title || '（无）'}\n\n【帖子正文】\n${body}\n\n请基于上面整篇帖子内容，输出：\n1) 帖子中覆盖的核心面试考点；\n2) 可追问的 3-5 道高质量面试题；\n3) 每题给出简明标准答案要点。`
+  return `【帖子标题】\n${title || '（无）'}\n\n【帖子URL】\n${url || '（无）'}\n\n【帖子正文】\n${body}\n\n请基于上面整篇帖子内容，输出：\n1) 帖子中覆盖的核心面试考点；\n2) 可追问的 3-5 道高质量面试题；\n3) 每题给出简明标准答案要点。`
 }
 
 const applyPrefillQuestion = async (prefill) => {
@@ -454,7 +473,7 @@ const applyPrefillQuestion = async (prefill) => {
   }
 }
 
-onMounted(() => { loadMeta(); loadQs() })
+onMounted(() => { loadQs() })
 onUnmounted(() => { if (_es) _es.close() })
 
 watch(

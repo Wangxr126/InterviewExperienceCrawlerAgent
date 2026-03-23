@@ -350,7 +350,7 @@ class FindSimilarQuestionsTool(Tool):
             # 场景0：优先向量语义检索（Neo4j 可用时），检索后重排
             if neo4j_service.available:
                 try:
-                    from backend.tools.knowledge_manager_tools import generate_embedding
+                    from backend.services.knowledge.knowledge_tools import generate_embedding
                     emb = generate_embedding(question_text[:2048])
                     if emb:
                         search_top_k = settings.retrieval_search_top_k

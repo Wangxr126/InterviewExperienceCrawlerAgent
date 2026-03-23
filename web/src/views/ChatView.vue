@@ -716,7 +716,7 @@ function renderToolDataHtml(data) {
 }
 
 function renderToolArgsHtml(tool) {
-  const args = getToolArgs(tool)
+  const args = getToolDisplayArgs(tool)
   if (!args || !Object.keys(args).length) {
     return `<pre class="args-kv-text">${escapeHtml('无入参')}</pre>`
   }
@@ -739,12 +739,93 @@ function stringifyAsJson(raw) {
 }
 
 function renderToolResultHtml(tool) {
-  const raw = tool?.result ?? tool?.observation
-  if (raw == null || raw === '') {
+  const display = getToolDisplayResult(tool)
+  if (display == null || display === '') {
     return `<pre class="args-kv-text">${escapeHtml('暂无结果')}</pre>`
   }
-  const jsonText = stringifyAsJson(raw)
+  const jsonText = stringifyAsJson(display)
   return `<pre class="args-kv-text">${escapeHtml(jsonText)}</pre>`
+}
+
+function pickKeys(obj, keys) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {}
+  const out = {}
+  for (const k of keys) {
+    if (Object.prototype.hasOwnProperty.call(obj, k)) out[k] = obj[k]
+  }
+  return out
+}
+
+function stripEmptyFields(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj
+  const out = {}
+  for (const [k, v] of Object.entries(obj)) {
+    if (v == null) continue
+    if (typeof v === 'string' && !v.trim()) continue
+    if (Array.isArray(v) && v.length === 0) continue
+    if (typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0) continue
+    out[k] = v
+  }
+  return out
+}
+
+function truncateValue(v, maxTextLen = 300) {
+  if (typeof v === 'string') {
+    return v.length > maxTextLen ? `${v.slice(0, maxTextLen)}...(已截断)` : v
+  }
+  if (Array.isArray(v)) {
+    return v.map((item) => truncateValue(item, maxTextLen))
+  }
+  if (v && typeof v === 'object') {
+    const out = {}
+    for (const [k, val] of Object.entries(v)) {
+      out[k] = truncateValue(val, maxTextLen)
+    }
+    return out
+  }
+  return v
+}
+
+function getToolDisplayArgs(tool) {
+  const toolName = (tool?.name || '').replace(/^[🔧\s]+/u, '').trim()
+  const args = stripEmptyFields(getToolArgs(tool))
+  if (!args || !Object.keys(args).length) return {}
+
+  if (toolName === 'get_question_detail') {
+    return pickKeys(args, ['question_id'])
+  }
+  if (toolName === 'submit_answer') {
+    // submit_answer 入参常很长（user_answer/feedback），参数区仅保留关键索引字段
+    const compact = pickKeys(args, ['question_id', 'score'])
+    return Object.keys(compact).length ? compact : truncateValue(args, 180)
+  }
+  return truncateValue(args)
+}
+
+function getToolDisplayResult(tool) {
+  const raw = tool?.result ?? tool?.observation
+  if (raw == null || raw === '') return raw
+  const parsed = parseJsonLikeString(typeof raw === 'string' ? raw : JSON.stringify(raw))
+  if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object' || Array.isArray(parsed.value)) {
+    return raw
+  }
+
+  const toolName = (tool?.name || '').replace(/^[🔧\s]+/u, '').trim()
+  const obj = { ...parsed.value }
+  const args = getToolArgs(tool)
+
+  // 若结果里只是回显参数，移除重复字段，避免“参数/结果看起来一样”
+  for (const [k, v] of Object.entries(args || {})) {
+    if (Object.prototype.hasOwnProperty.call(obj, k) && JSON.stringify(obj[k]) === JSON.stringify(v)) {
+      delete obj[k]
+    }
+  }
+  if (toolName === 'submit_answer') {
+    delete obj.user_answer
+  }
+
+  const cleaned = stripEmptyFields(obj)
+  return Object.keys(cleaned).length ? truncateValue(cleaned) : raw
 }
 
 /** 切换某一步某 key 的长文本展开状态 */
@@ -991,7 +1072,7 @@ const loadHistory = async (loadAll = false) => {
     // 如果 loadAll=true，加载所有会话的历史；否则加载当前会话
     const d = loadAll 
       ? await api.getAllChatHistory(props.userId)
-      : await api.getChatHistory(props.userId)
+      : await api.getChatHistory(props.userId, sessionId.value)
     lastLoadedUserId = props.userId
     
     if (d.messages?.length) {
@@ -1706,9 +1787,9 @@ const send = async () => {
 
 watch([() => props.isActive, () => props.userId], ([active, uid], [prevActive, prevUid]) => {
   if (uid) sessionId.value = getFixedSessionId()
-  // 页面激活时加载所有历史记录
+  // 页面激活时优先加载当前会话，确保与后端会话恢复一致
   if (active && uid) {
-    loadHistory(true)  // 默认加载所有会话的历史
+    loadHistory(false)
   }
   // 🔧 页面失活时不再中断请求，让后端继续完成
   // 这样切换回来时可以看到完整的历史记录

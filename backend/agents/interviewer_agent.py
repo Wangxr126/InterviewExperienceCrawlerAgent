@@ -31,6 +31,7 @@ from backend.services.logging.agent_tool_runtime_stats import (
     agent_tool_runtime_stats,
     tool_execution_success_for_stats,
 )
+from backend.services.logging.hello_agent_logger import build_agent_logger
 from backend.agents.dsml_utils import strip_dsml_from_text
 
 logger = logging.getLogger(__name__)
@@ -389,29 +390,38 @@ class InterviewerAgent(ReActAgent):
         _data_dir = str(settings.backend_data_dir / "memory")
         _skills_dir = str(settings.backend_data_dir.parent.parent / ".claude" / "skills")
         _agent_config = HelloAgentsConfig(
-            trace_enabled=True,
-            trace_dir=f"{_data_dir}/traces",
-            trace_sanitize=True,
-            session_enabled=True,
+            trace_enabled=settings.agent_trace_enabled,
+            trace_dir=settings.agent_trace_dir,
+            trace_sanitize=settings.agent_trace_sanitize,
+            session_enabled=settings.interviewer_session_enabled,
             session_dir="sqlite",
-            auto_save_enabled=True,
-            auto_save_interval=2,
-            context_window=128000,
-            compression_threshold=0.8,
-            min_retain_rounds=10,
+            auto_save_enabled=settings.interviewer_session_auto_save_enabled,
+            auto_save_interval=settings.interviewer_session_auto_save_interval,
+            context_window=settings.context_window,
+            compression_threshold=settings.compression_threshold,
+            min_retain_rounds=settings.min_retain_rounds,
             enable_smart_compression=settings.enable_smart_compression,
+            summary_llm_provider=settings.summary_llm_provider,
+            summary_llm_model=settings.summary_llm_model,
+            summary_llm_api_key=settings.summary_llm_api_key,
+            summary_llm_base_url=settings.summary_llm_base_url,
+            summary_llm_timeout=settings.summary_llm_timeout,
+            summary_max_tokens=settings.summary_max_tokens,
+            summary_temperature=settings.summary_temperature,
             todowrite_enabled=True,
             todowrite_persistence_dir=f"{_data_dir}/todos",
-            devlog_enabled=True,
-            devlog_persistence_dir=f"{_data_dir}/devlogs",
+            devlog_enabled=settings.interviewer_devlog_enabled,
+            devlog_persistence_dir=settings.agent_devlog_dir,
             skills_enabled=False,
             skills_dir=_skills_dir,
             skills_auto_register=False,
-            circuit_enabled=True,
-            circuit_failure_threshold=3,
-            tool_output_max_lines=500,
-            tool_output_max_bytes=20480,
-            tool_output_dir=f"{_data_dir}/tool-output",
+            circuit_enabled=settings.interviewer_circuit_enabled,
+            circuit_failure_threshold=settings.interviewer_circuit_failure_threshold,
+            circuit_recovery_timeout=settings.interviewer_circuit_recovery_timeout,
+            tool_output_max_lines=settings.agent_tool_output_max_lines,
+            tool_output_max_bytes=settings.agent_tool_output_max_bytes,
+            tool_output_dir=settings.agent_tool_output_dir,
+            tool_output_truncate_direction=settings.agent_tool_output_truncate_direction,
             subagent_enabled=True,
             async_enabled=True,
             max_concurrent_tools=3,
@@ -423,6 +433,7 @@ class InterviewerAgent(ReActAgent):
         )
 
         max_steps = getattr(settings, "interviewer_max_steps", 3)
+        self._agent_logger = build_agent_logger("InterviewerAgent", settings.agent_run_log_dir)
 
         super().__init__(
             name="InterviewerAgent",
@@ -449,7 +460,10 @@ class InterviewerAgent(ReActAgent):
         logger.info(
             f"[InterviewerAgent] 初始化完成 endpoints={_ep_n} model={_model} "
             f"base_url={settings.interviewer_base_url or settings.llm_base_url} "
-            f"max_steps={max_steps} streamable={settings.interviewer_streamable}"
+            f"max_steps={max_steps} streamable={settings.interviewer_streamable} "
+            f"circuit_enabled={settings.interviewer_circuit_enabled} "
+            f"circuit_failure_threshold={settings.interviewer_circuit_failure_threshold} "
+            f"circuit_recovery_timeout={settings.interviewer_circuit_recovery_timeout}s"
         )
 
     @property
@@ -574,6 +588,7 @@ class InterviewerAgent(ReActAgent):
                             success=False,
                             execution_time_ms=(time.time() - _t0) * 1000.0,
                             user_id=get_current_user_id(),
+                            params_input={},
                         )
                         return (tool_name, tool_call_id, {"content": f"错误：参数格式不正确 - {str(e)}", "args": {}})
                     self._stream_tool_args_cache[tool_call_id] = arguments
@@ -588,6 +603,8 @@ class InterviewerAgent(ReActAgent):
 
                     tool = self.tool_registry.get_tool(tool_name)
                     response_status = None
+                    _time_ms = None
+                    _args_for_return = arguments
                     if not tool:
                         result_content = f"❌ 工具 {tool_name} 不存在"
                     else:
@@ -595,6 +612,12 @@ class InterviewerAgent(ReActAgent):
                             tool_response = await tool.arun_with_timing(arguments)
                             response_status = tool_response.status
                             result_content = tool_response.text
+                            _stats = getattr(tool_response, "stats", None)
+                            if isinstance(_stats, dict):
+                                _time_ms = _stats.get("time_ms")
+                            _ctx = getattr(tool_response, "context", None)
+                            if isinstance(_ctx, dict) and isinstance(_ctx.get("params_input"), dict):
+                                _args_for_return = _ctx.get("params_input")
                             truncate_result = self.truncator.truncate(
                                 tool_name=tool_name, output=result_content
                             )
@@ -623,12 +646,13 @@ class InterviewerAgent(ReActAgent):
                             str(result_content),
                             response_status=response_status,
                         ),
-                        execution_time_ms=(time.time() - _t0) * 1000.0,
+                        execution_time_ms=float(_time_ms) if _time_ms is not None else (time.time() - _t0) * 1000.0,
                         user_id=get_current_user_id(),
+                        params_input=_args_for_return,
                     )
 
                     # ✅ 携带 args，便于流式事件消费方读取工具参数
-                    return (tool_name, tool_call_id, {"content": result_content, "args": arguments})
+                    return (tool_name, tool_call_id, {"content": result_content, "args": _args_for_return})
 
             user_results = await _asyncio.gather(*[execute_one(tc) for tc in user_calls])
             results.extend(user_results)
@@ -643,14 +667,28 @@ class InterviewerAgent(ReActAgent):
 
         _t0 = time.time()
         try:
-            result = super()._execute_tool_call(tool_name, arguments)
-            ok = tool_execution_success_for_stats(str(result))
+            tool = self.tool_registry.get_tool(tool_name)
+            if not tool:
+                result = f"❌ 工具 {tool_name} 不存在"
+                ok = False
+                cost_ms = (time.time() - _t0) * 1000.0
+            else:
+                tool_response = tool.run_with_timing(arguments)
+                result = tool_response.text
+                ok = tool_execution_success_for_stats(
+                    str(result),
+                    response_status=getattr(tool_response, "status", None),
+                )
+                _stats = getattr(tool_response, "stats", None)
+                _time_ms = _stats.get("time_ms") if isinstance(_stats, dict) else None
+                cost_ms = float(_time_ms) if _time_ms is not None else (time.time() - _t0) * 1000.0
             agent_tool_runtime_stats.record(
                 agent_name=self.name,
                 tool_name=tool_name,
                 success=ok,
-                execution_time_ms=(time.time() - _t0) * 1000.0,
+                execution_time_ms=cost_ms,
                 user_id=get_current_user_id(),
+                params_input=arguments if isinstance(arguments, dict) else {},
             )
             return result
         except Exception:
@@ -997,7 +1035,7 @@ class InterviewerAgent(ReActAgent):
         logger.info(f"[对话处理] ✅ 回复完成 ({len(response)}字, 思考{len(thinking_steps)}步)")
 
         try:
-            self.save_session(session_id)
+            self.save_session(session_path)
         except Exception as e:
             logger.warning(f"[对话处理] save_session 失败: {e}")
 
@@ -1179,7 +1217,7 @@ class InterviewerAgent(ReActAgent):
                 (full_content or "")[:300],
             )
             try:
-                await asyncio.to_thread(self.save_session, session_id)
+                await asyncio.to_thread(self.save_session, session_path)
                 await asyncio.to_thread(
                     sqlite_service.patch_last_assistant_content,
                     session_id,

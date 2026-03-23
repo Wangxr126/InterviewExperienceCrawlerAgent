@@ -8,6 +8,7 @@
 """
 import json
 import logging
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
@@ -25,6 +26,7 @@ from backend.agents.prompts.two_stage_prompts import (
     ENRICH_SYSTEM_PROMPT,
     ENRICH_USER_PROMPT_TEMPLATE,
 )
+from backend.services.logging.hello_agent_logger import build_agent_logger
 from backend.services.finetune.stage_merge_utils import merge_stage2_with_stage1
 
 logger = logging.getLogger(__name__)
@@ -94,6 +96,15 @@ _JSON_RETRY_INSTRUCTION = """
 _last_extraction_error: str | None = None
 
 
+def _build_stage1_session_id(task_id: str, user_input: str) -> str:
+    """构造 Stage1 会话键：优先 task_id；缺失时退化为输入摘要。"""
+    tid = (task_id or "").strip()
+    if tid:
+        return f"miner:stage1:{tid}"
+    digest = hashlib.sha1((user_input or "").encode("utf-8")).hexdigest()[:16]
+    return f"miner:stage1:adhoc:{digest}"
+
+
 def _is_quota_or_rate_limit_error(err: Exception) -> bool:
     """判断是否为额度超限或限流错误，应切换备用模型"""
     msg = (str(err) or "").lower()
@@ -141,6 +152,8 @@ class TwoStageExtractor:
         self._image_paths = image_paths or []
         self._task_id = task_id
         self._ocr_called = False
+        self._stage1_agent_logger = build_agent_logger("TwoStage_RoughExtractor", settings.agent_run_log_dir)
+        self._stage2_agent_logger = build_agent_logger("TwoStage_EnrichExtractor", settings.agent_run_log_dir)
         self._stage1_model_used = ""
         self._stage1_models: List[dict] = list(settings.miner_stage1_models)
         self._s1_mt = settings.miner_stage1_max_tokens
@@ -155,33 +168,51 @@ class TwoStageExtractor:
         # 工具与 Agent 配置（Stage1 每次换端点时重建 MinerReActAgent）
         self._registry = ToolRegistry()
         self._registry.register_tool(OcrImagesTool(image_paths=self._image_paths, task_id=self._task_id))
-        self._registry.register_tool(MarkUnrelatedTool())
+        self._registry.register_tool(MarkUnrelatedTool(task_id=self._task_id))
         self._registry.register_tool(VerifyExtractionCountTool())
 
-        _data_dir = str(settings.backend_data_dir / "memory")
         _skills_dir = str(settings.backend_data_dir.parent.parent / ".claude" / "skills")
         self._agent_config = HelloAgentsConfig(
-            trace_enabled=True,
-            trace_dir=f"{_data_dir}/traces",
-            trace_sanitize=True,
-            session_enabled=False,
-            context_window=128000,
-            compression_threshold=0.8,
-            min_retain_rounds=5,
+            trace_enabled=settings.agent_trace_enabled,
+            trace_dir=settings.agent_trace_dir,
+            trace_sanitize=settings.agent_trace_sanitize,
+            session_enabled=settings.miner_session_enabled,
+            session_dir="sqlite",
+            auto_save_enabled=settings.miner_session_auto_save_enabled,
+            auto_save_interval=settings.miner_session_auto_save_interval,
+            context_window=settings.context_window,
+            compression_threshold=settings.compression_threshold,
+            min_retain_rounds=max(1, settings.min_retain_rounds),
+            enable_smart_compression=settings.enable_smart_compression,
+            summary_llm_provider=settings.summary_llm_provider,
+            summary_llm_model=settings.summary_llm_model,
+            summary_llm_api_key=settings.summary_llm_api_key,
+            summary_llm_base_url=settings.summary_llm_base_url,
+            summary_llm_timeout=settings.summary_llm_timeout,
+            summary_max_tokens=settings.summary_max_tokens,
+            summary_temperature=settings.summary_temperature,
             todowrite_enabled=False,
-            devlog_enabled=False,
+            devlog_enabled=settings.miner_devlog_enabled,
+            devlog_persistence_dir=settings.agent_devlog_dir,
             skills_enabled=True,
             skills_dir=_skills_dir,
             skills_auto_register=True,
-            circuit_enabled=True,
-            circuit_failure_threshold=3,
-            tool_output_max_lines=99999,
-            tool_output_max_bytes=10485760,
-            tool_output_dir=f"{_data_dir}/tool-output",
+            circuit_enabled=settings.miner_circuit_enabled,
+            circuit_failure_threshold=settings.miner_circuit_failure_threshold,
+            circuit_recovery_timeout=settings.miner_circuit_recovery_timeout,
+            tool_output_max_lines=settings.agent_tool_output_max_lines,
+            tool_output_max_bytes=settings.agent_tool_output_max_bytes,
+            tool_output_dir=settings.agent_tool_output_dir,
+            tool_output_truncate_direction=settings.agent_tool_output_truncate_direction,
             subagent_enabled=False,
             async_enabled=True,
             max_concurrent_tools=2,
         )
+        if self._agent_config.session_enabled:
+            from backend.services.storage.sqlite_session_store import SqliteSessionStore
+            self._session_store = SqliteSessionStore(session_dir="sqlite")
+        else:
+            self._session_store = None
 
         if not self._stage1_models:
             sm = settings.miner_stage1_mode
@@ -203,9 +234,12 @@ class TwoStageExtractor:
             else f"{settings.miner_stage1_mode}(未配置)"
         )
         logger.info(
-            "[TwoStageExtractor] 初始化完成 stage1=%s stage2=%s",
+            "[TwoStageExtractor] 初始化完成 stage1=%s stage2=%s circuit_enabled=%s failure_threshold=%s recovery_timeout=%ss",
             _s1_desc,
             _stage2_names or "未配置",
+            settings.miner_circuit_enabled,
+            settings.miner_circuit_failure_threshold,
+            settings.miner_circuit_recovery_timeout,
         )
         if (
             settings.miner_stage1_mode == "remote"
@@ -309,6 +343,7 @@ class TwoStageExtractor:
             company=company or "",
             position=position or "",
         )
+        _session_id = _build_stage1_session_id(self._task_id, user_input)
 
         try:
             from backend.services.crawler.question_extractor import (
@@ -325,6 +360,14 @@ class TwoStageExtractor:
             n_ep = len(self._stage1_models)
             for ep_idx, cfg in enumerate(self._stage1_models):
                 self._build_stage1_agent(cfg)
+                if settings.miner_session_enabled:
+                    try:
+                        self.rough_agent.load_session(_session_id, check_consistency=False)
+                        logger.info("[TwoStageExtractor] Stage1 已恢复会话: %s", _session_id)
+                    except FileNotFoundError:
+                        pass
+                    except Exception as _e:
+                        logger.warning("[TwoStageExtractor] Stage1 load_session 失败（忽略）: %s", _e)
                 logger.info(
                     "[TwoStageExtractor] Stage1 端点 %d/%d model=%s base=%s",
                     ep_idx + 1,
@@ -452,6 +495,12 @@ class TwoStageExtractor:
             _last_extraction_error = str(e)
             logger.error(f"[TwoStageExtractor] Stage 1 异常: {e}")
             return "", self._ocr_called, False
+        finally:
+            if settings.miner_session_enabled:
+                try:
+                    self.rough_agent.save_session(_session_id)
+                except Exception as _e:
+                    logger.warning("[TwoStageExtractor] Stage1 save_session 失败（忽略）: %s", _e)
 
         # 规范化字段名：模型可能返回 question/answer/category，需映射为 question_text/answer_text/question_type
         rough_questions = [
@@ -502,6 +551,7 @@ class TwoStageExtractor:
                     name="Enrich Extractor",
                     llm=enrich_llm,
                     system_prompt=ENRICH_SYSTEM_PROMPT,
+                    logger=self._stage2_agent_logger,
                 )
                 enrich_result = enrich_agent.run(enrich_input)
                 enrich_result = (enrich_result or "").strip()

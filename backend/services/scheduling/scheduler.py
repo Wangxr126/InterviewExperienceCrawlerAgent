@@ -566,7 +566,7 @@ def process_single_task(task_id: str) -> Dict:
 def _get_embedding(text: str) -> Optional[List[float]]:
     """获取文本向量（调用 DashScope Embedding API），失败时返回 None"""
     try:
-        from backend.tools.knowledge_manager_tools import generate_embedding
+        from backend.services.knowledge.knowledge_tools import generate_embedding
         vec = generate_embedding(text)
         return vec if vec else None
     except Exception as e:

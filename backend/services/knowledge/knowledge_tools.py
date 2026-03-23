@@ -1,6 +1,6 @@
 """
-知识管理器工具箱 (KnowledgeManager Tools) v2.0
-负责：结构化解析 → 语义查重 → 双写入库（Neo4j + SQLite）
+知识服务工具箱 (Knowledge Tools) v2.0
+负责：结构化解析 -> 语义查重 -> 双写入库（Neo4j + SQLite）
 新增：MetaExtractor（元信息提取）、真实 Embedding 生成
 """
 import logging
@@ -11,17 +11,11 @@ import requests
 from typing import List, Dict, Any, Optional
 
 from hello_agents.tools import Tool, ToolParameter
-from hello_agents.tools.response import ToolResponse
 from backend.config.config import settings
 from backend.services.storage.neo4j_service import neo4j_service
 from backend.services.storage.sqlite_service import sqlite_service
 
 logger = logging.getLogger(__name__)
-
-
-class ToolErrorCode:
-    """工具错误码常量。"""
-    INVALID_PARAM = "INVALID_PARAM"
 
 
 # ==============================================================================
@@ -196,7 +190,7 @@ _DIFFICULTY_RULES = {
 class MetaExtractor(Tool):
     """
     从面经文本中提取结构化元信息：公司、岗位、业务线、难度、帖子类型。
-    策略：规则优先 → LLM 兜底补全。
+    策略：规则优先 -> LLM 兜底补全。
     """
     def __init__(self):
         super().__init__(
@@ -214,10 +208,7 @@ class MetaExtractor(Tool):
     def run(self, parameters: Dict[str, Any]) -> str:
         missing = _validate_required_params(parameters, ["raw_text"])
         if missing:
-            return ToolResponse.error(
-                code=ToolErrorCode.INVALID_PARAM,
-                message=f"缺少必需参数: {missing}"
-            )
+            return f"INVALID_PARAM|缺少必需参数: {missing}"
 
         raw_text = parameters.get("raw_text", "")
         source_platform = parameters.get("source_platform", "")
@@ -272,7 +263,7 @@ class MetaExtractor(Tool):
 
 # ==============================================================================
 # 2. 知识结构化解析器 (KnowledgeStructurer)
-# 将面经原文 + 元信息 → 结构化题目JSON列表
+# 将面经原文 + 元信息 -> 结构化题目JSON列表
 # ==============================================================================
 
 _STRUCTURE_SYSTEM = """你是面试题结构化专家。
@@ -315,10 +306,7 @@ class KnowledgeStructurer(Tool):
     def run(self, parameters: Dict[str, Any]) -> str:
         missing = _validate_required_params(parameters, ["raw_text"])
         if missing:
-            return ToolResponse.error(
-                code=ToolErrorCode.INVALID_PARAM,
-                message=f"缺少必需参数: {missing}"
-            )
+            return f"INVALID_PARAM|缺少必需参数: {missing}"
 
         raw_text = parameters.get("raw_text", "")
         meta_json = parameters.get("meta_json", "{}")
@@ -375,10 +363,7 @@ class DuplicateChecker(Tool):
     def run(self, parameters: Dict[str, Any]) -> str:
         missing = _validate_required_params(parameters, ["question"])
         if missing:
-            return ToolResponse.error(
-                code=ToolErrorCode.INVALID_PARAM,
-                message=f"缺少必需参数: {missing}"
-            )
+            return f"INVALID_PARAM|缺少必需参数: {missing}"
 
         question = parameters.get("question", "")
         threshold = float(parameters.get("threshold", 0.92))
@@ -433,10 +418,7 @@ class BaseManager(Tool):
     def run(self, parameters: Dict[str, Any]) -> str:
         missing = _validate_required_params(parameters, ["question", "answer", "tags"])
         if missing:
-            return ToolResponse.error(
-                code=ToolErrorCode.INVALID_PARAM,
-                message=f"缺少必需参数: {missing}"
-            )
+            return f"INVALID_PARAM|缺少必需参数: {missing}"
 
         question = parameters.get("question", "").strip()
         answer = parameters.get("answer", "").strip()

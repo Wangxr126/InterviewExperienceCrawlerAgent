@@ -11,6 +11,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+import json
 from collections import defaultdict
 from typing import Any, Dict, Optional
 
@@ -77,10 +78,16 @@ class AgentToolRuntimeStats:
                     agent_name TEXT NOT NULL,
                     tool_name TEXT NOT NULL,
                     success INTEGER NOT NULL DEFAULT 0,
-                    execution_time_ms REAL NOT NULL DEFAULT 0
+                    execution_time_ms REAL NOT NULL DEFAULT 0,
+                    params_input_text TEXT
                 )
                 """
             )
+            cols = {
+                str(r["name"]) for r in conn.execute("PRAGMA table_info(agent_tool_runtime_calls)").fetchall()
+            }
+            if "params_input_text" not in cols:
+                conn.execute("ALTER TABLE agent_tool_runtime_calls ADD COLUMN params_input_text TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_agent_tool_runtime_user ON agent_tool_runtime_calls(user_id)"
             )
@@ -97,6 +104,7 @@ class AgentToolRuntimeStats:
         success: bool,
         execution_time_ms: float = 0.0,
         user_id: Optional[str] = None,
+        params_input: Optional[Dict[str, Any]] = None,
     ) -> None:
         agent = (agent_name or "").strip() or "UnknownAgent"
         tool = (tool_name or "").strip() or "unknown_tool"
@@ -104,6 +112,12 @@ class AgentToolRuntimeStats:
         cost = float(execution_time_ms or 0.0)
         if cost < 0:
             cost = 0.0
+        params_input_text: Optional[str] = None
+        if isinstance(params_input, dict):
+            try:
+                params_input_text = json.dumps(params_input, ensure_ascii=False)
+            except Exception:
+                params_input_text = str(params_input)
 
         with self._lock:
             item = self._stats[agent][tool]
@@ -123,10 +137,10 @@ class AgentToolRuntimeStats:
                 conn.execute(
                     """
                     INSERT INTO agent_tool_runtime_calls
-                    (ts, user_id, agent_name, tool_name, success, execution_time_ms)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (ts, user_id, agent_name, tool_name, success, execution_time_ms, params_input_text)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (time.time(), uid or None, agent, tool, 1 if success else 0, cost),
+                    (time.time(), uid or None, agent, tool, 1 if success else 0, cost, params_input_text),
                 )
                 conn.commit()
         except Exception:
@@ -143,7 +157,8 @@ class AgentToolRuntimeStats:
                 SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success,
                 SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed,
                 AVG(execution_time_ms) AS avg_execution_time_ms,
-                MAX(ts) AS latest_ts
+                MAX(ts) AS latest_ts,
+                MAX(id) AS latest_id
             FROM agent_tool_runtime_calls
         """
         params = []
@@ -153,13 +168,25 @@ class AgentToolRuntimeStats:
         sql += " GROUP BY agent_name, tool_name"
 
         rows = []
+        latest_ids = []
         latest_ts = 0.0
         try:
             with self._get_conn() as conn:
                 cur = conn.execute(sql, params)
                 rows = [dict(r) for r in cur.fetchall()]
+                latest_ids = [int(r.get("latest_id") or 0) for r in rows if int(r.get("latest_id") or 0) > 0]
+                latest_params_map: Dict[int, Optional[str]] = {}
+                if latest_ids:
+                    placeholders = ",".join(["?"] * len(latest_ids))
+                    pcur = conn.execute(
+                        f"SELECT id, params_input_text FROM agent_tool_runtime_calls WHERE id IN ({placeholders})",
+                        latest_ids,
+                    )
+                    for p in pcur.fetchall():
+                        latest_params_map[int(p["id"])] = p["params_input_text"]
         except Exception:
             rows = []
+            latest_params_map = {}
 
         by_agent: Dict[str, Dict[str, Any]] = {}
         total_calls = 0
@@ -170,6 +197,14 @@ class AgentToolRuntimeStats:
             success = int(r.get("success") or 0)
             failed = int(r.get("failed") or 0)
             avg_ms = float(r.get("avg_execution_time_ms") or 0.0)
+            latest_id = int(r.get("latest_id") or 0)
+            latest_params_input = None
+            _raw_params = latest_params_map.get(latest_id)
+            if _raw_params:
+                try:
+                    latest_params_input = json.loads(_raw_params)
+                except Exception:
+                    latest_params_input = _raw_params
             latest_ts = max(latest_ts, float(r.get("latest_ts") or 0.0))
 
             if count <= 0:
@@ -190,6 +225,7 @@ class AgentToolRuntimeStats:
                     "failed": failed,
                     "success_rate": round((success / count) * 100.0, 2) if count else 0.0,
                     "avg_execution_time_ms": round(avg_ms, 2),
+                    "latest_params_input": latest_params_input,
                 }
             )
             by_agent[agent_name]["total_calls"] += count

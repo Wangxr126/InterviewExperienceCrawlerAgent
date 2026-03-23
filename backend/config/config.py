@@ -284,7 +284,7 @@ class _Settings:
 
     @property
     def architect_model(self) -> str:
-        """与 knowledge_manager_model 相同（兼容 knowledge_manager_tools 等旧引用）。"""
+        """与 knowledge_manager_model 相同（兼容 knowledge_tools 等旧引用）。"""
         return self.knowledge_manager_model
 
     @property
@@ -435,9 +435,115 @@ class _Settings:
         return True
 
     @property
+    def interviewer_session_enabled(self) -> bool:
+        """Interviewer 会话持久化开关。"""
+        return _get_bool("INTERVIEWER_SESSION_ENABLED", True)
+
+    @property
+    def interviewer_session_auto_save_enabled(self) -> bool:
+        """Interviewer 自动保存开关。"""
+        return _get_bool("INTERVIEWER_SESSION_AUTO_SAVE_ENABLED", True)
+
+    @property
+    def interviewer_session_auto_save_interval(self) -> int:
+        """Interviewer 自动保存间隔（每 N 条消息）。"""
+        return max(1, _get_int("INTERVIEWER_SESSION_AUTO_SAVE_INTERVAL", 2))
+
+    @property
+    def interviewer_circuit_enabled(self) -> bool:
+        """Interviewer 工具熔断开关。"""
+        return _get_bool("INTERVIEWER_CIRCUIT_ENABLED", True)
+
+    @property
+    def interviewer_circuit_failure_threshold(self) -> int:
+        """Interviewer 工具连续失败多少次后熔断。"""
+        return max(1, _get_int("INTERVIEWER_CIRCUIT_FAILURE_THRESHOLD", 3))
+
+    @property
+    def interviewer_circuit_recovery_timeout(self) -> int:
+        """Interviewer 工具熔断后恢复时间（秒）。"""
+        return max(1, _get_int("INTERVIEWER_CIRCUIT_RECOVERY_TIMEOUT", 300))
+
+    @property
     def enable_smart_compression(self) -> bool:
         """是否启用智能摘要（需额外 LLM 调用），默认 False"""
         return _get_bool("ENABLE_SMART_COMPRESSION", False)
+
+    @property
+    def context_window(self) -> int:
+        """上下文窗口大小（HelloAgents Config）。"""
+        return _get_int("CONTEXT_WINDOW", 128000)
+
+    @property
+    def compression_threshold(self) -> float:
+        """历史压缩阈值（0~1）。"""
+        return _get_float("COMPRESSION_THRESHOLD", 0.8)
+
+    @property
+    def min_retain_rounds(self) -> int:
+        """压缩后保留最近完整对话轮次。"""
+        return _get_int("MIN_RETAIN_ROUNDS", 10)
+
+    @property
+    def summary_llm_provider(self) -> str:
+        """历史摘要模型 provider（固定远程，默认复用全局远程 provider）。"""
+        return _get("SUMMARY_LLM_PROVIDER") or self.llm_remote_provider
+
+    @property
+    def summary_llm_model(self) -> str:
+        """历史摘要模型（固定远程）。"""
+        return _get("SUMMARY_LLM_MODEL")
+
+    @property
+    def summary_llm_api_key(self) -> str:
+        """历史摘要模型 API Key（固定远程）。"""
+        return _get("SUMMARY_LLM_API_KEY") or self.llm_remote_api_key
+
+    @property
+    def summary_llm_base_url(self) -> str:
+        """历史摘要模型 Base URL（固定远程）。"""
+        return _get("SUMMARY_LLM_BASE_URL") or self.llm_remote_base_url
+
+    @property
+    def summary_llm_timeout(self) -> int:
+        """历史摘要模型超时（秒）。"""
+        return _get_int("SUMMARY_LLM_TIMEOUT", 0) or self.llm_remote_timeout
+
+    @property
+    def summary_max_tokens(self) -> int:
+        """历史摘要最大输出 token。"""
+        return _get_int("SUMMARY_MAX_TOKENS", 800)
+
+    @property
+    def summary_temperature(self) -> float:
+        """历史摘要温度。"""
+        return _get_float("SUMMARY_TEMPERATURE", 0.3)
+
+    @property
+    def agent_trace_enabled(self) -> bool:
+        """是否启用 Agent trace。"""
+        return _get_bool("AGENT_TRACE_ENABLED", True)
+
+    @property
+    def agent_trace_sanitize(self) -> bool:
+        """是否对 trace 做脱敏。"""
+        return _get_bool("AGENT_TRACE_SANITIZE", True)
+
+    @property
+    def agent_tool_output_max_lines(self) -> int:
+        """工具输出最大行数（超限截断）。"""
+        return _get_int("AGENT_TOOL_OUTPUT_MAX_LINES", 500)
+
+    @property
+    def agent_tool_output_max_bytes(self) -> int:
+        """工具输出最大字节（超限截断）。"""
+        return _get_int("AGENT_TOOL_OUTPUT_MAX_BYTES", 20480)
+
+    @property
+    def agent_tool_output_truncate_direction(self) -> str:
+        """工具输出截断方向：head / tail / head_tail。"""
+        direction = _get("AGENT_TOOL_OUTPUT_TRUNCATE_DIRECTION", "head").lower().strip()
+        return direction if direction in ("head", "tail", "head_tail") else "head"
 
     # ── 4.5 微调辅助大模型 ────────────────────────────────────────
     @property
@@ -848,9 +954,39 @@ class _Settings:
         return _get("MINER_ENFORCE_CHINESE_OUTPUT", "true").lower() in ("1", "true", "yes")
 
     @property
+    def miner_circuit_enabled(self) -> bool:
+        """Miner/TwoStage Stage1 工具熔断开关。"""
+        return _get_bool("MINER_CIRCUIT_ENABLED", True)
+
+    @property
+    def miner_circuit_failure_threshold(self) -> int:
+        """Miner/TwoStage Stage1 工具连续失败多少次后熔断。"""
+        return max(1, _get_int("MINER_CIRCUIT_FAILURE_THRESHOLD", 3))
+
+    @property
+    def miner_circuit_recovery_timeout(self) -> int:
+        """Miner/TwoStage Stage1 工具熔断后恢复时间（秒）。"""
+        return max(1, _get_int("MINER_CIRCUIT_RECOVERY_TIMEOUT", 300))
+
+    @property
     def miner_max_steps(self) -> int:
         """Miner Agent 最大步数（含 OCR、TodoWrite、Finish 等工具调用）"""
         return _get_int("MINER_MAX_STEPS", 100)
+
+    @property
+    def miner_session_enabled(self) -> bool:
+        """Miner 会话持久化开关（断电续跑）。默认关闭以保持历史行为。"""
+        return _get_bool("MINER_SESSION_ENABLED", False)
+
+    @property
+    def miner_session_auto_save_enabled(self) -> bool:
+        """Miner 自动保存开关（每 N 条消息）。"""
+        return _get_bool("MINER_SESSION_AUTO_SAVE_ENABLED", True)
+
+    @property
+    def miner_session_auto_save_interval(self) -> int:
+        """Miner 自动保存间隔。"""
+        return max(1, _get_int("MINER_SESSION_AUTO_SAVE_INTERVAL", 1))
 
     @property
     def miner_log_input_preview_chars(self) -> int:
@@ -1194,6 +1330,77 @@ class _Settings:
         if not p:
             return str(Path(self.log_dir) / "subprocess")
         return _resolve_data_path(p)
+
+    @property
+    def agent_trace_dir(self) -> str:
+        """HelloAgents trace 目录。"""
+        p = _get("AGENT_TRACE_DIR", "").strip()
+        if p:
+            return _resolve_data_path(p)
+        return str(Path(self.memory_data_dir) / "traces")
+
+    @property
+    def agent_run_log_dir(self) -> str:
+        """HelloAgents AgentLogger 目录（每个 agent 单独文件）。"""
+        p = _get("AGENT_RUN_LOG_DIR", "").strip()
+        if p:
+            return _resolve_data_path(p)
+        return str(Path(self.log_dir) / "agents")
+
+    @property
+    def agent_devlog_enabled(self) -> bool:
+        """全局 DevLog 开关（各 Agent 可再单独覆盖）。"""
+        return _get_bool("AGENT_DEVLOG_ENABLED", True)
+
+    @property
+    def interviewer_devlog_enabled(self) -> bool:
+        """Interviewer DevLog 开关。"""
+        return _get_bool("INTERVIEWER_DEVLOG_ENABLED", self.agent_devlog_enabled)
+
+    @property
+    def miner_devlog_enabled(self) -> bool:
+        """Miner（含 two_stage Stage1）DevLog 开关。"""
+        return _get_bool("MINER_DEVLOG_ENABLED", self.agent_devlog_enabled)
+
+    @property
+    def agent_devlog_dir(self) -> str:
+        """DevLog 落盘目录。"""
+        p = _get("AGENT_DEVLOG_DIR", "").strip()
+        if p:
+            return _resolve_data_path(p)
+        return str(Path(self.memory_data_dir) / "devlogs")
+
+    @property
+    def agent_tool_output_dir(self) -> str:
+        """HelloAgents 工具输出完整落盘目录。"""
+        p = _get("AGENT_TOOL_OUTPUT_DIR", "").strip()
+        if p:
+            return _resolve_data_path(p)
+        return str(Path(self.memory_data_dir) / "tool-output")
+
+    @property
+    def chat_history_migration_on_startup(self) -> bool:
+        """启动时是否自动执行历史迁移（合并到默认 user/session）。"""
+        return _get_bool("CHAT_HISTORY_MIGRATION_ON_STARTUP", False)
+
+    @property
+    def chat_history_migration_mode(self) -> str:
+        """迁移模式：off | dry_run | apply。"""
+        mode = _get("CHAT_HISTORY_MIGRATION_MODE", "off").lower().strip()
+        return mode if mode in ("off", "dry_run", "apply") else "off"
+
+    @property
+    def chat_history_migration_run_once(self) -> bool:
+        """迁移是否只运行一次（通过 marker 文件判定）。"""
+        return _get_bool("CHAT_HISTORY_MIGRATION_RUN_ONCE", True)
+
+    @property
+    def chat_history_migration_marker(self) -> str:
+        """历史迁移一次性标记文件路径。"""
+        p = _get("CHAT_HISTORY_MIGRATION_MARKER", "").strip()
+        if p:
+            return _resolve_data_path(p)
+        return str(Path(self.memory_data_dir) / "chat_history_migration.done")
 
     @property
     def post_images_dir(self) -> Path:

@@ -3,12 +3,16 @@ Miner Agent - 信息挖掘师（ReAct版）
 职责：从面经原文中智能挖掘结构化信息
 
 使用 hello-agents 框架的 ReActAgent，内置 Thought + Finish 工具。
-按框架能力配置：Trace、熔断器、工具截断等。Miner 禁用 TodoWrite/DevLog，避免模型误用任务规划工具占用步数。
+按框架能力配置：Trace、熔断器、工具截断等。Miner 禁用 TodoWrite，DevLog 由配置开关控制。
 """
 import logging
 import re
-import time
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 from typing import Any, List, Tuple
+import hashlib
 
 from hello_agents import ReActAgent
 from hello_agents.core.llm import HelloAgentsLLM
@@ -22,7 +26,8 @@ from backend.services.logging.agent_tool_runtime_stats import (
     agent_tool_runtime_stats,
     tool_execution_success_for_stats,
 )
-from backend.tools.miner_tools import OcrImagesTool, MarkUnrelatedTool
+from backend.services.logging.hello_agent_logger import build_agent_logger
+from backend.tools.miner_tools import OcrImagesTool, MarkUnrelatedTool, VerifyExtractionCountTool
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +35,18 @@ logger = logging.getLogger(__name__)
 UNRELATED_SIGNAL = "__UNRELATED__"
 
 
+def _build_miner_session_id(task_id: str, user_input: str) -> str:
+    """构造稳定会话键：优先 task_id；缺失时退化为输入摘要。"""
+    tid = (task_id or "").strip()
+    if tid:
+        return f"miner:{tid}"
+    digest = hashlib.sha1((user_input or "").encode("utf-8")).hexdigest()[:16]
+    return f"miner:adhoc:{digest}"
+
+
 class MinerAgent(ReActAgent):
+    _had_recent_failure = False
+
     """
     信息挖掘师 Agent（ReAct版）
 
@@ -63,36 +79,50 @@ class MinerAgent(ReActAgent):
         # 注册业务工具（ReActAgent 内置了 Thought + Finish，无需再注册 FinishTool）
         registry = ToolRegistry()
         registry.register_tool(OcrImagesTool(image_paths=self._image_paths, task_id=self._task_id))
-        registry.register_tool(MarkUnrelatedTool())
+        registry.register_tool(MarkUnrelatedTool(task_id=self._task_id))
+        registry.register_tool(VerifyExtractionCountTool())
 
         # ── hello-agents Config（对齐框架 16 项能力）────────────────────
-        _data_dir = str(settings.backend_data_dir / "memory")
         _skills_dir = str(settings.backend_data_dir.parent.parent / ".claude" / "skills")
         _agent_config = HelloAgentsConfig(
             # 可观测性
-            trace_enabled=True,
-            trace_dir=f"{_data_dir}/traces",
-            trace_sanitize=True,
-            # Miner 为单次任务，无会话持久化
-            session_enabled=False,
+            trace_enabled=settings.agent_trace_enabled,
+            trace_dir=settings.agent_trace_dir,
+            trace_sanitize=settings.agent_trace_sanitize,
+            # 可选断点续跑（默认关闭，避免改变历史行为）
+            session_enabled=settings.miner_session_enabled,
+            session_dir="sqlite",
+            auto_save_enabled=settings.miner_session_auto_save_enabled,
+            auto_save_interval=settings.miner_session_auto_save_interval,
             # 上下文工程（单次提取输入较短，保留默认）
-            context_window=128000,
-            compression_threshold=0.8,
-            min_retain_rounds=5,
-            # TodoWrite/DevLog 禁用：Miner 只需 ocr_images→Finish，避免模型误用任务规划工具占用步数
+            context_window=settings.context_window,
+            compression_threshold=settings.compression_threshold,
+            min_retain_rounds=max(1, settings.min_retain_rounds),
+            enable_smart_compression=settings.enable_smart_compression,
+            summary_llm_provider=settings.summary_llm_provider,
+            summary_llm_model=settings.summary_llm_model,
+            summary_llm_api_key=settings.summary_llm_api_key,
+            summary_llm_base_url=settings.summary_llm_base_url,
+            summary_llm_timeout=settings.summary_llm_timeout,
+            summary_max_tokens=settings.summary_max_tokens,
+            summary_temperature=settings.summary_temperature,
+            # TodoWrite 禁用：Miner 只需 ocr_images→Finish，避免模型误用任务规划工具占用步数
             todowrite_enabled=False,
-            devlog_enabled=False,
+            devlog_enabled=settings.miner_devlog_enabled,
+            devlog_persistence_dir=settings.agent_devlog_dir,
             # Skills（可选，面经提取可复用）
             skills_enabled=True,
             skills_dir=_skills_dir,
             skills_auto_register=True,
             # 熔断器（OCR/LLM 失败时自动熔断）
-            circuit_enabled=True,
-            circuit_failure_threshold=3,
+            circuit_enabled=settings.miner_circuit_enabled,
+            circuit_failure_threshold=settings.miner_circuit_failure_threshold,
+            circuit_recovery_timeout=settings.miner_circuit_recovery_timeout,
             # 工具输出截断（OCR 结果可能很长）
-            tool_output_max_lines=500,
-            tool_output_max_bytes=20480,
-            tool_output_dir=f"{_data_dir}/tool-output",
+            tool_output_max_lines=settings.agent_tool_output_max_lines,
+            tool_output_max_bytes=settings.agent_tool_output_max_bytes,
+            tool_output_dir=settings.agent_tool_output_dir,
+            tool_output_truncate_direction=settings.agent_tool_output_truncate_direction,
             # 子代理（TaskTool，可选）
             subagent_enabled=False,
             # 异步
@@ -101,6 +131,7 @@ class MinerAgent(ReActAgent):
         )
 
         max_steps = settings.miner_max_steps
+        self._agent_logger = build_agent_logger("MinerAgent", settings.agent_run_log_dir)
 
         # 初始化父类（ReActAgent）
         super().__init__(
@@ -111,12 +142,38 @@ class MinerAgent(ReActAgent):
             max_steps=max_steps,
             config=_agent_config,
         )
+        if _agent_config.session_enabled:
+            from backend.services.storage.sqlite_session_store import SqliteSessionStore
+            self.session_store = SqliteSessionStore(session_dir="sqlite")
 
         _n_ep = len(_llms) if settings.miner_mode == "remote" and _llms else (1 if settings.miner_mode != "remote" else 0)
         logger.info(
             f"[MinerAgent] 初始化完成 miner_mode={settings.miner_mode} model={settings.miner_model} "
-            f"endpoints={_n_ep or 1} max_steps={max_steps} trace_enabled"
+            f"endpoints={_n_ep or 1} max_steps={max_steps} "
+            f"circuit_enabled={settings.miner_circuit_enabled} "
+            f"circuit_failure_threshold={settings.miner_circuit_failure_threshold} "
+            f"circuit_recovery_timeout={settings.miner_circuit_recovery_timeout}s"
         )
+
+    def _append_devlog(self, category: str, content: str, metadata: dict | None = None) -> None:
+        """轻量运行时 DevLog：用于自动记录 Miner 的失败与恢复。"""
+        if not settings.miner_devlog_enabled:
+            return
+        try:
+            devlog_dir = Path(settings.agent_devlog_dir)
+            devlog_dir.mkdir(parents=True, exist_ok=True)
+            now = datetime.now(timezone.utc)
+            payload = {
+                "id": f"devlog-{now.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}",
+                "timestamp": now.isoformat().replace("+00:00", "Z"),
+                "category": category,
+                "content": content,
+                "metadata": metadata or {},
+            }
+            out = devlog_dir / f"{payload['id']}.json"
+            out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.debug("[MinerAgent] 写入 DevLog 失败（忽略）: %s", e)
 
     def run(
         self,
@@ -155,8 +212,18 @@ class MinerAgent(ReActAgent):
 
         # 重置状态
         self._ocr_called = False
+        _session_id = _build_miner_session_id(self._task_id, user_input)
 
         try:
+            if settings.miner_session_enabled:
+                try:
+                    self.load_session(_session_id, check_consistency=False)
+                    logger.info("[MinerAgent] 已恢复会话: %s", _session_id)
+                except FileNotFoundError:
+                    pass
+                except Exception as _e:
+                    logger.warning("[MinerAgent] load_session 失败（忽略）: %s", _e)
+
             # 调用父类的 run 方法（ReActAgent 自动处理 Thought/Finish/工具循环）
             result = super().run(user_input)
 
@@ -197,6 +264,22 @@ class MinerAgent(ReActAgent):
             is_unrelated_obj = self._is_unrelated_object(result_text)
             
             if UNRELATED_SIGNAL in result_text or mark_unrelated_called or is_unrelated_obj:
+                if MinerAgent._had_recent_failure:
+                    self._append_devlog(
+                        "solution",
+                        "Miner 从失败状态恢复（当前任务成功判定为 unrelated）。",
+                        {
+                            "task_id": self._task_id,
+                            "has_image": has_image,
+                            "company": company,
+                            "position": position,
+                            "source_url": source_url,
+                            "post_title": post_title,
+                            "result_type": "unrelated",
+                            "tags": ["miner", "recovery", "solution"],
+                        },
+                    )
+                    MinerAgent._had_recent_failure = False
                 logger.debug(f"[MinerAgent] 执行完成，输出长度: {len(result_text)}, ocr_called={self._ocr_called}, is_unrelated=True")
                 return UNRELATED_SIGNAL, self._ocr_called, True
 
@@ -204,26 +287,93 @@ class MinerAgent(ReActAgent):
             # 尝试从中提取 JSON 以避免整条记录被标记为 error
             result_text = self._extract_json_if_direct_reply(result_text)
 
+            if not result_text:
+                self._append_devlog(
+                    "issue",
+                    "Miner 执行返回空结果。",
+                    {
+                        "task_id": self._task_id,
+                        "has_image": has_image,
+                        "company": company,
+                        "position": position,
+                        "source_url": source_url,
+                        "post_title": post_title,
+                        "tags": ["miner", "empty-result", "issue"],
+                    },
+                )
+                MinerAgent._had_recent_failure = True
+            elif MinerAgent._had_recent_failure:
+                self._append_devlog(
+                    "solution",
+                    "Miner 从失败状态恢复（当前任务返回有效结果）。",
+                    {
+                        "task_id": self._task_id,
+                        "has_image": has_image,
+                        "company": company,
+                        "position": position,
+                        "source_url": source_url,
+                        "post_title": post_title,
+                        "result_length": len(result_text),
+                        "tags": ["miner", "recovery", "solution"],
+                    },
+                )
+                MinerAgent._had_recent_failure = False
+
             logger.debug(f"[MinerAgent] 执行完成，输出长度: {len(result_text)}, ocr_called={self._ocr_called}, is_unrelated=False")
             return result_text, self._ocr_called, False
 
         except Exception as e:
             logger.error(f"[MinerAgent] 执行异常: {e}")
+            self._append_devlog(
+                "issue",
+                "Miner 执行异常。",
+                {
+                    "task_id": self._task_id,
+                    "has_image": has_image,
+                    "company": company,
+                    "position": position,
+                    "source_url": source_url,
+                    "post_title": post_title,
+                    "error": str(e),
+                    "tags": ["miner", "exception", "issue"],
+                },
+            )
+            MinerAgent._had_recent_failure = True
             return "", self._ocr_called, False
+        finally:
+            if settings.miner_session_enabled:
+                try:
+                    self.save_session(_session_id)
+                except Exception as _e:
+                    logger.warning("[MinerAgent] save_session 失败（忽略）: %s", _e)
 
     def _execute_tool_call(self, tool_name: str, arguments):
         """统一记录 Miner 的工具调用统计（含子进程链路）。"""
         from backend.agents.context import get_current_user_id
 
-        _t0 = time.time()
         try:
-            result = super()._execute_tool_call(tool_name, arguments)
+            tool = self.tool_registry.get_tool(tool_name)
+            if not tool:
+                result = f"❌ 工具 {tool_name} 不存在"
+                ok = False
+                cost_ms = 0.0
+            else:
+                tool_response = tool.run_with_timing(arguments)
+                result = tool_response.text
+                ok = tool_execution_success_for_stats(
+                    str(result),
+                    response_status=getattr(tool_response, "status", None),
+                )
+                _stats = getattr(tool_response, "stats", None)
+                _time_ms = _stats.get("time_ms") if isinstance(_stats, dict) else None
+                cost_ms = float(_time_ms) if _time_ms is not None else 0.0
             agent_tool_runtime_stats.record(
                 agent_name=self.name,
                 tool_name=tool_name,
-                success=tool_execution_success_for_stats(str(result)),
-                execution_time_ms=(time.time() - _t0) * 1000.0,
+                success=ok,
+                execution_time_ms=cost_ms,
                 user_id=get_current_user_id(),
+                params_input=arguments if isinstance(arguments, dict) else {},
             )
             return result
         except Exception:

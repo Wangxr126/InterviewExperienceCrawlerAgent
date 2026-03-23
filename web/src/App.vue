@@ -50,8 +50,10 @@
         <GraphRagView v-show="currentView === 'graph_rag'"
                       :user-id="userId"
                       :is-active="currentView === 'graph_rag'" />
-        <ModelCompareView v-show="currentView === 'model_compare'" />
-        <ModelBenchView v-show="currentView === 'model_bench'" :prefill="modelBenchPrefill" />
+        <ModelBenchView
+          v-show="currentView === 'model_compare'"
+          :prefill="modelBenchPrefill"
+        />
       </main>
     </div>
 
@@ -76,7 +78,6 @@ import ReportView   from './views/ReportView.vue'
 import FinetuneView from './views/FinetuneView.vue'
 import ToolUsageView from './views/ToolUsageView.vue'
 import GraphRagView from './views/GraphRagView.vue'
-import ModelCompareView from './views/ModelCompareView.vue'
 import ModelBenchView from './views/ModelBenchView.vue'
 import MasteryDialog from './components/MasteryDialog.vue'
 
@@ -107,8 +108,7 @@ const navItems = [
   { key: 'finetune', icon: '🧪', label: '微调标注' },
   { key: 'tool_usage', icon: '🧰', label: '工具统计' },
   { key: 'graph_rag', icon: '🕸️', label: 'GraphRAG' },
-  { key: 'model_compare', icon: '⚖️', label: '模型对比' },
-  { key: 'model_bench',   icon: '🔬', label: '推理评测' },
+  { key: 'model_compare', icon: '🔬', label: '模型对比' },
 ]
 
 const loadMeta = async () => {
@@ -193,10 +193,13 @@ const onRunModelBench = ({ question } = {}) => {
     question: { ...question },
     ts: Date.now(),
   }
-  currentView.value = 'model_bench'
+  currentView.value = 'model_compare'
 }
 
 onMounted(async () => {
+  if (currentView.value === 'model_bench') {
+    currentView.value = 'model_compare'
+  }
   await loadConfig()
   await loadMeta()
 })

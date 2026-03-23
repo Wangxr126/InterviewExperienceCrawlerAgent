@@ -80,7 +80,7 @@ class MultiRecallRecommender:
         # 1. 向量召回（薄弱点相似题 / query 语义相似）
         if weights.get("vector", 0) > 0:
             try:
-                from backend.tools.knowledge_manager_tools import generate_embedding
+                from backend.services.knowledge.knowledge_tools import generate_embedding
                 q = effective_query or (effective_tags[0] if effective_tags else "")
                 if q:
                     emb = generate_embedding(q[:2048])
@@ -215,7 +215,7 @@ class MultiRecallRecommender:
         # 1a) 向量召回（薄弱点相似）
         if w_vector > 0 and effective_query:
             try:
-                from backend.tools.knowledge_manager_tools import generate_embedding
+                from backend.services.knowledge.knowledge_tools import generate_embedding
                 emb = generate_embedding(effective_query[:2048])
                 if emb and neo4j_service.available:
                     vec_results = neo4j_service.search_similar(

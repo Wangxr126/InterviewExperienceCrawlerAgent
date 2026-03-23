@@ -297,6 +297,7 @@ from typing import Optional, List, Dict, Any
 import asyncio
 
 import json
+from datetime import datetime
 
 import requests
 
@@ -567,6 +568,31 @@ async def startup_event():
                 )
     except Exception:
         logger.warning("[Startup] fetched 自动恢复失败（不影响主服务启动）", exc_info=True)
+
+    # 历史迁移：将旧会话清洗并合并到默认 user/session，供 HelloAgents SessionStore 直接加载
+    try:
+        mode = _s.chat_history_migration_mode
+        if _s.chat_history_migration_on_startup and mode != "off":
+            marker_path = Path(_s.chat_history_migration_marker)
+            if _s.chat_history_migration_run_once and marker_path.exists():
+                logger.info("[Startup] 历史迁移已执行过（marker 存在），跳过。")
+            else:
+                from backend.scripts.migrate_chat_history_to_default_session import migrate as _migrate_chat_history
+
+                do_apply = mode == "apply"
+                logger.info(f"[Startup] 执行历史迁移 mode={mode} ...")
+                rc = await asyncio.to_thread(_migrate_chat_history, do_apply)
+                if rc == 0 and _s.chat_history_migration_run_once:
+                    marker_path.parent.mkdir(parents=True, exist_ok=True)
+                    marker_payload = {
+                        "mode": mode,
+                        "applied": do_apply,
+                        "executed_at": datetime.now().isoformat(),
+                    }
+                    marker_path.write_text(json.dumps(marker_payload, ensure_ascii=False), encoding="utf-8")
+                logger.info(f"[Startup] 历史迁移完成 mode={mode} rc={rc}")
+    except Exception:
+        logger.warning("[Startup] 历史迁移执行失败（不影响主服务启动）", exc_info=True)
 
     # 同步预热 LLM，确保首次请求不因冷启动超时
     if _s.llm_warmup_enabled and _s.llm_base_url:
@@ -889,6 +915,22 @@ def _attach_placeholder_tools_from_logs(messages: list, user_id: str, session_id
         if tools:
             m["thinking"] = [{"__step": 1, "thought": "", "tools": tools}]
 
+
+def _load_history_from_session_store(user_id: str, session_id: str) -> list:
+    """
+    从 InterviewerAgent 的 session_store 读取会话历史（与 chat load/save 同源）。
+    读取失败时返回空列表。
+    """
+    try:
+        _store = getattr(orchestrator, "session_store", None)
+        if _store is None:
+            return []
+        payload = _store.load(f"{user_id}:{session_id}")
+        history = payload.get("history") if isinstance(payload, dict) else []
+        return history if isinstance(history, list) else []
+    except Exception:
+        return []
+
 @app.get("/")
 
 def root():
@@ -904,6 +946,64 @@ def root():
 def health():
 
     return {"status": "ok"}
+
+
+def _normalize_circuit_status(status_obj: Any) -> Dict[str, Any]:
+    if isinstance(status_obj, dict):
+        return {
+            "state": status_obj.get("state"),
+            "failure_count": status_obj.get("failure_count"),
+            "open_since": status_obj.get("open_since"),
+            "recover_in_seconds": status_obj.get("recover_in_seconds"),
+        }
+    return {"raw": str(status_obj)}
+
+
+def _collect_registry_circuit_status(registry: Any) -> Dict[str, Any]:
+    cb = getattr(registry, "circuit_breaker", None) if registry is not None else None
+    if cb is None:
+        return {"available": False, "reason": "circuit_breaker_not_found"}
+    get_all = getattr(cb, "get_all_status", None)
+    if not callable(get_all):
+        return {"available": False, "reason": "get_all_status_not_supported"}
+    try:
+        raw = get_all() or {}
+        if not isinstance(raw, dict):
+            return {"available": True, "tools": {}, "raw": str(raw)}
+        tools = {name: _normalize_circuit_status(st) for name, st in raw.items()}
+        return {"available": True, "tools": tools}
+    except Exception as e:
+        return {"available": False, "reason": f"read_failed: {e}"}
+
+
+@app.get("/api/agents/circuit-breaker/status")
+def get_agents_circuit_breaker_status():
+    """查看各 Agent 工具熔断状态（open/closed、失败次数、恢复倒计时）。"""
+    from backend.services.crawler.question_extractor import get_latest_miner_runtime_handles
+
+    interviewer_registry = getattr(orchestrator, "tool_registry", None)
+    miner_handles = get_latest_miner_runtime_handles()
+    miner_agent = miner_handles.get("miner_agent")
+    two_stage_extractor = miner_handles.get("two_stage_extractor")
+
+    miner_registry = getattr(miner_agent, "tool_registry", None) if miner_agent else None
+    two_stage_registry = getattr(two_stage_extractor, "_registry", None) if two_stage_extractor else None
+
+    return {
+        "status": "ok",
+        "generated_at": now_beijing_str(),
+        "agents": {
+            "interviewer": _collect_registry_circuit_status(interviewer_registry),
+            "miner": _collect_registry_circuit_status(miner_registry) if miner_registry else {
+                "available": False,
+                "reason": "miner_not_initialized_yet",
+            },
+            "two_stage_stage1": _collect_registry_circuit_status(two_stage_registry) if two_stage_registry else {
+                "available": False,
+                "reason": "two_stage_not_initialized_yet",
+            },
+        },
+    }
 
 
 
@@ -1727,20 +1827,32 @@ def get_question_study_records(
     return sqlite_service.get_study_records_by_question(user_id, question_id, limit=limit)
 
 @app.get("/api/user/{user_id}/chat/history")
-def get_chat_history(user_id: str):
+def get_chat_history(
+    user_id: str,
+    session_id: str | None = Query(None, description="可选。指定会话 ID；不传则取默认/最近会话"),
+):
     """获取用户对话历史：优先读取 .env 默认会话，不存在再回退到用户最近一次会话。"""
     import re as _re
     from datetime import datetime as _dt, timedelta as _td
     from backend.config.config import settings as _settings
     fixed_session_id = _settings.default_session_id
-    session = sqlite_service.get_session(fixed_session_id)
-    if not session or session.get("user_id") != user_id:
-        session = sqlite_service.get_latest_session_for_user(user_id)
+    preferred_session_id = (session_id or "").strip()
+    if preferred_session_id:
+        session = sqlite_service.get_session(preferred_session_id)
+        if session and session.get("user_id") != user_id:
+            session = None
+    else:
+        session = sqlite_service.get_session(fixed_session_id)
+        if not session or session.get("user_id") != user_id:
+            session = sqlite_service.get_latest_session_for_user(user_id)
     if not session:
         return {"messages": [], "session_id": None}
 
     raw_history = session.get("conversation_history") or []
     session_id = session.get("session_id")
+    ss_history = _load_history_from_session_store(user_id, session_id or fixed_session_id)
+    if len(ss_history) > len(raw_history):
+        raw_history = ss_history
 
     messages = []
     base_time = _dt.now()
@@ -1799,6 +1911,9 @@ def get_all_chat_history(user_id: str):
     for session in all_sessions:
         raw_history = session.get("conversation_history") or []
         session_id = session.get("session_id")
+        ss_history = _load_history_from_session_store(user_id, session_id or "")
+        if len(ss_history) > len(raw_history):
+            raw_history = ss_history
         
         for msg in raw_history:
             if not isinstance(msg, dict):

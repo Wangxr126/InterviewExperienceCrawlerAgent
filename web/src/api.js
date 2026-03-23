@@ -13,8 +13,9 @@ export const api = {
   },
 
   // ── 对话历史 ───────────────────────────────────────────
-  async getChatHistory(userId) {
-    const r = await fetch(`${BASE}/api/user/${userId}/chat/history`)
+  async getChatHistory(userId, sessionId = null) {
+    const q = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''
+    const r = await fetch(`${BASE}/api/user/${userId}/chat/history${q}`)
     return r.json()
   },
 

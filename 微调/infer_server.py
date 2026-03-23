@@ -14,12 +14,18 @@ import asyncio
 import threading
 from pathlib import Path
 from typing import Optional
+from dotenv import load_dotenv
 
 os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("UNSLOTH_DISABLE_STATISTICS", "1")
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
+
+# 读取项目根目录 .env，便于在前端/后端之外直接运行此脚本时也能吃到配置。
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
 import torch
 from fastapi import FastAPI, Query
@@ -32,16 +38,14 @@ from peft import PeftModel
 BASE_MODEL     = "unsloth/Qwen3-4B"
 LOAD_IN_4BIT   = True
 PORT           = int(os.environ.get("INFER_PORT", 8899))
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", 512))
-
-_SCRIPT_DIR = Path(__file__).resolve().parent
+MAX_NEW_TOKENS = int(os.environ.get("INFER_MAX_NEW_TOKENS", os.environ.get("MAX_NEW_TOKENS", 2048)))
 
 # adapter 路径（None = 基础模型不加载 adapter）
 ADAPTERS: dict[str, Optional[str]] = {
     "base":    None,
-    "seq2048": str(_SCRIPT_DIR / "lora_output/qwen3-4b-miner_r16_seq2048_bs1x16_ep3_lr2e-4"),
-    "seq4096": str(_SCRIPT_DIR / "lora_output/qwen3-4b-miner_r16_seq4096_bs1x16_ep3_lr2e-4"),
-    "seq8192": str(_SCRIPT_DIR / "lora_output/qwen3-4b-miner_r16_seq8192_bs1x32_ep3_lr2e-4"),
+    "seq2048": str(_SCRIPT_DIR / "adapter/lora_seq2048/qwen3-4b-miner_r16_seq2048_bs1x16_ep3_lr2e-4"),
+    "seq4096": str(_SCRIPT_DIR / "adapter/lora_seq4096/qwen3-4b-miner_r16_seq4096_bs1x16_ep3_lr2e-4"),
+    "seq8192": str(_SCRIPT_DIR / "adapter/lora_seq8192/qwen3-4b-miner_r16_seq8192_bs1x32_ep3_lr2e-4"),
 }
 
 ADAPTER_LABELS = {

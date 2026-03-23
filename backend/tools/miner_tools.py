@@ -77,6 +77,52 @@ class OcrImagesTool(Tool):
             logger.error(f"[OcrTool] OCR 失败: {e}")
             return ToolResponse.error(code="OCR_FAILED", message=f"OCR 执行失败: {str(e)}")
 
+    async def arun(self, parameters: Dict[str, Any]) -> ToolResponse:
+        """
+        异步并发执行 OCR。
+        当存在多张图片时，使用 ocr_images_to_text_async 并行处理，提升 I/O 场景吞吐。
+        """
+        self._call_count += 1
+
+        if not self._image_paths:
+            logger.info("[OcrTool] 无图片可识别")
+            return ToolResponse.success(text="", data={"image_count": 0, "ocr_called": True})
+
+        logger.info(f"[OcrTool] 开始异步 OCR，共 {len(self._image_paths)} 张图片")
+        try:
+            from backend.services.crawler.ocr_service_mcp import (
+                is_remote_ocr_unconfigured,
+                ocr_images_to_text_async,
+            )
+
+            result = await ocr_images_to_text_async(
+                self._image_paths,
+                self._task_id,
+                max_concurrency=4,
+            )
+            if result:
+                logger.info(f"[OcrTool] OCR 成功，识别字符数: {len(result)}")
+                return ToolResponse.success(
+                    text=result,
+                    data={"image_count": len(self._image_paths), "char_count": len(result), "ocr_called": True}
+                )
+
+            if is_remote_ocr_unconfigured():
+                logger.error("[OcrTool] remote OCR 不可用（缺少 OCR_REMOTE_* 配置），未识别到文字")
+            else:
+                logger.warning("[OcrTool] OCR 未识别到文字")
+            return ToolResponse.partial(
+                text="未从图片中识别到有效文字，请结合正文判断或考虑标记无关。",
+                data={
+                    "image_count": len(self._image_paths),
+                    "char_count": 0,
+                    "ocr_called": True,
+                },
+            )
+        except Exception as e:
+            logger.error(f"[OcrTool] 异步 OCR 失败: {e}")
+            return ToolResponse.error(code="OCR_FAILED", message=f"OCR 执行失败: {str(e)}")
+
 
 class MarkUnrelatedTool(Tool):
     """
@@ -84,7 +130,7 @@ class MarkUnrelatedTool(Tool):
     当正文和图片均无面试题时调用，标记后任务立即结束。
     """
 
-    def __init__(self):
+    def __init__(self, task_id: str = "", source_url: str = ""):
         super().__init__(
             name="mark_unrelated",
             description=(
@@ -93,6 +139,8 @@ class MarkUnrelatedTool(Tool):
                 "调用一次后任务立即结束，禁止重复调用。收到 __UNRELATED__ 后无需任何后续操作。"
             ),
         )
+        self._task_id = (task_id or "").strip()
+        self._source_url = (source_url or "").strip()
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
@@ -105,10 +153,42 @@ class MarkUnrelatedTool(Tool):
         ]
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """返回特殊信号，由 MinerAgent 识别并处理"""
+        """标记无关帖并返回特殊信号，由 MinerAgent 识别并处理。"""
         reason = parameters.get("reason", "LLM判断无关")
         logger.info(f"[MarkUnrelatedTool] 标记无关: {reason}")
-        return ToolResponse.success(text="__UNRELATED__", data={"reason": reason})
+
+        updated_rows = 0
+        try:
+            from backend.services.storage.sqlite_service import sqlite_service
+
+            if self._task_id:
+                # 优先按 task_id 更新，定位更稳定
+                sqlite_service.update_task_status(
+                    self._task_id,
+                    "unrelated",
+                    error_msg=str(reason),
+                )
+                updated_rows = 1
+            elif self._source_url:
+                # 兜底按 source_url 直接执行 SQL 更新
+                with sqlite_service._get_conn() as conn:  # noqa: SLF001 - 仅用于本工具兜底更新
+                    cur = conn.execute(
+                        """
+                        UPDATE crawl_tasks
+                        SET status='unrelated', error_msg=?, processed_at=CURRENT_TIMESTAMP
+                        WHERE source_url=?
+                        """,
+                        (str(reason), self._source_url),
+                    )
+                    conn.commit()
+                    updated_rows = int(cur.rowcount or 0)
+        except Exception as e:
+            logger.warning("[MarkUnrelatedTool] 更新 crawl_tasks 为 unrelated 失败: %s", e)
+
+        return ToolResponse.success(
+            text="__UNRELATED__",
+            data={"reason": reason, "updated_rows": updated_rows},
+        )
 
 
 class VerifyExtractionCountTool(Tool):

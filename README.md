@@ -293,10 +293,8 @@ wxr_agent/
 │   │   ├── warmup/               # LLM / Embedding / Rerank 预热
 │   │   └── ...                   # rerank、多路召回推荐等
 │   ├── tools/
-│   │   ├── hunter_tools.py
 │   │   ├── interviewer_tools.py
-│   │   ├── miner_tools.py
-│   │   └── knowledge_manager_tools.py
+│   │   └── miner_tools.py
 │   ├── llm/                      # 流式与 DeepSeek 适配等
 │   └── data/                     # 默认数据根（库文件、post_images、neo4j/qdrant 卷映射等）
 │
@@ -371,9 +369,9 @@ wxr_agent/
 
 ### 新平台支持
 
-1. 在 `backend/tools/hunter_tools.py` 新增 `parseXXX()` 函数
-2. 在 `detectPlatform()` 中注册 URL 检测规则
-3. 定义统一输出 schema
+1. 在 `backend/services/crawler/` 新增对应平台抓取模块
+2. 在调度/抓取入口注册 URL 检测与任务流转规则
+3. 定义统一输出 schema（供提取链路复用）
 
 ### 新处理策略
 

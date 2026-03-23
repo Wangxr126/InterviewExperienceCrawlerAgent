@@ -45,7 +45,7 @@ def _embed_texts_for_rerank_fallback(texts: List[str], timeout: int) -> Optional
         except Exception as e:
             logger.debug("[Rerank] 批量 Embedding 失败，尝试逐条: %s", e)
     try:
-        from backend.tools.knowledge_manager_tools import generate_embedding
+        from backend.services.knowledge.knowledge_tools import generate_embedding
     except ImportError:
         return None
     out: List[List[float]] = []

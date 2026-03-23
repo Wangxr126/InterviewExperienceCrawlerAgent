@@ -17,6 +17,7 @@
     OCR_RETRIES=3
 """
 import logging
+import asyncio
 import base64
 import re
 import time
@@ -300,6 +301,13 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
     if not image_paths:
         return ""
 
+    # 同步入口在「多图 + 无事件循环」时自动走并发异步实现，兼容现有 run() 调用链。
+    if len(image_paths) > 1:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(ocr_images_to_text_async(image_paths, task_id=task_id, max_concurrency=4))
+
     method = settings.ocr_method
     post_images_dir = settings.post_images_dir
     timeout = settings.ocr_timeout
@@ -344,17 +352,14 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
             t = _call_claude_vision_ocr(path, timeout)
         return t
 
-    results = []
-    failed_detail: list[str] = []
-    for idx, rel_path in enumerate(image_paths):
+    def _process_single_image(idx: int, rel_path: str) -> tuple[int, Optional[str], Optional[str]]:
+        """处理单张图片，返回 (idx, ocr_text_or_none, failed_detail_or_none)。"""
         if not rel_path or ".." in rel_path:
-            failed_detail.append(f"图片{idx + 1}: 非法路径 rel={rel_path!r}")
-            continue
+            return idx, None, f"图片{idx + 1}: 非法路径 rel={rel_path!r}"
         full_path = post_images_dir / rel_path
         if not full_path.exists():
             logger.warning(f"[OCR] 跳过不存在的图片: {full_path}")
-            failed_detail.append(f"图片{idx + 1}: 文件不存在 {full_path}")
-            continue
+            return idx, None, f"图片{idx + 1}: 文件不存在 {full_path}"
 
         text = None
         for attempt in range(max_retries + 1):
@@ -378,15 +383,22 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
                     time.sleep(1)
 
         if text and text.strip():
-            results.append(f"[图片{idx + 1} OCR结果]\n{text.strip()}")
-        else:
-            _sz = full_path.stat().st_size if full_path.exists() else -1
-            logger.warning(
-                f"[OCR] 图片 {idx + 1} 重试 {max_retries} 次后仍未识别到有效文字: {rel_path} (文件约 {_sz} bytes)"
-            )
-            failed_detail.append(
-                f"图片{idx + 1}: rel={rel_path} bytes={_sz} 无有效OCR文字"
-            )
+            return idx, f"[图片{idx + 1} OCR结果]\n{text.strip()}", None
+
+        _sz = full_path.stat().st_size if full_path.exists() else -1
+        logger.warning(
+            f"[OCR] 图片 {idx + 1} 重试 {max_retries} 次后仍未识别到有效文字: {rel_path} (文件约 {_sz} bytes)"
+        )
+        return idx, None, f"图片{idx + 1}: rel={rel_path} bytes={_sz} 无有效OCR文字"
+
+    results: list[str] = []
+    failed_detail: list[str] = []
+    for idx, rel_path in enumerate(image_paths):
+        _, one_result, one_failed = _process_single_image(idx, rel_path)
+        if one_result:
+            results.append(one_result)
+        elif one_failed:
+            failed_detail.append(one_failed)
 
     if not results:
         logger.warning(
@@ -407,4 +419,135 @@ def ocr_images_to_text(image_paths: List[str], task_id: str = "") -> str:
         )
 
     logger.info(f"[OCR] 完成，成功识别 {len(results)}/{len(image_paths)} 张")
+    return "\n\n".join(results)
+
+
+async def ocr_images_to_text_async(
+    image_paths: List[str],
+    task_id: str = "",
+    max_concurrency: int = 4,
+) -> str:
+    """
+    异步并发 OCR 本地图片，返回拼接后的文本（按原图片顺序）。
+    适用于 hello_agents 工具 `arun()` 场景。
+    """
+    if not image_paths:
+        return ""
+
+    method = settings.ocr_method
+    post_images_dir = settings.post_images_dir
+    timeout = settings.ocr_timeout
+    max_retries = settings.ocr_retries
+    logger.info(
+        f"[OCR-Async] 方式={method}, 图片数={len(image_paths)}, timeout={timeout}s, retries={max_retries}, "
+        f"concurrency={max_concurrency}, task={task_id}"
+    )
+
+    if method == "remote":
+        if not (settings.ocr_remote_api_key or "").strip() or not (settings.ocr_remote_base_url or "").strip():
+            logger.error("[OCR-Async] remote 模式必须配置 OCR_REMOTE_API_KEY 与 OCR_REMOTE_BASE_URL")
+            return ""
+        if not settings.ocr_remote_models:
+            logger.error("[OCR-Async] remote 模式需要 OCR_REMOTE_MODELS 或 OCR_REMOTE_MODEL")
+            return ""
+    if method == "qwen_vl" and not settings.ocr_api_key:
+        logger.warning("[OCR-Async] qwen_vl 模式但未配置 API Key")
+        return ""
+    if method == "claude_vision" and not settings.anthropic_api_key:
+        logger.warning("[OCR-Async] claude_vision 模式但 ANTHROPIC_API_KEY 未配置")
+        return ""
+
+    def _do_ocr(path: str) -> Optional[str]:
+        t = None
+        if method == "remote":
+            t = _call_remote_ocr(path, timeout)
+        elif method == "ollama_vl":
+            t = _call_ollama_vl_ocr(path, timeout)
+        elif method == "claude_vision":
+            t = _call_claude_vision_ocr(path, timeout)
+        elif method == "qwen_vl":
+            t = _call_qwen_vl_ocr(path, timeout)
+        else:
+            t = _call_ollama_vl_ocr(path, timeout)
+        if not t and method == "claude_vision":
+            t = _call_qwen_vl_ocr(path, timeout)
+        elif not t and method == "qwen_vl":
+            t = _call_claude_vision_ocr(path, timeout)
+        return t
+
+    def _process_single_image(idx: int, rel_path: str) -> tuple[int, Optional[str], Optional[str]]:
+        if not rel_path or ".." in rel_path:
+            return idx, None, f"图片{idx + 1}: 非法路径 rel={rel_path!r}"
+        full_path = post_images_dir / rel_path
+        if not full_path.exists():
+            logger.warning(f"[OCR-Async] 跳过不存在的图片: {full_path}")
+            return idx, None, f"图片{idx + 1}: 文件不存在 {full_path}"
+
+        text = None
+        for attempt in range(max_retries + 1):
+            try:
+                text = _do_ocr(str(full_path))
+                if text and text.strip():
+                    if _is_ocr_garbled(text):
+                        logger.warning(
+                            f"[OCR-Async] 图片 {idx + 1} 疑似乱码（第 {attempt + 1}/{max_retries + 1} 次）: {text[:50]}..."
+                        )
+                        text = None
+                        if attempt < max_retries:
+                            time.sleep(1)
+                        continue
+                    break
+                if attempt < max_retries:
+                    logger.warning(
+                        f"[OCR-Async] 图片 {idx + 1} 未识别到文字，第 {attempt + 1}/{max_retries + 1} 次重试: {rel_path}"
+                    )
+                    time.sleep(1)
+            except Exception as e:
+                logger.warning(f"[OCR-Async] 图片 {idx + 1} 第 {attempt + 1} 次失败: {e}")
+                if attempt < max_retries:
+                    time.sleep(1)
+
+        if text and text.strip():
+            return idx, f"[图片{idx + 1} OCR结果]\n{text.strip()}", None
+
+        _sz = full_path.stat().st_size if full_path.exists() else -1
+        logger.warning(
+            f"[OCR-Async] 图片 {idx + 1} 重试 {max_retries} 次后仍未识别到有效文字: {rel_path} (文件约 {_sz} bytes)"
+        )
+        return idx, None, f"图片{idx + 1}: rel={rel_path} bytes={_sz} 无有效OCR文字"
+
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+    async def _run_one(idx: int, rel_path: str) -> tuple[int, Optional[str], Optional[str]]:
+        async with semaphore:
+            return await asyncio.to_thread(_process_single_image, idx, rel_path)
+
+    items = await asyncio.gather(
+        *(_run_one(i, p) for i, p in enumerate(image_paths)),
+        return_exceptions=False,
+    )
+    items.sort(key=lambda x: x[0])
+
+    results = [it[1] for it in items if it[1]]
+    failed_detail = [it[2] for it in items if it[2]]
+
+    if not results:
+        logger.warning(
+            "[OCR-Async] 本任务无可用 OCR 文本 | task=%s | 共 %d 张路径 | 明细: %s",
+            task_id,
+            len(image_paths),
+            "; ".join(failed_detail) if failed_detail else "(无明细)",
+        )
+        return ""
+
+    if len(results) < len(image_paths):
+        logger.info(
+            "[OCR-Async] 部分成功 %d/%d 张 | task=%s | 未出字明细: %s",
+            len(results),
+            len(image_paths),
+            task_id,
+            "; ".join(failed_detail) if failed_detail else "-",
+        )
+
+    logger.info(f"[OCR-Async] 完成，成功识别 {len(results)}/{len(image_paths)} 张")
     return "\n\n".join(results)

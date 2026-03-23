@@ -52,6 +52,11 @@
             {{ Number(row.avg_execution_time_ms || 0).toFixed(1) }}
           </template>
         </el-table-column>
+        <el-table-column prop="latest_params_input" label="最近入参" min-width="260">
+          <template #default="{ row }">
+            <span class="params-preview">{{ formatParamsInput(row.latest_params_input) }}</span>
+          </template>
+        </el-table-column>
       </el-table>
     </div>
 
@@ -153,6 +158,16 @@ watch(
 )
 
 onBeforeUnmount(() => stopAutoRefresh())
+
+const formatParamsInput = (val) => {
+  if (!val) return '-'
+  try {
+    const s = typeof val === 'string' ? val : JSON.stringify(val)
+    return s.length > 120 ? `${s.slice(0, 120)}...` : s
+  } catch {
+    return String(val)
+  }
+}
 </script>
 
 <style scoped>
@@ -203,6 +218,10 @@ onBeforeUnmount(() => stopAutoRefresh())
 .empty-state {
   text-align: center;
   padding: 60px 12px;
+  color: var(--text-sub);
+}
+.params-preview {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   color: var(--text-sub);
 }
 </style>

@@ -18,6 +18,7 @@ SSE 消息格式（JSON）：
 import asyncio
 import json
 import time
+from urllib.parse import urlparse
 from typing import List, Optional
 
 import httpx
@@ -30,6 +31,41 @@ _DEFAULT_SERVER = "http://localhost:8899"
 _INFER_PATH = "/infer/stream"   # POST {question, model}
 _FALLBACK_INFER_PATH = "/infer/compare-stream"  # GET ?question=...&models=...
 _MODEL_TIMEOUT = 120.0
+
+
+def _normalize_server_url(server_url: str) -> str:
+    """规范化推理服务地址：补协议、去尾斜杠、剔除 infer 子路径。"""
+    s = (server_url or "").strip()
+    if not s:
+        return _DEFAULT_SERVER
+    if "://" not in s:
+        s = f"http://{s}"
+    s = s.rstrip("/")
+    if s.endswith("/infer/stream"):
+        s = s[: -len("/infer/stream")]
+    elif s.endswith("/infer/compare-stream"):
+        s = s[: -len("/infer/compare-stream")]
+    return s
+
+
+def _candidate_server_urls(server_url: str) -> List[str]:
+    """
+    生成候选地址，优先原地址。
+    额外兼容后端跑在容器内、推理服务跑在宿主机的常见场景：
+    localhost/127.0.0.1 -> host.docker.internal
+    """
+    base = _normalize_server_url(server_url)
+    out = [base]
+    try:
+        parsed = urlparse(base)
+        host = (parsed.hostname or "").lower()
+        if host in {"localhost", "127.0.0.1"}:
+            alt = base.replace(parsed.netloc, base.split("//", 1)[1].replace(host, "host.docker.internal", 1), 1)
+            if alt not in out:
+                out.append(alt)
+    except Exception:
+        pass
+    return out
 
 
 def _sse(data: dict) -> str:
@@ -47,7 +83,7 @@ async def _stream_one_model(
     """向 DSW 服务发送单个模型请求，token 逐个放入 queue"""
     start = time.time()
     await queue.put({"type": "start", "model": model_id})
-    async def _consume_stream(resp: httpx.Response):
+    async def _consume_stream(resp: httpx.Response) -> str:
         resp.raise_for_status()
         async for line in resp.aiter_lines():
             line = line.strip()
@@ -71,37 +107,60 @@ async def _stream_one_model(
             elif t == "done":
                 elapsed_ms = int((time.time() - start) * 1000)
                 await queue.put({"type": "done", "model": model_id, "elapsed_ms": elapsed_ms})
-                return
+                return "done"
             elif t == "error":
                 await queue.put({"type": "error", "model": model_id, "text": msg.get("text", "unknown error")})
-                return
+                return "error"
             else:
                 # 其他类型透传
                 await queue.put({**msg, "model": model_id})
+        # 流自然结束（未显式给出 done/error）
+        return "eof"
     try:
-        url = server_url.rstrip("/") + _INFER_PATH
-        try:
-            async with client.stream(
-                "POST",
-                url,
-                json={"question": question, "model": model_id},
-                timeout=_MODEL_TIMEOUT,
-            ) as resp:
-                await _consume_stream(resp)
-        except httpx.HTTPStatusError as e:
-            # 兼容 infer_server.py 的 GET /infer/compare-stream
-            if e.response is not None and e.response.status_code in (404, 405):
-                fallback_url = server_url.rstrip("/") + _FALLBACK_INFER_PATH
-                params = {"question": question, "models": model_id}
-                async with client.stream("GET", fallback_url, params=params, timeout=_MODEL_TIMEOUT) as resp2:
-                    await _consume_stream(resp2)
-            else:
-                raise
-        # 如果流结束但没有 done 消息
-        elapsed_ms = int((time.time() - start) * 1000)
-        await queue.put({"type": "done", "model": model_id, "elapsed_ms": elapsed_ms})
+        last_error: Optional[Exception] = None
+        end_state = "eof"
+        for base_url in _candidate_server_urls(server_url):
+            url = base_url + _INFER_PATH
+            try:
+                async with client.stream(
+                    "POST",
+                    url,
+                    json={"question": question, "model": model_id},
+                    timeout=_MODEL_TIMEOUT,
+                ) as resp:
+                    end_state = await _consume_stream(resp)
+                last_error = None
+                break
+            except httpx.HTTPStatusError as e:
+                # 兼容 infer_server.py 的 GET /infer/compare-stream
+                if e.response is not None and e.response.status_code in (404, 405):
+                    fallback_url = base_url + _FALLBACK_INFER_PATH
+                    params = {"question": question, "models": model_id}
+                    async with client.stream("GET", fallback_url, params=params, timeout=_MODEL_TIMEOUT) as resp2:
+                        end_state = await _consume_stream(resp2)
+                    last_error = None
+                    break
+                last_error = e
+            except httpx.ConnectError as e:
+                last_error = e
+                continue
+            except Exception as e:
+                last_error = e
+                break
+        if last_error is not None:
+            raise last_error
+        # 仅在流自然结束且未显式发送 done/error 时补发 done
+        if end_state == "eof":
+            elapsed_ms = int((time.time() - start) * 1000)
+            await queue.put({"type": "done", "model": model_id, "elapsed_ms": elapsed_ms})
     except Exception as e:
-        await queue.put({"type": "error", "model": model_id, "text": f"{type(e).__name__}: {e}"})
+        extra = ""
+        if isinstance(e, httpx.ConnectError):
+            extra = (
+                "（后端无法连到推理服务；请确认该地址对后端进程可达，"
+                "若后端在容器内且你填了 localhost，可改为宿主机 IP）"
+            )
+        await queue.put({"type": "error", "model": model_id, "text": f"{type(e).__name__}: {e}{extra}"})
 
 
 async def _generate(
@@ -163,3 +222,27 @@ async def model_bench_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+async def _self_test() -> None:
+    """
+    轻量自测：验证 URL 规范化和候选地址逻辑。
+    运行：python backend/api/model_bench_api.py --self-test
+    """
+    assert _normalize_server_url("localhost:8899") == "http://localhost:8899"
+    assert _normalize_server_url("http://localhost:8899/infer/stream") == "http://localhost:8899"
+    assert _normalize_server_url("https://x.x.x.x:8899/infer/compare-stream") == "https://x.x.x.x:8899"
+    cands = _candidate_server_urls("localhost:8899")
+    assert cands[0] == "http://localhost:8899"
+    assert any("host.docker.internal" in x for x in cands), cands
+    print("model_bench_api self-test passed")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Model bench api helper")
+    parser.add_argument("--self-test", action="store_true", help="run lightweight self test")
+    args = parser.parse_args()
+    if args.self_test:
+        asyncio.run(_self_test())

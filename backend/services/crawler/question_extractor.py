@@ -261,6 +261,16 @@ def _append_llm_log_to_csv(user_prompt: str, llm_response: str, response_time_se
 
 # 模块级复用 MinerAgent（LLM 客户端只初始化一次）
 _shared_miner_agent = None
+_latest_miner_agent = None
+_latest_two_stage_extractor = None
+
+
+def get_latest_miner_runtime_handles() -> Dict[str, object]:
+    """返回最近一次实际执行过的 Miner/TwoStage 运行时句柄（用于诊断接口）。"""
+    return {
+        "miner_agent": _latest_miner_agent,
+        "two_stage_extractor": _latest_two_stage_extractor,
+    }
 
 
 def _get_miner_agent(image_paths: List[str] = None, task_id: str = ""):
@@ -284,6 +294,7 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
     """
     from backend.agents.miner_agent import UNRELATED_SIGNAL
     from backend.config.config import settings as _settings_mode
+    global _latest_miner_agent, _latest_two_stage_extractor
 
     _REFUSE_QUICK = [
         r"^抱歉[，]?我无法",
@@ -297,6 +308,7 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
             from backend.agents.two_stage_miner_agent import TwoStageExtractor
 
             ext = TwoStageExtractor(image_paths=image_paths or [], task_id=task_id or "")
+            _latest_two_stage_extractor = ext
             if retry_hint:
                 result, ocr_called, is_unrelated = ext.extract(
                     content=content,
@@ -321,6 +333,7 @@ def _call_llm_with_agent(content: str, has_image: bool, company: str = "", posit
             )
         else:
             agent = _get_miner_agent(image_paths=image_paths, task_id=task_id)
+            _latest_miner_agent = agent
             if retry_hint:
                 result, ocr_called, is_unrelated = agent.run(
                     content=content,
