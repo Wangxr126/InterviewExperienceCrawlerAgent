@@ -154,6 +154,7 @@ class GetRecommendedQuestionTool(Tool):
             name="get_recommended_question",
             description=(
                 "【意图】用户说“来道题/下一题/出题”，且未明确指定目标 q_id（不是“我想练习这道题【q_id:xxx】”）。"
+                "【边界】用户说“换个问法/类似题/同公司的类似题”时，严禁调用本工具，应改用 find_similar_questions。"
                 "【功能】从题库按：遗忘曲线到期、薄弱标签优先，并结合 topic/company/difficulty 做随机推荐（默认推荐多道，模型只展示其中一道）。"
                 "【填槽】topic/company/difficulty 均为可选；若用户只说“某公司”但未给公司名，请先追问补全。"
                 "【返回】JSON：{总数, 筛选条件, 题目列表[]}；每个题目包含 q_id、题目、难度、标签、公司、推荐理由。"
@@ -315,6 +316,8 @@ class FindSimilarQuestionsTool(Tool):
                 "【调用时机】用户说「换个问法」「同公司的类似题」「出几道类似的」且对话中有上一题时。"
                 "【功能】向量检索相似题，排除 exclude_id，返回 limit 道。"
                 "【填槽】question_text（必填）、exclude_id、company、difficulty。若说「同公司的」未指定公司，先询问。"
+                "【补充】若用户说「该公司/这个公司」，优先从上一题 company 自动填槽；"
+                "用户说「同类型题」，应基于上一题题干与标签关键词构造 question_text。"
                 "【返回】相似题列表（题目ID、题目、难度、标签、公司）；检索失败时返回失败原因。"
                 "【严禁】用户说「我想练习这道题」时严禁调用。"
             ),

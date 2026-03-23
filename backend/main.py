@@ -2088,14 +2088,44 @@ def get_extraction_status():
     }
 
 
+def _candidate_trace_dirs() -> list[Path]:
+    """返回可用的 trace 目录候选（兼容历史目录迁移）。"""
+    dirs: list[Path] = []
+    try:
+        dirs.append(Path(_cfg.agent_trace_dir))
+    except Exception:
+        pass
+    try:
+        dirs.append(Path(_cfg.backend_data_dir) / "memory" / "traces")
+    except Exception:
+        pass
+    # 兼容历史运行目录：<project_root>/memory/traces
+    try:
+        dirs.append(Path(__file__).resolve().parents[1] / "memory" / "traces")
+    except Exception:
+        pass
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for d in dirs:
+        k = str(d.resolve()) if d.exists() else str(d)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(d)
+    return out
+
+
 def _read_extraction_trace_steps():
     """读取最新 trace 文件的推理步骤，供轮询和 SSE 复用"""
     import json
     from pathlib import Path
-    trace_dir = Path(_cfg.backend_data_dir) / "memory" / "traces"
-    if not trace_dir.exists():
-        return [], None
-    files = sorted(trace_dir.glob("trace-s-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = []
+    for trace_dir in _candidate_trace_dirs():
+        if not trace_dir.exists():
+            continue
+        files.extend(trace_dir.glob("trace-s-*.jsonl"))
+    files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
         return [], None
     latest = files[0]
@@ -2188,14 +2218,14 @@ def get_trace_html(session_id: str):
     """
     import re as _re
     from fastapi.responses import FileResponse
-    trace_dir = Path(_cfg.backend_data_dir) / "memory" / "traces"
     # 安全校验：session_id 只允许字母数字和连字符
     if not _re.match(r"^s-[a-zA-Z0-9\-]+$", session_id):
         raise HTTPException(status_code=400, detail="无效的 session_id")
-    html_path = trace_dir / f"trace-{session_id}.html"
-    if not html_path.exists():
-        raise HTTPException(status_code=404, detail="Trace 文件不存在或已清理")
-    return FileResponse(html_path, media_type="text/html; charset=utf-8")
+    for trace_dir in _candidate_trace_dirs():
+        html_path = trace_dir / f"trace-{session_id}.html"
+        if html_path.exists():
+            return FileResponse(html_path, media_type="text/html; charset=utf-8")
+    raise HTTPException(status_code=404, detail="Trace 文件不存在或已清理")
 
 
 
@@ -3053,7 +3083,7 @@ def get_crawl_tasks(
 
     status: Optional[str] = Query(
         None,
-        description="pending/fetched/done/error/unrelated/skipped；虚拟：stage2_incomplete（已完成且至少一题未精答）、stage2_complete（已完成且全部题已精答区分）",
+        description="pending/fetched/done/error/unrelated/skipped；虚拟：stage2_incomplete（已完成且在有答案题目中精答完成率<=50%）、stage2_complete（已完成且在有答案题目中精答完成率>50%）",
     ),
 
     platform: Optional[str] = Query(None),
@@ -3126,29 +3156,36 @@ def get_crawl_tasks(
 
     # stage2 虚拟状态：SQLite 存在 EXISTS 子查询 + OFFSET 失效的 bug，
     # 必须用 WHERE id IN (SELECT id FROM crawl_tasks WHERE <exists条件>) 包一层来绕过
+    # 「Stage2 完成」改为按占比判定：有答案题目中，超过 50% 已区分粗答(raw_answer)与精答(answer_text)。
+    _STAGE2_RATIO_EXPR = (
+        "("
+        "SELECT COALESCE(SUM("
+        "CASE WHEN LENGTH(TRIM(COALESCE(q.answer_text,''))) > 0 "
+        "AND LENGTH(TRIM(COALESCE(q.raw_answer,''))) > 0 "
+        "AND TRIM(COALESCE(q.answer_text,'')) != TRIM(COALESCE(q.raw_answer,'')) "
+        "THEN 1 ELSE 0 END"
+        "), 0) * 1.0 / "
+        "NULLIF(COALESCE(SUM(CASE WHEN LENGTH(TRIM(COALESCE(q.answer_text,''))) > 0 THEN 1 ELSE 0 END), 0), 0) "
+        "FROM questions q WHERE q.source_url = crawl_tasks.source_url"
+        ")"
+    )
     _STAGE2_INCOMPLETE_INNER = (
         "crawl_tasks.status = 'done' "
         "AND EXISTS (SELECT 1 FROM questions q WHERE q.source_url = crawl_tasks.source_url) "
         "AND EXISTS ("
-        "SELECT 1 FROM questions q2 WHERE q2.source_url = crawl_tasks.source_url "
-        "AND LENGTH(TRIM(COALESCE(q2.answer_text,''))) > 0 "
-        "AND ("
-        "q2.raw_answer IS NULL OR TRIM(q2.raw_answer) = '' "
-        "OR TRIM(COALESCE(q2.answer_text,'')) = TRIM(COALESCE(q2.raw_answer,''))"
-        ")"
-        ")"
+        "SELECT 1 FROM questions q3 WHERE q3.source_url = crawl_tasks.source_url "
+        "AND LENGTH(TRIM(COALESCE(q3.answer_text,''))) > 0"
+        ") "
+        f"AND COALESCE({_STAGE2_RATIO_EXPR}, 0.0) <= 0.5"
     )
     _STAGE2_COMPLETE_INNER = (
         "crawl_tasks.status = 'done' "
         "AND EXISTS (SELECT 1 FROM questions q WHERE q.source_url = crawl_tasks.source_url) "
-        "AND NOT EXISTS ("
-        "SELECT 1 FROM questions q2 WHERE q2.source_url = crawl_tasks.source_url "
-        "AND LENGTH(TRIM(COALESCE(q2.answer_text,''))) > 0 "
-        "AND ("
-        "q2.raw_answer IS NULL OR TRIM(q2.raw_answer) = '' "
-        "OR TRIM(COALESCE(q2.answer_text,'')) = TRIM(COALESCE(q2.raw_answer,''))"
-        ")"
-        ")"
+        "AND EXISTS ("
+        "SELECT 1 FROM questions q3 WHERE q3.source_url = crawl_tasks.source_url "
+        "AND LENGTH(TRIM(COALESCE(q3.answer_text,''))) > 0"
+        ") "
+        f"AND COALESCE({_STAGE2_RATIO_EXPR}, 0.0) > 0.5"
     )
 
     with sqlite3.connect(sqlite_service.db_path) as conn:

@@ -252,11 +252,8 @@ def enrich_task_stage2(task_id: str) -> Dict[str, Any]:
         from backend.services.crawler.question_extractor import _get_latest_trace_session_id
         s2_trace = _get_latest_trace_session_id()
         if s2_trace:
-            sqlite_service.update_task(
+            sqlite_service.update_task_stage2_trace_session_id(
                 task_id=task_id,
-                status=task.get("status", "done"),
-                questions_count=task.get("questions_count", 0),
-                error_msg=task.get("error_msg") or "",
                 stage2_trace_session_id=s2_trace,
             )
     except Exception as _te:

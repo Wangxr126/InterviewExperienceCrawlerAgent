@@ -10,6 +10,7 @@ LoRA 对比推理服务 —— 在 DSW（GPU）上运行
 import os
 import sys
 import json
+import time
 import asyncio
 import threading
 from pathlib import Path
@@ -28,7 +29,7 @@ _PROJECT_ROOT = _SCRIPT_DIR.parent
 load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
 import torch
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer, BitsAndBytesConfig
@@ -63,6 +64,30 @@ _loaded_ok   = False
 _load_error  = ""
 
 
+def _gpu_snapshot() -> dict:
+    """返回当前 GPU 快照，便于排查是否真的走到 CUDA。"""
+    snap = {
+        "cuda_available": bool(torch.cuda.is_available()),
+        "device_count": 0,
+        "current_device": None,
+        "device_name": "",
+        "memory_allocated_mb": 0.0,
+        "memory_reserved_mb": 0.0,
+    }
+    if not torch.cuda.is_available():
+        return snap
+    try:
+        idx = torch.cuda.current_device()
+        snap["device_count"] = torch.cuda.device_count()
+        snap["current_device"] = idx
+        snap["device_name"] = torch.cuda.get_device_name(idx)
+        snap["memory_allocated_mb"] = round(torch.cuda.memory_allocated(idx) / (1024 * 1024), 2)
+        snap["memory_reserved_mb"] = round(torch.cuda.memory_reserved(idx) / (1024 * 1024), 2)
+    except Exception:
+        pass
+    return snap
+
+
 def _load_models():
     global _base_model, _tokenizer, _loaded_ok, _load_error
     try:
@@ -81,6 +106,14 @@ def _load_models():
             trust_remote_code=True,
         )
         _base_model.eval()
+        gpu_info = _gpu_snapshot()
+        print(
+            f"[startup] CUDA={gpu_info['cuda_available']} "
+            f"device={gpu_info['device_name']} "
+            f"allocated={gpu_info['memory_allocated_mb']}MB "
+            f"reserved={gpu_info['memory_reserved_mb']}MB",
+            flush=True,
+        )
         print("[startup] 基础模型加载完成", flush=True)
         _loaded_ok = True
     except Exception as e:
@@ -106,7 +139,12 @@ def on_startup():
 
 @app.get("/health")
 def health():
-    return {"ok": _loaded_ok, "error": _load_error, "adapters": list(ADAPTERS.keys())}
+    return {
+        "ok": _loaded_ok,
+        "error": _load_error,
+        "adapters": list(ADAPTERS.keys()),
+        "gpu": _gpu_snapshot(),
+    }
 
 
 @app.get("/models")
@@ -123,39 +161,197 @@ def list_models():
 
 
 def _build_prompt(question: str) -> str:
+    # 模型对比与 Miner 提取保持一致：拼接 Miner 的 system/user prompt 后再送模型。
+    try:
+        from backend.agents.prompts.miner_prompt import get_miner_prompt, format_miner_user_prompt
+
+        miner_system = get_miner_prompt()
+        miner_user = format_miner_user_prompt(
+            content=question,
+            has_image=False,
+            company="",
+            position="",
+        )
+        return (
+            f"<|im_start|>system\n{miner_system}<|im_end|>\n"
+            f"<|im_start|>user\n{miner_user}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+    except Exception:
+        # 回退：避免 prompt 模块异常导致服务不可用
+        return (
+            f"<|im_start|>system\n你是一名专业的面经分析助手，请提取结构化面试题并输出 JSON。<|im_end|>\n"
+            f"<|im_start|>user\n{question}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+
+def _compose_chat_prompt(system_prompt: str, user_prompt: str) -> str:
     return (
-        f"<|im_start|>system\n你是一名专业的技术面试助手，请给出清晰、完整的回答。<|im_end|>\n"
-        f"<|im_start|>user\n{question}<|im_end|>\n"
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
 
 
-def _infer_stream_sync(model, question: str, queue: asyncio.Queue, loop):
+def _build_prompt_from_payload(payload: dict) -> str:
+    """
+    统一构造 prompt：
+    1) 有 prompt + system_prompt：直接拼接成 chat；
+    2) 有 prompt（已是完整文本）：直接使用；
+    3) 有 question：按 Miner Prompt 规则构造。
+    """
+    prompt = (payload.get("prompt") or "").strip()
+    system_prompt = (payload.get("system_prompt") or "").strip()
+    question = (payload.get("question") or "").strip()
+
+    if prompt and system_prompt:
+        return _compose_chat_prompt(system_prompt, prompt)
+    if prompt:
+        return prompt
+    if question:
+        return _build_prompt(question)
+    return _build_prompt("请输出空结果：[]")
+
+
+def _infer_stream_sync(model, final_prompt: str, infer_params: dict, queue: asyncio.Queue, loop):
     """在普通线程里做 generate，把 token 塞到 asyncio Queue。"""
     try:
-        prompt = _build_prompt(question)
-        inputs = _tokenizer(prompt, return_tensors="pt").to(model.device)
+        t0 = time.time()
+        inputs = _tokenizer(final_prompt, return_tensors="pt").to(model.device)
         streamer = TextIteratorStreamer(
             _tokenizer, skip_prompt=True, skip_special_tokens=True
         )
+        first_token_sent = False
         gen_kwargs = dict(
             **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=0.7,
-            top_p=0.9,
-            do_sample=True,
+            max_new_tokens=int(infer_params.get("max_new_tokens") or MAX_NEW_TOKENS),
+            temperature=float(infer_params.get("temperature") or 0.7),
+            top_p=float(infer_params.get("top_p") or 0.9),
+            do_sample=bool(infer_params.get("do_sample", True)),
             pad_token_id=_tokenizer.eos_token_id,
             streamer=streamer,
         )
         gen_thread = threading.Thread(target=model.generate, kwargs=gen_kwargs)
         gen_thread.start()
         for token in streamer:
+            if not first_token_sent:
+                first_token_sent = True
+                first_token_ms = int((time.time() - t0) * 1000)
+                asyncio.run_coroutine_threadsafe(queue.put(("meta", {"first_token_ms": first_token_ms})), loop)
             asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
         gen_thread.join()
+        total_ms = int((time.time() - t0) * 1000)
+        asyncio.run_coroutine_threadsafe(queue.put(("meta", {"total_ms": total_ms})), loop)
     except Exception as e:
         asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
     finally:
         asyncio.run_coroutine_threadsafe(queue.put(("done", "")), loop)
+
+
+def _resolve_model(model_id: str):
+    adapter_path = ADAPTERS.get(model_id)
+    if model_id not in ADAPTERS:
+        raise ValueError(f"未知模型ID: {model_id}")
+    if adapter_path and not Path(adapter_path).exists():
+        raise FileNotFoundError(f"adapter 路径不存在: {adapter_path}")
+    if adapter_path:
+        model = PeftModel.from_pretrained(_base_model, adapter_path)
+        model.eval()
+        return model, adapter_path
+    return _base_model, None
+
+
+@app.post("/infer/stream")
+async def infer_stream(payload: dict = Body(...)):
+    """
+    单模型统一流式接口（与 backend/api/model_bench_api.py 对齐）:
+      入参支持:
+        - question + model
+        - question + model_id
+        - prompt + system_prompt + model_id
+      流式输出:
+        data: {"type":"token","text":"..."}
+        data: {"type":"done","elapsed_ms":1234,...}
+        data: {"type":"error","text":"..."}
+    """
+    if not _loaded_ok:
+        async def err_gen():
+            msg = json.dumps({"type": "error", "text": f"模型未就绪: {_load_error}"}, ensure_ascii=False)
+            yield f"data: {msg}\n\n"
+        return StreamingResponse(err_gen(), media_type="text/event-stream")
+
+    model_id = (payload.get("model") or payload.get("model_id") or "base").strip()
+    final_prompt = _build_prompt_from_payload(payload)
+    loop = asyncio.get_event_loop()
+
+    async def generate():
+        t0 = time.time()
+        queue: asyncio.Queue = asyncio.Queue()
+        with _model_lock:
+            model = None
+            adapter_path = None
+            token_count = 0
+            first_token_ms = None
+            model_total_ms = None
+            try:
+                model, adapter_path = _resolve_model(model_id)
+                t = threading.Thread(
+                    target=_infer_stream_sync,
+                    args=(model, final_prompt, payload, queue, loop),
+                    daemon=True,
+                )
+                t.start()
+
+                while True:
+                    kind, value = await queue.get()
+                    if kind == "done":
+                        break
+                    if kind == "error":
+                        evt = json.dumps({"type": "error", "text": value}, ensure_ascii=False)
+                        yield f"data: {evt}\n\n"
+                        break
+                    if kind == "meta":
+                        if isinstance(value, dict):
+                            if "first_token_ms" in value:
+                                first_token_ms = value["first_token_ms"]
+                            if "total_ms" in value:
+                                model_total_ms = value["total_ms"]
+                        continue
+                    token_count += 1
+                    evt = json.dumps({"type": "token", "text": value}, ensure_ascii=False)
+                    yield f"data: {evt}\n\n"
+
+            except Exception as e:
+                evt = json.dumps({"type": "error", "text": str(e)}, ensure_ascii=False)
+                yield f"data: {evt}\n\n"
+            finally:
+                if adapter_path and isinstance(model, PeftModel):
+                    try:
+                        model.unload()
+                    except Exception:
+                        pass
+
+                elapsed_ms = int((time.time() - t0) * 1000)
+                done_evt = json.dumps({
+                    "type": "done",
+                    "model": model_id,
+                    "elapsed_ms": elapsed_ms,
+                    "first_token_ms": first_token_ms,
+                    "model_total_ms": model_total_ms,
+                    "token_count": token_count,
+                    "gpu": _gpu_snapshot(),
+                }, ensure_ascii=False)
+                yield f"data: {done_evt}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/infer/compare-stream")
@@ -201,10 +397,11 @@ async def compare_stream(
                         model = _base_model
 
                     # 异步推理
+                    final_prompt = _build_prompt(question)
                     queue: asyncio.Queue = asyncio.Queue()
                     t = threading.Thread(
                         target=_infer_stream_sync,
-                        args=(model, question, queue, loop),
+                        args=(model, final_prompt, {"max_new_tokens": MAX_NEW_TOKENS}, queue, loop),
                         daemon=True,
                     )
                     t.start()

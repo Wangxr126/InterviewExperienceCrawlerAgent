@@ -9,28 +9,14 @@
       </p>
     </header>
 
-    <!-- DSW 服务配置 -->
+    <!-- 服务说明 -->
     <section class="lc-panel">
       <div class="lc-section-title">
-        <span>⚙️</span><span>推理服务地址</span>
-      </div>
-      <div class="lc-server-row">
-        <el-input
-          v-model="serverUrl"
-          placeholder="http://your-dsw-host:8899"
-          clearable
-          class="lc-server-input"
-        />
-        <el-button :loading="pinging" @click="pingServer" type="default" class="lc-btn-ping">
-          {{ pingStatus === 'ok' ? '✅ 已连接' : pingStatus === 'err' ? '❌ 无法连接' : '检测连接' }}
-        </el-button>
-        <el-tag v-if="serverModels.length" type="success" effect="light" size="small">
-          {{ serverModels.length }} 个模型已就绪
-        </el-tag>
+        <span>⚙️</span><span>推理服务</span>
       </div>
       <p class="lc-server-hint">
-        在 DSW 终端执行：<code>cd /mnt/workspace/TEMP-FILE-STATION/finetune &amp;&amp; python infer_server.py</code>，
-        然后开启端口 <code>8899</code> 的转发，将转发地址填入上方。
+        本页已改为通过后端 <code>/api/model-bench/stream</code> 统一转发，
+        前端无需直接配置或连接 <code>8899</code>。
       </p>
     </section>
 
@@ -145,7 +131,7 @@
 
           <div v-if="col.status === 'done' || col.status === 'running'" class="lc-card-foot">
             <span v-if="col.tokenCount" class="lc-stat">{{ col.tokenCount }} tokens</span>
-            <span v-if="col.elapsed" class="lc-stat">{{ (col.elapsed / 1000).toFixed(1) }}s</span>
+            <span v-if="col.elapsed" class="lc-stat">耗时 {{ (col.elapsed / 1000).toFixed(1) }}s</span>
           </div>
         </div>
       </div>
@@ -158,32 +144,8 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 
-// ── 服务配置 ──────────────────────────────────────────────
-const serverUrl   = ref(localStorage.getItem('lora_server_url') || 'http://localhost:8899')
-const pingStatus  = ref('')   // '' | 'ok' | 'err'
-const pinging     = ref(false)
-const serverModels = ref([])
-
-const saveServer = () => localStorage.setItem('lora_server_url', serverUrl.value)
-
-const pingServer = async () => {
-  saveServer()
-  pinging.value = true
-  pingStatus.value = ''
-  try {
-    const r = await fetch(`${serverUrl.value}/models`, { signal: AbortSignal.timeout(5000) })
-    const data = await r.json()
-    serverModels.value = Array.isArray(data) ? data : []
-    pingStatus.value = 'ok'
-    ElMessage.success(`连接成功，${serverModels.value.length} 个模型`)
-  } catch (e) {
-    pingStatus.value = 'err'
-    serverModels.value = []
-    ElMessage.error('无法连接到推理服务：' + e.message)
-  } finally {
-    pinging.value = false
-  }
-}
+// ── 服务配置（前端仅连后端） ───────────────────────────────
+const serverUrl = ref('')
 
 // ── 题库 ──────────────────────────────────────────────────
 const questions     = ref([])
@@ -244,7 +206,7 @@ const activeQuestion = computed(() => {
 })
 
 const canRun = computed(() =>
-  !!activeQuestion.value && !!serverUrl.value
+  !!activeQuestion.value
 )
 
 // ── 四列结果 ──────────────────────────────────────────────
@@ -292,14 +254,18 @@ const stopCompare = () => {
 
 const runCompare = () => {
   if (!canRun.value) return
-  saveServer()
   resetColumns()
   showResults.value = true
   running.value = true
 
-  const question = encodeURIComponent(activeQuestion.value)
-  const models   = MODEL_IDS.join(',')
-  const url      = `${serverUrl.value}/infer/compare-stream?question=${question}&models=${models}`
+  const params = new URLSearchParams()
+  params.set('question', activeQuestion.value)
+  params.set('models', MODEL_IDS.join(','))
+  if (serverUrl.value.trim()) {
+    // 兼容开发调试：可在代码里设置 serverUrl 指向远端推理服务
+    params.set('server_url', serverUrl.value.trim())
+  }
+  const url = `/api/model-bench/stream?${params.toString()}`
 
   if (_es) _es.close()
   _es = new EventSource(url)
@@ -316,7 +282,7 @@ const runCompare = () => {
       } else if (msg.type === 'done') {
         if (col) {
           col.status  = 'done'
-          col.elapsed = Date.now() - col.startAt
+          col.elapsed = Number(msg.elapsed_ms || 0) || (Date.now() - col.startAt)
         }
       } else if (msg.type === 'error') {
         if (col) { col.status = 'error'; col.errorMsg = msg.text }

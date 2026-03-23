@@ -1859,6 +1859,38 @@ class SqliteService:
             conn.execute("UPDATE crawl_tasks SET " + ", ".join(sets) + " WHERE task_id=?", params)
             conn.commit()
 
+    def update_task_stage2_trace_session_id(self, task_id: str, stage2_trace_session_id: str) -> bool:
+        """仅更新 crawl_tasks.stage2_trace_session_id，避免覆盖其他任务字段。"""
+        if not task_id:
+            return False
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE crawl_tasks
+                SET stage2_trace_session_id = ?, processed_at = CURRENT_TIMESTAMP
+                WHERE task_id = ?
+                """,
+                ((stage2_trace_session_id or "").strip() or None, task_id),
+            )
+            conn.commit()
+            return (cur.rowcount or 0) > 0
+
+    def update_task_trace_session_id(self, task_id: str, trace_session_id: str) -> bool:
+        """仅更新 crawl_tasks.trace_session_id，避免覆盖其他任务字段。"""
+        if not task_id:
+            return False
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE crawl_tasks
+                SET trace_session_id = ?, processed_at = CURRENT_TIMESTAMP
+                WHERE task_id = ?
+                """,
+                ((trace_session_id or "").strip() or None, task_id),
+            )
+            conn.commit()
+            return (cur.rowcount or 0) > 0
+
     def update_task_content(self, task_id: str, post_title: str, raw_content: str,
                             image_paths: List[str] = None, post_time: str = None):
         """重抓正文后更新任务：标题、正文、图片路径，并重置为 fetched 待提取。post_time 为帖子发表时间，None 表示不更新"""

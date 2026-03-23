@@ -38,7 +38,7 @@
 | `finetune` | 微调标注 | `FinetuneView.vue` |
 | `tool_usage` | 工具统计 | `ToolUsageView.vue` |
 | `graph_rag` | GraphRAG | `GraphRagView.vue` |
-| `model_compare` | 模型对比 | `ModelCompareView.vue` |
+| `model_compare` | 模型对比 | `ModelBenchView.vue` |
 
 前端 API 封装：[`web/src/api.js`](../web/src/api.js)。
 

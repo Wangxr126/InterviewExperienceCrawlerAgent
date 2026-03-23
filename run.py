@@ -111,9 +111,14 @@ def main():
 
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
 
+    uvicorn_log_level = (os.environ.get("UVICORN_LOG_LEVEL") or "info").strip().lower()
+    if uvicorn_log_level not in {"critical", "error", "warning", "info", "debug", "trace"}:
+        uvicorn_log_level = "info"
+    logger.info("Uvicorn 日志级别: %s（可用 UVICORN_LOG_LEVEL 覆盖）", uvicorn_log_level)
+
     cmd = [sys.executable, "-m", "uvicorn", "backend.main:app",
            "--host", host, "--port", str(port),
-           "--log-level", "warning"]  # 访问日志由 main.py 的 loguru 拦截器处理
+           "--log-level", uvicorn_log_level]  # 默认 info，便于排查 SSE/代理问题
     
     if reload:
         cmd.append("--reload")

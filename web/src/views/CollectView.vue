@@ -161,8 +161,8 @@
                 <div><strong>已完成</strong>：题目已提取并入库</div>
                 <div><strong>无关帖</strong>：LLM 判断正文与面经无关，参与「清洗无关帖」后删除</div>
                 <div><strong>失败</strong>：抓取正文或 LLM 提取时出错</div>
-                <div><strong>Stage2未完成</strong>：任务为已完成且已入库题目，但至少一题尚未精答（raw 空或与当前答相同）</div>
-                <div><strong>Stage2已完成</strong>：已完成且每道有内容的题都已区分粗答/精答</div>
+                <div><strong>Stage2未完成</strong>：任务为已完成且已入库题目，但 Stage2 精答完成率 ≤ 50%</div>
+                <div><strong>Stage2已完成</strong>：已完成且 Stage2 精答完成率 > 50%（大部分题目已精答）</div>
               </div>
             </template>
             <QuestionFilled class="status-help-icon" />
@@ -464,8 +464,8 @@ const STATUS_OPTIONS = [
   { value: 'pending',   label: '待抓取',  desc: '未获取正文' },
   { value: 'fetched',   label: '待提取',  desc: '待 LLM 提取' },
   { value: 'done',      label: '已完成',  desc: '题目已入库' },
-  { value: 'stage2_incomplete', label: 'Stage2未完成', desc: '已入库但至少一题需 Stage2 精答' },
-  { value: 'stage2_complete',   label: 'Stage2已完成', desc: '全部有内容的题已区分粗/精答' },
+  { value: 'stage2_incomplete', label: 'Stage2未完成', desc: '精答完成率 ≤ 50%' },
+  { value: 'stage2_complete',   label: 'Stage2已完成', desc: '精答完成率 > 50%（大部分已精答）' },
   { value: 'unrelated', label: '无关帖',  desc: 'LLM 判断与面经无关' },
   { value: 'error',     label: '失败',    desc: '抓取或提取出错' },
 ]
