@@ -54,7 +54,7 @@
 | [STARTUP_GUIDE.md](STARTUP_GUIDE.md) | 启动顺序、Docker、Ollama、排障 |
 | [环境配置说明.md](环境配置说明.md) | Conda、MCP、与 `.env` 的对应关系 |
 | [微调模块技术解析.md](微调模块技术解析.md) | SFT / LoRA 理论与训练细节 |
-| [MCP服务详解.md](MCP服务详解.md) | 三个 MCP 的能力、配置与示例 |
+| [MCP服务详解.md](MCP服务详解.md) | 三个 MCP 的能力、配置与示例；`mcp-content-extractor` 细节另见 `mcp/mcp-content-extractor/README.md` |
 | [MCP独立部署指南.md](MCP独立部署指南.md) | 独立部署 TypeScript MCP |
 | [MCP构建与部署指南.md](MCP构建与部署指南.md) | 构建与发布流程 |
 | [图片识别.md](图片识别.md) | OCR 与图片路径数据流 |
@@ -69,12 +69,10 @@
 | [页面功能与按钮说明.md](系统梳理/页面功能与按钮说明.md) | 各页按钮、接口与效果图占位路径 |
 | [模型对比页面说明.md](系统梳理/模型对比页面说明.md) | 模型对比预设、环境变量、接口 |
 | [进程与子进程架构文档.md](系统梳理/进程与子进程架构文档.md) | 爬虫子进程与恢复 |
-| [Agent-Miner全景文档.md](系统梳理/Agent-Miner全景文档.md) | Miner 两阶段与采集数据流 |
+| [Agent-Miner全景文档.md](系统梳理/Agent-Miner全景文档.md) | MinerAgent ReAct 提取与采集数据流 |
 | [Agent-Interviewer全景文档.md](系统梳理/Agent-Interviewer全景文档.md) | 主对话 Agent 职责与工具 |
-| [意图实现详解-最终版.md](系统梳理/意图实现详解-最终版.md) | 意图与路由实现 |
-| [意图与推荐检索实现详解.md](系统梳理/意图与推荐检索实现详解.md) | 推荐与检索扩展说明 |
+| [意图与推荐检索实现详解.md](系统梳理/意图与推荐检索实现详解.md) | 意图路由、推荐/相似题、Rerank、GraphRAG、智能练习等 |
 | [记忆机制全景文档.md](系统梳理/记忆机制全景文档.md) | 记忆写入与存储 |
-| [自研MCP文档.md](系统梳理/自研MCP文档.md) | `mcp-content-extractor` 专述 |
 | [案例-练习对话点评重复-面试稿.md](系统梳理/案例-练习对话点评重复-面试稿.md) | 问题案例记录 |
 
 ### `docs/系统梳理/placeholders/`
@@ -85,7 +83,7 @@
 
 ## 推荐阅读顺序
 
-1. 仓库根目录 [README.md](../README.md)  
+1. 仓库根目录 [README.md](../README.md)（含端到端/异常/数据流 Mermaid、**MinerAgent / InterviewerAgent** 工具表与 MCP 一览）  
 2. [STARTUP_GUIDE.md](STARTUP_GUIDE.md)  
 3. [环境配置说明.md](环境配置说明.md)  
 4. [系统梳理/API全量文档.md](系统梳理/API全量文档.md) + [页面功能与按钮说明.md](系统梳理/页面功能与按钮说明.md)  

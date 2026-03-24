@@ -59,7 +59,7 @@ MinerAgent 是“内容抽取专用 Agent”，目标是从帖子正文中提取
 - **返回**：
   - `ToolResponse.success(text="__UNRELATED__", data={reason})`
 
-#### C. `verify_extraction_count`（`VerifyExtractionCountTool`，当前 MinerAgent 未注册）
+#### C. `verify_extraction_count`（`VerifyExtractionCountTool`，已在 `MinerAgent` 中注册）
 - **功能**：校验提取题数与预期题数是否一致。
 - **参数**：
   - `extracted_count: integer`（必填）
@@ -90,7 +90,11 @@ flowchart TD
     D -->|否| F[保持false]
     C --> G{是否无关}
     G -->|是| H[返回UNRELATED_SIGNAL]
-    G -->|否| I[提取JSON结果]
+    G -->|否| V{需要 verify_extraction_count?}
+    V -->|是| VC[verify_extraction_count]
+    VC -->|不符| C
+    VC -->|通过| I[提取JSON结果]
+    V -->|否| I
     I --> J[清洗think标签与噪音]
     J --> K[返回answer, ocr_called, false]
 ```

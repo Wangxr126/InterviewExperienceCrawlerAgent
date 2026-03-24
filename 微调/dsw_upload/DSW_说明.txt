@@ -1,0 +1,22 @@
+LoRA 对比 — DSW 侧准备说明（与仓库 微调/infer_server.py 配套）
+
+1) 权重目录
+   在 DSW 上保持与 infer_server.py 中 ADAPTERS 一致的路径，例如：
+   微调/adapter/lora_seq2048/...
+   微调/adapter/lora_seq4096/...
+   微调/adapter/lora_seq8192/...
+
+2) 启动推理服务
+   cd 微调
+   conda activate <你的环境>
+   python infer_server.py
+   默认端口 8899；本机后端设置环境变量 MODEL_BENCH_SERVER_URL=http://<DSW内网或转发地址>:8899
+
+3) 演示案例 JSON
+   在本机有 backend/data/local_data.db 时运行：
+   python scripts/export_lora_bench_cases.py
+   会生成本目录 bench_cases.json（10 条题干 + 豆包答案 + 原帖正文片段）。
+   云端无题库时：可把整个项目里的 local_data.db 拷到同路径后再跑导出，或手动编辑 bench_cases.json。
+
+4) 前端
+   LoRA 对比页支持导出「四模型 + 豆包 + 原帖」的 JSON/剪贴板文本。

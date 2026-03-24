@@ -17,87 +17,99 @@
 
 ## 前端效果总览
 
-> 直接看本 README 可快速了解界面；全量图见 [`GALLERY.md`](GALLERY.md)。
+> 直接看本 README 可快速了解界面；全量图见 [`项目图片总览.md`](项目图片总览.md)。
 
 ### 核心业务页面
 
-![题库浏览](docs/项目图片/1、题库浏览界面.png)
-![练习对话](docs/项目图片/2、练习对话页面.png)
+![题库浏览](docs/项目图片/01_题库浏览界面.png)
+![练习对话](docs/项目图片/02_练习对话页面.png)
+![答题流程-step2](docs/项目图片/03_答题流程-step2.png)
+![答题流程-step3](docs/项目图片/04_答题流程-step3.png)
+![答题流程-agent回复](docs/项目图片/05_答题流程-agent回复.png)
+![答题流程-评分结果](docs/项目图片/06_答题流程-评分结果.png)
+![个人薄弱点](docs/项目图片/07_个人薄弱点.png)
+![智能联系](docs/项目图片/08_智能联系.png)
 
 ### 采集、训练与分析页面
 
-![数据采集1](docs/项目图片/4.1、数据采集界面1.png)
-![数据采集2](docs/项目图片/4.2、数据采集界面2.png)
-![定时任务](docs/项目图片/5、定时任务截图.png)
-![学习报告](docs/项目图片/6、学习报告截图.png)
-![微调样本列表](docs/项目图片/7.1、微调标注-样本列表.png)
-![微调标注编辑](docs/项目图片/7.2、微调标注-标注编辑.png)
-![一键微调](docs/项目图片/7.3、微调标注-一键微调.png)
-![工具统计](docs/项目图片/8、工具统计.png)
-![GraphRAG知识图谱](docs/项目图片/9-GraphRAG.png)
-![模型对比](docs/项目图片/10、模型对比.png)
+![数据采集1](docs/项目图片/09_数据采集界面1.png)
+![数据采集2](docs/项目图片/10_数据采集界面2.png)
+![定时任务](docs/项目图片/11_定时任务截图.png)
+![学习报告](docs/项目图片/12_学习报告截图.png)
+![微调样本列表](docs/项目图片/13_微调标注-样本列表.png)
+![微调标注编辑](docs/项目图片/14_微调标注-标注编辑.png)
+![一键微调](docs/项目图片/15_微调标注-一键微调.png)
+![工具统计](docs/项目图片/16_工具统计.png)
+![GraphRAG知识图谱](docs/项目图片/17_GraphRAG知识图谱.png)
+![模型对比](docs/项目图片/18_模型对比.png)
+
+### 当前仍建议补充
+
+- `19_收录面经页面.png`（对应 `web/src/views/IngestView.vue`）
 
 ---
 
-## 系统架构
+## 最新系统架构（代码对齐）
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│          前端（Vue 3 + Vite，web/）                          │
-│  BrowseView / ChatView / IngestView / CollectView /         │
-│  SchedulerView / ReportView / FinetuneView /                │
-│  ToolUsageView / GraphRagView / ModelBenchView              │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ HTTP / SSE
-┌──────────────────────────▼──────────────────────────────────┐
-│          FastAPI 主服务（backend/main.py）                   │
-│  题库 / 对话 / 评分 / 收录 / 报告 / 图谱 / 工具统计          │
-│  scheduler_api  ·  reasoning_api  ·  finetune API           │
-│  APScheduler 定时任务  ·  静态资源 /post-images              │
-├──────────────────────────────────────────────────────────────┤
-│                      Agent 层                                │
-│  ┌──────────────────────┐  ┌──────────────────────────────┐ │
-│  │    MinerAgent        │  │      InterviewerAgent        │ │
-│  │  采集 & 结构化提取    │  │    对话 & 评分 & 推荐编排     │ │
-│  └──────────────────────┘  └──────────────────────────────┘ │
-├──────────────────────────────────────────────────────────────┤
-│                     服务层                                   │
-│  crawler · scheduling · storage · knowledge · finetune      │
-│  rerank · multi_recall_recommender · warmup                 │
-├──────────────────────────────────────────────────────────────┤
-│                     MCP 服务层（可选扩展）                    │
-│  mcp-content-extractor（Python·stdio）                      │
-│  mcp-content-fetcher  （TypeScript·stdio/独立）              │
-│  mcp-image-extractor  （TypeScript·stdio/独立）              │
-├─────────────────────────┬──────────────────┬────────────────┤
-│  SQLite                 │  Neo4j           │  Qdrant        │
-│  local_data.db          │  知识图谱 :7687   │  向量 :6333    │
-└─────────────────────────┴──────────────────┴────────────────┘
+前端（Vue 3 + Vite，web/）
+  └─ 生产构建到 backend/static/dist
+          │
+          ▼
+FastAPI 主服务（backend/main.py）
+  ├─ 题库 / 对话 / 评分 / 收录 / 报告 / 图谱 / 工具统计
+  ├─ 采集链路与任务管理（crawler）
+  ├─ 微调标注与模型对比接口（finetune / model bench）
+  ├─ 定时任务 API（scheduler_api 挂载）
+  └─ 推理轨迹 API（reasoning_api 挂载）
+          │
+          ├─ Agent 层：InterviewerAgent（对话编排）
+          ├─ Agent 层：MinerAgent / MinerReActAgent（提取）
+          ├─ 服务层：crawler / scheduling / finetune / storage / knowledge
+          │
+          ├─ SQLite（backend/data/local_data.db）
+          ├─ Neo4j（docker compose）
+          └─ Qdrant（docker compose）
 ```
 
 ---
 
-## 双 Agent 协作机制
+## Agent 角色（真实命名）
 
-### MinerAgent（采集与结构化提取）
+### `MinerAgent`（采集与提取）
 
-**职责**：从采集内容中抽取结构化面试题，写入题库。
+- 从采集内容中抽取题目、标签、知识点等结构化信息
+- 支持 OCR 辅助、无关内容终止（`mark_unrelated`）等策略
+- 与采集任务、批量重提取、Stage2 精答流程联动
 
-**核心工具**：
+### `InterviewerAgent`（对话与编排）
 
-| 工具 | 说明 |
-|------|------|
-| `ocr_images` | 对帖子图片做 OCR，正文无题时调用 |
-| `mark_unrelated` | 标记帖子为无关（广告/求分享等），终止提取 |
-| `verify_extraction_count` | 校验提取数量与原文预期数量是否一致 |
+- 承担练习问答、流式回复、答题评分、学习建议
+- 通过工具调用组织记忆、推荐、掌握度等业务能力
+- 管理会话上下文与多轮对话编排（`get_orchestrator`）
 
-**输出示例**（写入 SQLite `questions` 表）：
+---
+
+## 双 Agent 协作机制（职责、工具与输出）
+
+两个 Agent **名称固定**：`MinerAgent`（面经挖掘）与 `InterviewerAgent`（练习编排）。下文不使用「AgentA」等占位命名。
+
+### MinerAgent：采集侧结构化提取
+
+| 工具名 | 作用 | 典型触发 |
+|--------|------|----------|
+| `ocr_images` | 对帖子关联图片做 OCR，把文字补进上下文 | 正文无明显面试题、但有图时 |
+| `mark_unrelated` | 将帖子标为无关（广告、求分享、无题等）并结束 | 确认无可用面试题时 |
+| `verify_extraction_count` | 校验「提取条数」与元信息中的预期题数是否一致 | 元信息带「原文约 N 道题」时 |
+| `Thought` / `Finish` | hello-agents ReAct 内置：思考与提交最终 JSON | 每轮推理与正常收尾 |
+
+**MinerAgent 输出示例（有题，写入题库）**：模型经 `Finish` 或解析后直接给出 **合法 JSON 数组**，元素为题目对象（字段名与 `miner_prompt` 一致）：
 
 ```json
 [
   {
     "question_text": "请介绍 Redis 的持久化机制（RDB 与 AOF）及各自适用场景",
-    "answer_text": "Redis 有 RDB 和 AOF 两种持久化方式……",
+    "answer_text": "Redis 提供 RDB 快照与 AOF 日志两种持久化……",
     "difficulty": "medium",
     "question_type": "工程-缓存与Redis",
     "topic_tags": ["Redis", "持久化", "RDB", "AOF"],
@@ -107,190 +119,209 @@
 ]
 ```
 
-**处理流程**：
+**无关帖**：先输出 `{"status":"unrelated","reason":"..."}` 再调 `mark_unrelated`（具体以 `miner_prompt` 为准）；上层会识别 `UNRELATED_SIGNAL`，**不会**把闲聊当成题库 JSON。
 
-```mermaid
-flowchart TD
-    A["📥 采集任务\n帖子 URL / 文本"] --> B["MinerAgent\n分析正文"]    
-    B --> C{"正文有\n面试题？"}
-    C -->|"有题"| E["直接结构化提取\n改写为标准问句"]
-    C -->|"无题且有图片"| D["调用 ocr_images\nOCR 识别图片文字"]
-    D --> E
-    C -->|"无题无图\n或广告/求分享"| F["输出 unrelated JSON\n调用 mark_unrelated 终止"]
-    E --> G{"元信息有\n预期题数？"}
-    G -->|"有"| H["调用 verify_extraction_count\n数量校验"]
-    H -->|"通过"| I["输出 JSON 数组\n写入 SQLite 题库"]
-    H -->|"不符"| E
-    G -->|"无"| I
-    style A fill:#e1f5ff
-    style I fill:#c8e6c9
-    style F fill:#ffcdd2
-```
+### InterviewerAgent：练习侧对话与编排
 
----
+业务工具由 `get_interviewer_tools()` 注册（代码：`backend/tools/interviewer_tools.py`），与 ReAct 内置 `Thought` / `Finish` 配合。
 
-### InterviewerAgent（对话与编排）
+| 工具名 | 作用 |
+|--------|------|
+| `get_session_context` | 当前会话练习统计（题量、均分、已练标签等） |
+| `get_recommended_question` | 按薄弱点/条件推荐题目列表 |
+| `find_similar_questions` | 按题干语义检索相似题 |
+| `filter_questions` | 多条件筛选题库 |
+| `get_question_detail` | 按 `question_id` 取题干与标准答案 |
+| `submit_answer` | 提交用户答案与评分结果并落库（含 SM-2 等） |
+| `record_weakness` | 记录混淆点/遗漏点到情景记忆与笔记 |
+| `manage_note` | 题目笔记增删改查 |
+| `get_mastery_report` | 掌握度、薄弱标签、复习建议 |
+| `get_knowledge_recommendation` | 延伸知识点与资源推荐 |
+| `analyze_resume` | 更新用户画像（目标岗位、技术栈等） |
 
-**职责**：驱动面试练习对话、评分、学习建议与知识推荐。
-
-**核心工具**：
-
-| 工具 | 说明 |
-|------|------|
-| `get_question` | 按条件抽取题目（公司/标签/难度/随机） |
-| `submit_answer_eval` | 提交答案，返回评分（0-5）、强弱点、AI 解析 |
-| `manage_note` | 添加/查看题目个人笔记 |
-| `get_user_mastery` | 查询用户掌握度与 SM-2 复习队列 |
-| `recommend_resources` | 根据薄弱标签推荐学习资源 |
-| `search_knowledge` | 向量检索 Qdrant 知识库 |
-| `query_graph` | 查询 Neo4j 知识图谱关联关系 |
-| `save_memory` / `load_memory` | 四层记忆读写（hello-agents） |
-
-**输出示例**（评分卡片）：
+**InterviewerAgent 侧「评分卡片」示例**（由 `submit_answer` 链路中的结构化评估生成，经 SSE 推到前端；**不是** Miner 的题库 JSON）：
 
 ```json
 {
   "score": 4,
-  "strengths": ["理解 RDB 快照机制", "知道 AOF 实时写入"],
-  "weaknesses": ["未提到 AOF 重写机制", "未对比两种方式的性能差异"],
-  "suggestion": "建议补充 AOF rewrite 触发条件及 mixed 持久化策略",
+  "strong_points": ["能说明 RDB 快照思路", "提到 AOF 追加写"],
+  "missed_points": ["未对比持久化对恢复与性能的影响"],
+  "suggestion": "可补充 AOF rewrite 与混合持久化策略",
   "reference_answer": "……"
 }
 ```
 
-**处理流程**：
+---
+
+## 主流程（端到端）
 
 ```mermaid
 flowchart TD
-    A["👤 用户发起练习"] --> B["InterviewerAgent\n解析意图"]
-    B --> C{"用户意图"}
-    C -->|"随机/指定题目"| D["调用 get_question\n获取题目"]
-    C -->|"提交答案"| E["调用 submit_answer_eval\n评分 0-5 + 强弱点"]
-    C -->|"查薄弱点"| F["调用 get_user_mastery\n掌握度 + 复习队列"]
-    C -->|"求推荐"| G["调用 recommend_resources\n资源推荐"]
-    C -->|"记笔记"| H["调用 manage_note\n读写笔记"]
-    D --> I["流式回复用户"]
-    E --> J["写入 SM-2 记录\n返回评分卡片"]
-    J --> I
-    F --> I
-    G --> I
-    H --> I
-    style A fill:#e1f5ff
-    style I fill:#c8e6c9
+  U1["用户 / 定时任务"] --> SRC["输入源\nURL · 批量 · 定时发现"]
+  SRC --> CRAWL["crawler 服务\n抓取 · 清洗 · 落任务表"]
+  CRAWL --> MA["MinerAgent\nReAct 结构化提取"]
+  MA --> MTOOLS["Miner 工具\nocr_images · mark_unrelated · verify_extraction_count"]
+  MTOOLS --> MA
+  MA --> DB[("SQLite 题库\nNeo4j 图谱\nQdrant 向量")]
+  U2["用户"] --> API["FastAPI\n/chat · /submit_answer 等"]
+  API --> IA["InterviewerAgent\n对话与编排"]
+  IA --> ITOOLS["Interviewer 工具\n抽题 · 评分 · 笔记 · 掌握度等"]
+  ITOOLS --> IA
+  IA --> DB
+  IA --> SSE["前端 SSE 流式"]
+  SSE --> U2
 ```
 
 ---
 
-## 处理流程逻辑
-
-### 主流程（端到端）
+## 异常与回退流程（含 Agent 名称）
 
 ```mermaid
 flowchart TD
-    U["👤 用户 / 定时任务"] --> IN["📥 输入源\nURL / 批量 / 定时发现"]
-    IN --> MA["MinerAgent\n采集 & 结构化提取"]
-    MA --> OCR["ocr_images\n（图片辅助，按需）"]
-    OCR --> MA
-    MA --> DB[("SQLite\n结构化题库")]
-    MA --> NEO[("Neo4j\n知识图谱")]
-    MA --> QD[("Qdrant\n向量索引")]
-    DB --> IA["InterviewerAgent\n对话 & 评分 & 推荐"]
-    NEO --> IA
-    QD --> IA
-    IA --> FE["前端\nSSE 流式返回"]
-    FE --> U
-    style U fill:#e1f5ff
-    style MA fill:#fff3e0
-    style IA fill:#fff3e0
-    style FE fill:#c8e6c9
+  A["MinerAgent 所在采集链路"] --> B{"抓取成功？"}
+  B -->|否| C["crawler 记错误日志"]
+  C --> D["重试最多 3 次"]
+  D --> E{"重试成功？"}
+  E -->|否| F["任务标记 failed"]
+  E -->|是| G["继续进入 MinerAgent"]
+  B -->|是| G
+  G --> H{"MinerAgent\n解析成功？"}
+  H -->|否| I["清洗 JSON / 兜底 unrelated\n或返回空串由上层重试"]
+  I --> J["可用结果入库或跳过"]
+  H -->|是| K{"需题数校验？"}
+  K -->|是| L["verify_extraction_count"]
+  L -->|不符| M["MinerAgent 重新扫描补全"]
+  M --> L
+  L -->|通过| J
+  K -->|否| J
+
+  P["InterviewerAgent 对话/评分"] --> Q{"LLM/工具超时或异常？"}
+  Q -->|是| R["友好提示 · 写 trace / 失败样本"]
+  Q -->|否| S["正常 SSE 返回"]
+  R --> S
 ```
 
-### 异常与回退流程
+---
 
-```mermaid
-flowchart TD
-    A["🔗 MinerAgent 抓取请求"] --> B{"抓取成功？"}
-    B -->|否| C["记录错误日志"]
-    C --> D["重试策略（最多 3 次）"]
-    D --> E{"重试成功？"}
-    E -->|否| F["降级输出 error item\n任务标记 failed"]
-    E -->|是| G["继续解析"]
-    B -->|是| G
-    G --> H{"MinerAgent\n解析成功？"}
-    H -->|否| I["回退 generic parser\n或标记 unrelated"]
-    I --> J["输出可用结果 / 跳过"]
-    H -->|是| K["verify_extraction_count\n数量校验"]
-    K -->|通过| J
-    K -->|不符| L["MinerAgent 重新逐条扫描\n补全遗漏题目"]
-    L --> K
-    style A fill:#ffebee
-    style F fill:#ffcdd2
-    style J fill:#c8e6c9
-```
-
-### 数据流与日志流
+## 数据流与日志流
 
 ```mermaid
 sequenceDiagram
-    participant User as 用户 / 调度器
-    participant MA as MinerAgent
-    participant Tools as MinerTools<br/>(ocr_images / mark_unrelated)
-    participant DB as SQLite / Neo4j / Qdrant
-    participant IA as InterviewerAgent
-    participant ITools as InterviewerTools<br/>(get_question / submit_answer_eval 等)
-    participant FE as 前端 SSE
+  participant User as 用户或调度器
+  participant Crawler as crawler服务
+  participant Miner as MinerAgent
+  participant MT as Miner工具集
+  participant DB as SQLite与图谱向量库
+  participant IA as InterviewerAgent
+  participant IT as Interviewer工具集
+  participant FE as 前端SSE
 
-    User->>MA: 提交采集任务(url/text)
-    MA->>Tools: 调用 ocr_images（按需）
-    Tools-->>MA: 返回 OCR 文字
-    MA->>DB: 写入结构化题目 + 知识图谱 + 向量索引
-    MA-->>User: 返回提取结果 / 任务状态
+  User->>Crawler: 任务 URL/文本
+  Crawler->>Miner: 正文+元信息+图片路径
+  Miner->>MT: ocr_images / mark_unrelated / verify_extraction_count
+  MT-->>Miner: 观测结果
+  Miner->>DB: 结构化题目写入与索引
 
-    User->>IA: 发起练习对话
-    IA->>DB: 读取题目 / 掌握度 / 图谱
-    IA->>ITools: 调用 submit_answer_eval / recommend_resources 等
-    ITools-->>IA: 返回评分卡片 / 推荐资源
-    IA-->>FE: SSE 流式输出
-    FE-->>User: 实时展示对话与评分
+  User->>IA: 练习消息或提交答案
+  IA->>IT: get_question 族 / submit_answer 等
+  IT-->>IA: JSON 工具结果
+  IA->>DB: 读题、写 study_records、掌握度
+  IA-->>FE: 流式 token 与工具事件
+  Note over Miner,IA: 推理轨迹、工具耗时写入 trace 与 agent_tool_runtime_stats（可观测）
 ```
 
 ---
 
-## MCP 服务层
+## MCP 服务层（可选扩展）
 
-`mcp/` 目录包含 3 个 MCP (Model Context Protocol) 服务，按需扩展 Agent 能力：
+仓库 `mcp/` 下提供 **3 个 MCP**，用于在 Cursor 等环境中扩展「抓内容 / 抓网页 / 抽图片」能力；**主站业务默认走后端 FastAPI + 内置爬虫**，MCP 为可选集成。
 
-| MCP | 语言 | 工具 | 部署方式 | 独立部署 |
-|-----|------|------|---------|--------|
-| `mcp-content-extractor` | Python | `extract_nowcoder_content` / `extract_xhs_content` / `extract_content` | stdio 子进程 | ❌（依赖后端爬虫） |
-| `mcp-content-fetcher` | TypeScript | `fetch_content` / `fetch_multiple_contents` | stdio / 独立 | ✅ npm / Docker / Smithery |
-| `mcp-image-extractor` | TypeScript | `extract_image_from_file` / `extract_image_from_url` / `extract_image_from_base64` | stdio / 独立 | ✅ npm / Docker / Smithery |
+| MCP | 语言 | 主要工具 | 依赖后端 | 可独立部署 |
+|-----|------|----------|----------|------------|
+| `mcp-content-extractor` | Python | `extract_nowcoder_content`、`extract_xhs_content`、`extract_content` | 是（爬虫与登录态） | 否 |
+| `mcp-content-fetcher` | TypeScript | `fetch_content`、`fetch_multiple_contents` | 否 | 是 |
+| `mcp-image-extractor` | TypeScript | 按文件/URL/Base64 抽图与压缩 | 否 | 是 |
 
-### Cursor 配置示例
+详细配置、Smithery 与排障见 [`docs/MCP服务详解.md`](docs/MCP服务详解.md)、[`docs/MCP构建与部署指南.md`](docs/MCP构建与部署指南.md)。
 
-```json
-{
-  "mcpServers": {
-    "content-extractor": {
-      "command": "python",
-      "args": ["mcp/mcp-content-extractor/server.py"],
-      "cwd": "e:/Agent/AgentProject/wxr_agent"
-    },
-    "content-fetcher": {
-      "command": "node",
-      "args": ["mcp/mcp-content-fetcher/dist/index.js"],
-      "cwd": "e:/Agent/AgentProject/wxr_agent"
-    },
-    "image-extractor": {
-      "command": "node",
-      "args": ["mcp/mcp-image-extractor/dist/index.js"],
-      "cwd": "e:/Agent/AgentProject/wxr_agent"
-    }
-  }
-}
+---
+
+## 处理流程逻辑（总览）
+
+```mermaid
+flowchart LR
+  subgraph 采集写库
+    M1[抓取] --> M2[MinerAgent]
+    M2 --> M3[校验与清洗]
+    M3 --> M4[(题库与索引)]
+  end
+  subgraph 练习读库
+    I1[InterviewerAgent] --> I2[工具编排]
+    I2 --> M4
+    I1 --> I3[SSE 到前端]
+  end
 ```
 
-> 详细说明见 [`docs/MCP服务详解.md`](docs/MCP服务详解.md) 与 [`docs/MCP构建与部署指南.md`](docs/MCP构建与部署指南.md)。
+### MinerAgent 单链路（提取）
+
+```mermaid
+flowchart TD
+  IN["帖子正文 + 元信息 + 图片路径"] --> RUN["MinerAgent.run / ReAct"]
+  RUN --> DEC{"需要 OCR？"}
+  DEC -->|是| OCR["ocr_images"]
+  OCR --> RUN
+  DEC -->|否| DEC2{"无关或无题？"}
+  DEC2 -->|是| UNREL["mark_unrelated → UNRELATED_SIGNAL"]
+  DEC2 -->|否| CNT{"元信息要求题数校验？"}
+  CNT -->|是| VER["verify_extraction_count"]
+  VER -->|失败| RUN
+  VER -->|通过| OUT["Finish：JSON 数组"]
+  CNT -->|否| OUT
+```
+
+### InterviewerAgent 单链路（对话与评分）
+
+```mermaid
+flowchart TD
+  MSG["用户消息"] --> IA["InterviewerAgent\nchat / chat_stream"]
+  IA --> REACT["ReAct：Thought → 工具 → Observation"]
+  REACT --> T{"意图类型"}
+  T -->|练习抽题| G1["get_recommended_question / filter_questions / get_question_detail"]
+  T -->|提交答案| G2["submit_answer 等编排\n(内部结构化评分 + 落库)"]
+  T -->|复盘推荐| G3["get_mastery_report / get_knowledge_recommendation"]
+  G1 --> SSE["SSE 推送"]
+  G2 --> SSE
+  G3 --> SSE
+```
+
+---
+
+## 前端页面（当前侧边栏）
+
+`web/src/App.vue` 中当前导航项：
+
+- `browse`：`BrowseView.vue`（题库浏览）
+- `chat`：`ChatView.vue`（练习对话）
+- `ingest`：`IngestView.vue`（收录面经）
+- `collect`：`CollectView.vue`（数据采集）
+- `scheduler`：`SchedulerView.vue`（定时任务）
+- `report`：`ReportView.vue`（学习报告）
+- `finetune`：`FinetuneView.vue`（微调标注）
+- `tool_usage`：`ToolUsageView.vue`（工具统计）
+- `graph_rag`：`GraphRagView.vue`（GraphRAG）
+- `model_compare`：`ModelBenchView.vue`（模型对比）
+
+---
+
+## 核心能力清单
+
+- **题库管理**：筛选、分页、随机抽题、智能组题
+- **对话练习**：SSE 流式问答，支持会话历史
+- **答题评估**：异步/流式评分、学习反馈、记录沉淀
+- **采集链路**：抓取、清洗、提取、批量重提取、任务可视化
+- **定时调度**：APScheduler 可视化管理，支持运行/启停/CRUD
+- **微调流程**：样本标注、训练数据生成、模型对比评测
+- **知识图谱与推荐**：Neo4j 图谱、Qdrant 向量检索、学习建议
 
 ---
 
@@ -298,12 +329,10 @@ sequenceDiagram
 
 ### 1) 环境要求
 
-| 组件 | 要求 |
-|------|------|
-| Python | 3.12+ |
-| Conda 环境 | `NewCoderAgent` |
-| Docker Desktop | Neo4j / Qdrant |
-| Node.js | 前端开发模式 |
+- Python 3.12+
+- Conda 环境：`NewCoderAgent`
+- Docker Desktop（Neo4j / Qdrant）
+- Node.js（前端开发模式）
 
 ### 2) 安装依赖
 
@@ -348,51 +377,36 @@ npm run dev
 
 ## API 入口（高频）
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET` | `/api/config` | 运行配置 |
-| `GET` | `/api/questions` | 题库查询 |
-| `GET` | `/api/questions/smart-practice` | 智能练习组题 |
-| `POST` | `/api/chat/stream` | 流式对话（SSE） |
-| `POST` | `/api/submit_answer/stream` | 流式评分（SSE） |
-| `POST` | `/api/ingest` | URL 收录 |
-| `GET` | `/api/crawler/stats` | 采集统计 |
-| `GET/POST` | `/api/scheduler/*` | 定时任务管理 |
-| `GET/POST` | `/api/finetune/*` | 微调与模型对比 |
-| `GET` | `/api/reasoning/*` | 推理轨迹查询 |
+- `GET /api/config`：运行配置
+- `GET /api/questions`：题库查询
+- `GET /api/questions/smart-practice`：智能练习组题
+- `POST /api/chat/stream`：流式对话
+- `POST /api/submit_answer/stream`：流式评分
+- `POST /api/ingest`：URL 收录
+- `GET /api/crawler/stats`：采集统计
+- `GET/POST /api/scheduler/*`：定时任务管理
+- `GET/POST /api/finetune/*`：微调与模型对比
+- `GET /api/reasoning/*`：推理轨迹查询
 
-完整接口文档见 [`docs/系统梳理/API全量文档.md`](docs/系统梳理/API全量文档.md)。
+更完整接口文档见 [`docs/系统梳理/API全量文档.md`](docs/系统梳理/API全量文档.md)。
 
 ---
 
-## 目录结构
+## 目录结构（精简版）
 
 ```text
 InterviewExperienceCrawlerAgent/
 ├─ backend/
-│  ├─ main.py                    # FastAPI 入口
-│  ├─ api/                       # scheduler_api / reasoning_api
-│  ├─ agents/
-│  │  ├─ interviewer_agent.py    # InterviewerAgent + get_orchestrator
-│  │  ├─ miner_agent.py          # MinerAgent 基础实现
-│  │  ├─ miner_react_agent.py    # MinerAgent ReAct 封装
-│  │  ├─ prompts/                # Interviewer / Miner 提示词
-│  │  └─ schemas/                # Miner JSON schema
-│  ├─ services/                  # crawler / scheduling / storage / finetune / knowledge
+│  ├─ main.py
+│  ├─ api/                  # scheduler_api / reasoning_api
+│  ├─ agents/               # interviewer_agent / miner_agent / miner_react_agent
+│  ├─ services/             # crawler / scheduling / storage / finetune / knowledge
 │  ├─ tools/
-│  │  ├─ miner_tools.py          # ocr_images / mark_unrelated / verify_extraction_count
-│  │  ├─ interviewer_tools.py    # get_question / submit_answer_eval / manage_note 等
-│  │  ├─ hunter_tools.py
-│  │  └─ knowledge_manager_tools.py
 │  ├─ config/config.py
-│  └─ data/                      # local_data.db / neo4j_data / qdrant_storage / logs
-├─ web/                          # Vue 3 + Vite（10 个视图）
-├─ mcp/                          # 3 个 MCP 服务
-│  ├─ mcp-content-extractor/     # Python · stdio
-│  ├─ mcp-content-fetcher/       # TypeScript · stdio / 独立
-│  └─ mcp-image-extractor/       # TypeScript · stdio / 独立
-├─ docs/                         # 系统梳理与使用文档
-├─ 微调/                          # 训练脚本、LoRA adapter、infer_server.py
+│  └─ data/                 # local_data.db / neo4j_data / qdrant_storage / logs 等
+├─ web/                     # Vue3 + Vite
+├─ docs/                    # 系统梳理与使用文档
+├─ 微调/                    # 训练脚本与产物
 ├─ docker-compose.yml
 ├─ run.py
 └─ requirements.txt
@@ -405,45 +419,45 @@ InterviewExperienceCrawlerAgent/
 - 配置来源：项目根目录 `.env`
 - 配置读取：`backend/config/config.py`
 - 支持本地/远程 LLM 双模式（`LLM_MODE=local|remote`）
-- 参考文档：[`docs/STARTUP_GUIDE.md`](docs/STARTUP_GUIDE.md) · [`docs/环境配置说明.md`](docs/环境配置说明.md)
+- 推荐先参考：
+  - [`docs/STARTUP_GUIDE.md`](docs/STARTUP_GUIDE.md)
+  - [`docs/环境配置说明.md`](docs/环境配置说明.md)
 
 ---
 
 ## 文档导航
 
-| 文档 | 路径 |
-|------|------|
-| 文档索引 | [`docs/README.md`](docs/README.md) |
-| 启动与排障 | [`docs/STARTUP_GUIDE.md`](docs/STARTUP_GUIDE.md) |
-| 页面功能说明 | [`docs/系统梳理/页面功能与按钮说明.md`](docs/系统梳理/页面功能与按钮说明.md) |
-| InterviewerAgent 全景 | [`docs/系统梳理/Agent-Interviewer全景文档.md`](docs/系统梳理/Agent-Interviewer全景文档.md) |
-| MinerAgent 全景 | [`docs/系统梳理/Agent-Miner全景文档.md`](docs/系统梳理/Agent-Miner全景文档.md) |
-| API 全量文档 | [`docs/系统梳理/API全量文档.md`](docs/系统梳理/API全量文档.md) |
-| MCP 服务详解 | [`docs/MCP服务详解.md`](docs/MCP服务详解.md) |
-| MCP 构建与部署 | [`docs/MCP构建与部署指南.md`](docs/MCP构建与部署指南.md) |
-| 微调模块说明 | [`docs/微调模块技术解析.md`](docs/微调模块技术解析.md) |
-| 全量截图 | [`GALLERY.md`](GALLERY.md) |
+- 文档索引：[`docs/README.md`](docs/README.md)
+- 页面功能说明：[`docs/系统梳理/页面功能与按钮说明.md`](docs/系统梳理/页面功能与按钮说明.md)
+- Agent 全景：
+  - [`docs/系统梳理/Agent-Interviewer全景文档.md`](docs/系统梳理/Agent-Interviewer全景文档.md)
+  - [`docs/系统梳理/Agent-Miner全景文档.md`](docs/系统梳理/Agent-Miner全景文档.md)
+- 模型对比：[`docs/系统梳理/模型对比页面说明.md`](docs/系统梳理/模型对比页面说明.md)
+- MCP 与扩展：
+  - [`docs/MCP服务详解.md`](docs/MCP服务详解.md)
+  - [`docs/MCP构建与部署指南.md`](docs/MCP构建与部署指南.md)
 
 ---
 
 ## 常见问题
 
-**Q: `python run.py` 提示环境问题？**  
-`run.py` 会尝试切换到 `NewCoderAgent` 解释器；路径变化时请修改 `run.py` 中的 `CONDA_ENV_PYTHON`。
+### 1) 为什么 `python run.py` 仍提示环境问题？
 
-**Q: Neo4j / Qdrant 连接失败？**  
-运行 `docker compose ps` 确认服务已启动，并确认 `.env` 中连接地址与 `docker-compose.yml` 端口一致。
+`run.py` 会尝试切换到固定的 `NewCoderAgent` 解释器路径；若路径变化，请修改 `run.py` 中的 `CONDA_ENV_PYTHON`。
 
-**Q: 前端流式卡住？**  
-设置 `VITE_STREAM_DIRECT=true` 绕过代理缓存，直连后端验证 SSE。
+### 2) Neo4j / Qdrant 连接失败怎么办？
 
-**Q: LLM 429 限流？**  
-进入火山引擎控制台 → 模型推理 → 关闭「安全体验模式」或提升推理配额。
+优先检查：
 
-**Q: 开发模式自动重启？**  
-```bash
-python run.py --reload
-```
+- `docker compose ps`
+- `docker compose logs neo4j`
+- `docker compose logs qdrant`
+
+并确认 `.env` 中连接地址与 `docker-compose.yml` 端口一致。
+
+### 3) 页面能打开但流式卡住怎么办？
+
+先用直连后端方式排查：前端设置 `VITE_STREAM_DIRECT=true`，绕过代理缓存验证 SSE。
 
 ---
 
@@ -452,4 +466,3 @@ python run.py --reload
 - [hello-agents](https://github.com/datawhalechina/hello-agents)
 - [DataWhale](https://datawhale.club)
 - 火山引擎 / 阿里云 / Ollama 等模型与基础设施能力
- 

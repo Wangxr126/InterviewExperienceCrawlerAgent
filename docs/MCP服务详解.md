@@ -78,6 +78,10 @@ python mcp/mcp-content-extractor/server.py
 
 ✅ **保留** - 这是 InterviewExperienceCrawlerAgent 的核心功能，用于爬取面试题
 
+### 更细的说明
+
+工具入参/返回、联调与目录说明见 [`mcp/mcp-content-extractor/README.md`](../mcp/mcp-content-extractor/README.md)。
+
 ---
 
 ## 2️⃣ mcp-content-fetcher (TypeScript)

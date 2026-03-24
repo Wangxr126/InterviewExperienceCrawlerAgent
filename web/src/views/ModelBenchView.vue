@@ -38,6 +38,37 @@
       </p>
     </section>
 
+    <!-- DSW 导出的 compare_results_10.json：由后端读 微调/dsw/ -->
+    <section class="mb-panel">
+      <div class="mb-section-title"><span>📦</span><span>DSW 预跑结果（本地 JSON）</span></div>
+      <p v-if="!dswPresetMeta.exists" class="mb-server-hint">
+        将 <code>compare_results_10.json</code> 放到仓库 <code>微调/dsw/</code> 后重启后端；或设置环境变量
+        <code>MODEL_BENCH_DSW_COMPARE_JSON</code>。加载后下方会出现<strong>豆包答案列</strong>与四模型对照。
+      </p>
+      <div v-else class="mb-preset-row">
+        <el-tag type="success" size="small" effect="light">{{ dswPresetMeta.count }} 条</el-tag>
+        <span v-if="dswPresetMeta.generated_at" class="mb-preset-meta">{{ dswPresetMeta.generated_at }}</span>
+        <el-select
+          v-model="selectedPresetIdx"
+          placeholder="选择预跑记录…"
+          filterable
+          clearable
+          class="mb-preset-select"
+        >
+          <el-option
+            v-for="it in dswPresetMeta.items"
+            :key="it.idx"
+            :label="presetOptionLabel(it)"
+            :value="it.idx"
+          />
+        </el-select>
+        <el-button type="primary" plain :disabled="!selectedPresetIdx" @click="applyDswPreset">
+          加载到对比区
+        </el-button>
+        <el-button :icon="Refresh" circle :loading="loadingDswPreset" @click="loadDswPresetMeta" />
+      </div>
+    </section>
+
     <!-- ── 两列布局：左侧选题 / 右侧配置 ── -->
     <div class="mb-config-grid">
       <!-- 左：帖子（URL）选择 -->
@@ -213,6 +244,51 @@
           </div>
         </div>
       </div>
+
+      <!-- 豆包 + 四模型对照（预跑 JSON 含 doubao_answer；实时推理时豆包列为提示） -->
+      <div class="mb-summary-block">
+        <div class="mb-results-title">
+          <span>📋</span><span>对照：豆包答案 · 四模型输出</span>
+        </div>
+        <div class="mb-grid mb-grid-5">
+          <div class="mb-card mb-card-doubao">
+            <div class="mb-card-head">
+              <div class="mb-card-title-row">
+                <span class="mb-card-num">豆</span>
+                <span class="mb-card-label">豆包 / 题库参考答案</span>
+                <span class="mb-card-id">doubao_answer</span>
+              </div>
+            </div>
+            <div class="mb-card-body">
+              <div
+                v-if="!doubaoPresetText.trim()"
+                class="mb-placeholder"
+              >
+                加载 <code>微调/dsw/compare_results_10.json</code> 中的条目后显示；实时四模型推理不带题库精答。
+              </div>
+              <div v-else class="mb-text" v-html="renderText(doubaoPresetText)" />
+            </div>
+          </div>
+          <div
+            v-for="(col, i) in columns"
+            :key="'sum-' + col.modelId"
+            class="mb-card"
+            :class="[`tone-${i}`, col.status]"
+          >
+            <div class="mb-card-head">
+              <div class="mb-card-title-row">
+                <span class="mb-card-num">{{ ['①', '②', '③', '④'][i] }}</span>
+                <span class="mb-card-label">{{ col.label }}</span>
+                <span class="mb-card-id">{{ col.modelId }}</span>
+              </div>
+            </div>
+            <div class="mb-card-body">
+              <div v-if="col.status === 'error'" class="mb-error-text">{{ col.errorMsg }}</div>
+              <div v-else class="mb-text" v-html="renderText(col.text)" />
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
   </div>
 </template>
@@ -231,6 +307,16 @@ const serverUrl   = ref(localStorage.getItem('mb_server_url') || 'http://localho
 const pingStatus  = ref('')   // '' | 'ok' | 'err'
 const pinging     = ref(false)
 const serverModels = ref([])
+
+const dswPresetMeta = ref({
+  exists: false,
+  count: 0,
+  generated_at: '',
+  items: [],
+})
+const loadingDswPreset = ref(false)
+const selectedPresetIdx = ref(null)
+const doubaoPresetText = ref('')
 
 const saveServer = () => localStorage.setItem('mb_server_url', serverUrl.value)
 
@@ -353,6 +439,76 @@ const columns = ref(makeColumns())
 const resetColumns = () => {
   columns.value = makeColumns()
   allDone.value = false
+  doubaoPresetText.value = ''
+}
+
+const loadDswPresetMeta = async () => {
+  loadingDswPreset.value = true
+  try {
+    const r = await fetch('/api/model-bench/dsw-preset/meta')
+    const d = await r.json()
+    dswPresetMeta.value = {
+      exists: !!d.exists,
+      count: d.count || 0,
+      generated_at: d.generated_at || '',
+      items: d.items || [],
+    }
+  } catch {
+    dswPresetMeta.value = { exists: false, count: 0, generated_at: '', items: [] }
+  } finally {
+    loadingDswPreset.value = false
+  }
+}
+
+const presetOptionLabel = (it) => {
+  const cat = it.category || ''
+  const prev = it.question_preview || (it.question_text || '').slice(0, 80)
+  return `#${it.idx} ${cat ? `[${cat}] ` : ''}${prev}`
+}
+
+const applyDswPreset = async () => {
+  if (!selectedPresetIdx.value) return
+  stopCompare()
+  try {
+    const r = await fetch(
+      `/api/model-bench/dsw-preset/item?idx=${encodeURIComponent(selectedPresetIdx.value)}`,
+    )
+    if (!r.ok) {
+      ElMessage.error('加载预跑条目失败')
+      return
+    }
+    const d = await r.json()
+    const item = d.item
+    if (!item) {
+      ElMessage.error('条目为空')
+      return
+    }
+    selectedQ.value = null
+    customQ.value = item.question_text || ''
+    doubaoPresetText.value = item.doubao_answer || ''
+    columns.value = makeColumns()
+    slots.value.forEach((slot) => {
+      const col = columns.value.find((c) => c.modelId === slot.modelId)
+      if (!col) return
+      const m = item.models?.[slot.modelId]
+      if (!m) return
+      const err = (m.error || '').trim()
+      const txt = m.text || ''
+      Object.assign(col, {
+        text: txt,
+        errorMsg: err,
+        status: err ? 'error' : 'done',
+        elapsed: Number(m.elapsed_ms || 0),
+        tokenCount: Math.max(1, Math.floor(txt.length / 3)),
+      })
+    })
+    showResults.value = true
+    allDone.value = true
+    running.value = false
+    ElMessage.success('已加载 DSW 预跑：豆包 + 四模型')
+  } catch (e) {
+    ElMessage.error('加载失败：' + (e.message || String(e)))
+  }
 }
 
 const renderText = (text) => {
@@ -393,6 +549,7 @@ const runCompare = () => {
   _es.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data)
+      if (msg.type === 'keepalive') return
       const col = columns.value.find(c => c.modelId === msg.model)
 
       if (msg.type === 'start') {
@@ -473,7 +630,10 @@ const applyPrefillQuestion = async (prefill) => {
   }
 }
 
-onMounted(() => { loadQs() })
+onMounted(() => {
+  loadQs()
+  loadDswPresetMeta()
+})
 onUnmounted(() => { if (_es) _es.close() })
 
 watch(
@@ -729,6 +889,48 @@ watch(
 }
 @media (max-width: 760px) {
   .mb-grid { grid-template-columns: 1fr; }
+}
+
+.mb-preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.mb-preset-meta {
+  font-size: 12px;
+  color: #64748b;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mb-preset-select { min-width: 260px; flex: 1; max-width: 480px; }
+
+.mb-grid-5 {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+@media (max-width: 1400px) {
+  .mb-grid-5 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .mb-grid-5 { grid-template-columns: 1fr; }
+}
+
+.mb-summary-block {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px dashed var(--line);
+}
+.mb-card-doubao {
+  border-top: 4px solid #f59e0b;
+  min-height: 200px;
+}
+.mb-card-doubao .mb-card-body :deep(code) {
+  font-size: 11px;
+  background: #f1f5f9;
+  padding: 1px 5px;
+  border-radius: 4px;
 }
 
 /* ── Card ── */

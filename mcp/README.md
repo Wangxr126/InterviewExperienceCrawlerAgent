@@ -562,7 +562,7 @@ docker run mcp-image-extractor
 
 | 文档   | 位置                  | 用途        |
 | ---- | ------------------- | --------- |
-| 快速参考 | `docs/MCP快速参考.md`   | 1 分钟快速上手  |
+| 快速上手 | `docs/MCP服务详解.md` 开篇表格 | 1 分钟对照三个 MCP |
 | 服务详解 | `docs/MCP服务详解.md`   | 深入理解各 MCP |
 | 独立部署 | `docs/MCP独立部署指南.md` | 如何独立部署    |
 | 本文档  | `mcp/README.md`     | MCP 目录说明  |

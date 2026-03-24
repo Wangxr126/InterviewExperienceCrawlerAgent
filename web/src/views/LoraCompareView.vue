@@ -1,26 +1,55 @@
 <template>
   <div class="lc-wrap">
-    <!-- 标题 -->
     <header class="lc-hero">
       <div class="lc-hero-badge">🧬 LoRA 对比</div>
       <h1 class="lc-title">微调模型对比推理</h1>
       <p class="lc-lead">
-        从题库选题，实时在 <strong>原始模型 + 三组 LoRA 权重</strong> 上并行推理，逐 token 流式展示对比结果。
+        从题库选题，实时在 <strong>原始模型 + 三组 LoRA 权重</strong> 上推理；流式四列下方可对照
+        <strong>原帖 content</strong>、<strong>豆包题库答案</strong> 与四模型完整输出，并支持一键导出。
       </p>
     </header>
 
-    <!-- 服务说明 -->
     <section class="lc-panel">
       <div class="lc-section-title">
         <span>⚙️</span><span>推理服务</span>
       </div>
       <p class="lc-server-hint">
-        本页已改为通过后端 <code>/api/model-bench/stream</code> 统一转发，
-        前端无需直接配置或连接 <code>8899</code>。
+        本页通过后端 <code>/api/model-bench/stream</code> 转发 DSW 上的 <code>infer_server.py</code>；
+        环境变量 <code>MODEL_BENCH_SERVER_URL</code> 指向云端地址即可。
       </p>
     </section>
 
-    <!-- 选题 -->
+    <section class="lc-panel">
+      <div class="lc-section-title"><span>📦</span><span>DSW 预跑结果（本地 JSON）</span></div>
+      <p v-if="!dswPresetMeta.exists" class="lc-server-hint">
+        将 DSW 导出的 <code>compare_results_10.json</code> 放到仓库
+        <code>微调/dsw/</code> 目录（与本机路径一致），重启后端后此处会出现下拉列表。
+        也可用环境变量 <code>MODEL_BENCH_DSW_COMPARE_JSON</code> 指定其它路径。
+      </p>
+      <div v-else class="lc-preset-row">
+        <el-tag type="success" size="small" effect="light">{{ dswPresetMeta.count }} 条</el-tag>
+        <span v-if="dswPresetMeta.generated_at" class="lc-preset-meta">{{ dswPresetMeta.generated_at }}</span>
+        <el-select
+          v-model="selectedPresetIdx"
+          placeholder="选择一条预跑记录…"
+          filterable
+          clearable
+          class="lc-preset-select"
+        >
+          <el-option
+            v-for="it in dswPresetMeta.items"
+            :key="it.idx"
+            :label="presetOptionLabel(it)"
+            :value="it.idx"
+          />
+        </el-select>
+        <el-button type="primary" plain :disabled="!selectedPresetIdx" @click="applyDswPreset">
+          加载到对比区
+        </el-button>
+        <el-button :icon="Refresh" circle :loading="loadingDswPreset" @click="loadDswPresetMeta" />
+      </div>
+    </section>
+
     <section class="lc-panel">
       <div class="lc-section-title"><span>📚</span><span>选择题目</span></div>
 
@@ -66,7 +95,6 @@
       />
     </section>
 
-    <!-- 自定义题目 -->
     <section class="lc-panel">
       <div class="lc-section-title"><span>✏️</span><span>或手动输入题目</span></div>
       <el-input
@@ -78,7 +106,6 @@
       />
     </section>
 
-    <!-- 当前题目预览 + 运行按钮 -->
     <section class="lc-panel lc-run-panel">
       <div class="lc-current-q">
         <span class="lc-q-label">当前题目：</span>
@@ -94,14 +121,19 @@
       >
         {{ running ? '推理中…' : '▶ 运行四模型对比' }}
       </el-button>
-      <el-button v-if="running" @click="stopCompare" type="danger" size="large" plain class="lc-stop-btn">
+      <el-button v-if="running" type="danger" size="large" plain class="lc-stop-btn" @click="stopCompare">
         停止
       </el-button>
     </section>
 
-    <!-- 四列结果 -->
-    <section v-if="showResults" class="lc-results" id="lc-infer-results">
-      <div class="lc-grid">
+    <section v-if="showResults" class="lc-results">
+      <div class="lc-results-actions">
+        <el-button type="primary" plain @click="exportCompareJson">导出对比 JSON</el-button>
+        <el-button plain @click="copyCompareText">复制对比文本</el-button>
+      </div>
+
+      <div class="lc-section-title lc-results-title"><span>⚡</span><span>流式输出（四模型）</span></div>
+      <div class="lc-grid lc-grid-4">
         <div
           v-for="(col, idx) in columns"
           :key="col.id"
@@ -109,7 +141,7 @@
           :class="[`tone-${idx}`, col.status]"
         >
           <div class="lc-card-head">
-            <span class="lc-card-tag">{{ ['①','②','③','④'][idx] }}</span>
+            <span class="lc-card-tag">{{ ['①', '②', '③', '④'][idx] }}</span>
             <div class="lc-card-info">
               <span class="lc-card-label">{{ col.label }}</span>
               <span class="lc-card-id mono">{{ col.id }}</span>
@@ -135,125 +167,48 @@
           </div>
         </div>
       </div>
-    </section>
-    </section>
 
-    <!-- ════════════════════════════════════════════════════════
-         第二排：Demo Cases 预置案例对比展示区
-         ════════════════════════════════════════════════════════ -->
-    <section class="dc-section">
-      <div class="dc-section-header">
-        <div class="dc-section-title">
-          <span class="dc-icon">🗂️</span>
-          <span>预置案例对比演示</span>
-          <span class="dc-subtitle">豆包参考答案 · 基座模型 · 三组 LoRA 微调</span>
+      <div class="lc-compare-summary">
+        <div class="lc-section-title"><span>📋</span><span>对照：原帖 content · 豆包答案 · 四模型输出</span></div>
+
+        <div v-if="postContentForDisplay" class="lc-post-box">
+          <div class="lc-subtitle">原帖 raw_content（题库关联帖）</div>
+          <pre class="lc-pre">{{ postContentForDisplay }}</pre>
         </div>
-        <el-button :icon="Refresh" size="small" :loading="loadingCases" @click="loadDemoCases" circle />
-      </div>
+        <p v-else class="lc-muted">
+          当前无关联原帖正文（自定义题干或未绑定 <code>crawl_task_id</code> 的题目）。推理仍使用上方题干走 Miner 模板。
+        </p>
 
-      <!-- 案例选择 tabs -->
-      <div class="dc-case-tabs" v-if="demoCases.length">
-        <div
-          v-for="c in demoCases"
-          :key="c.case_index"
-          class="dc-case-tab"
-          :class="{ active: selectedCase?.case_index === c.case_index }"
-          @click="selectCase(c)"
-        >
-          <span class="dc-tab-num">{{ c.case_index }}</span>
-          <span class="dc-tab-cat">{{ c.category }}</span>
-          <span class="dc-tab-title">{{ c.title.slice(0, 12) }}</span>
-        </div>
-      </div>
-      <div v-else-if="!loadingCases" class="dc-empty">暂无预置案例，请先运行 scripts/extract_demo_cases.py</div>
-
-      <!-- 案例详情 -->
-      <div v-if="selectedCase" class="dc-case-detail">
-        <!-- 基本信息条 -->
-        <div class="dc-meta-bar">
-          <el-tag size="small" type="warning" effect="light">{{ selectedCase.category }}</el-tag>
-          <el-tag v-if="selectedCase.company" size="small" type="info" effect="plain">{{ selectedCase.company }}</el-tag>
-          <el-tag v-if="selectedCase.platform" size="small" effect="plain">{{ selectedCase.platform }}</el-tag>
-          <span class="dc-meta-title">{{ selectedCase.title }}</span>
-          <span class="dc-meta-qcount">📝 {{ selectedCase.questions_count }} 题</span>
-          <el-tag v-if="selectedCase.has_irregular_numbering" size="small" type="danger" effect="plain">非规则标号</el-tag>
-          <el-tag v-if="selectedCase.is_modified" size="small" type="success" effect="plain">人工修改</el-tag>
-        </div>
-
-        <!-- 原始 content 折叠展示 -->
-        <div class="dc-content-block">
-          <div class="dc-content-header" @click="showContent = !showContent">
-            <span>📄 原始帖子正文</span>
-            <span class="dc-content-len">（{{ (fullCaseContent || selectedCase.content || selectedCase.content_preview || '').length }} 字符）</span>
-            <span class="dc-toggle">{{ showContent ? '▲ 收起' : '▼ 展开查看' }}</span>
-          </div>
-          <div v-if="showContent" class="dc-content-body">
-            <pre class="dc-pre">{{ fullCaseContent || selectedCase.content_preview }}</pre>
-            <el-button
-              v-if="!fullCaseContent"
-              size="small" type="primary" plain
-              class="dc-load-full-btn"
-              :loading="loadingFullContent"
-              @click="loadFullContent"
-            >加载完整正文</el-button>
-          </div>
-        </div>
-
-        <!-- 操作栏 -->
-        <div class="dc-compare-toolbar">
-          <el-button type="primary" size="small" :loading="demoRunning" @click="runDemoCompare">
-            {{ demoRunning ? '推理中…' : '▶ 对此案例运行四模型推理' }}
-          </el-button>
-          <el-button v-if="demoRunning" type="danger" plain size="small" @click="stopDemoCompare">停止</el-button>
-          <span class="dc-toolbar-hint">将用帖子完整正文作为输入，在四个模型上做题目提取推理</span>
-        </div>
-
-        <!-- 五列卡片：豆包 + base + seq2048 + seq4096 + seq8192 -->
-        <div class="dc-grid">
-          <!-- 豆包参考答案 -->
-          <div class="dc-card dc-card-doubao">
-            <div class="dc-card-head">
-              <span class="dc-card-icon">🫘</span>
-              <div class="dc-card-info">
-                <span class="dc-card-label">豆包参考答案</span>
-                <el-tag size="small" type="warning" effect="light">标注基准</el-tag>
+        <div class="lc-grid lc-grid-5">
+          <div class="lc-card lc-static tone-ref">
+            <div class="lc-card-head">
+              <span class="lc-card-tag">豆</span>
+              <div class="lc-card-info">
+                <span class="lc-card-label">豆包生成的答案（题库 answer_text）</span>
+                <span class="lc-card-id mono">doubao_answer</span>
               </div>
             </div>
-            <div class="dc-card-body">
-              <div v-if="selectedCase.doubao_output" v-html="renderJson(selectedCase.doubao_output)" />
-              <div v-else class="dc-placeholder">（暂无标注输出）</div>
+            <div class="lc-card-body">
+              <div class="lc-text-content" v-html="renderText(doubaoAnswerDisplay)" />
             </div>
           </div>
 
-          <!-- 四模型推理结果 -->
           <div
-            v-for="(dcol, idx) in demoCols"
-            :key="dcol.id"
-            class="dc-card"
-            :class="[`dc-tone-${idx}`, dcol.status]"
+            v-for="(col, idx) in columns"
+            :key="'sum-' + col.id"
+            class="lc-card lc-static"
+            :class="[`tone-${idx}`, col.status]"
           >
-            <div class="dc-card-head">
-              <span class="dc-card-icon">{{ ['①','②','③','④'][idx] }}</span>
-              <div class="dc-card-info">
-                <span class="dc-card-label">{{ dcol.label }}</span>
-                <span class="dc-card-id">{{ dcol.id }}</span>
-              </div>
-              <div class="dc-status-area">
-                <span v-if="dcol.status === 'waiting'" class="lc-dot waiting" />
-                <span v-else-if="dcol.status === 'running'" class="lc-dot running" />
-                <el-tag v-else-if="dcol.status === 'done'" type="success" size="small" effect="light">完成</el-tag>
-                <el-tag v-else-if="dcol.status === 'error'" type="danger" size="small" effect="light">错误</el-tag>
+            <div class="lc-card-head">
+              <span class="lc-card-tag">{{ ['①', '②', '③', '④'][idx] }}</span>
+              <div class="lc-card-info">
+                <span class="lc-card-label">{{ col.label }}</span>
+                <span class="lc-card-id mono">{{ col.id }}</span>
               </div>
             </div>
-            <div class="dc-card-body">
-              <div v-if="dcol.status === 'waiting'" class="dc-placeholder">等待推理…</div>
-              <div v-else-if="dcol.status === 'running' && !dcol.text" class="dc-placeholder dc-blink">生成中…</div>
-              <div v-else-if="dcol.status === 'error'" class="dc-error">{{ dcol.errorMsg }}</div>
-              <div v-else v-html="renderJson(dcol.text)" />
-            </div>
-            <div v-if="dcol.status !== 'waiting'" class="dc-card-foot">
-              <span v-if="dcol.tokenCount" class="lc-stat">{{ dcol.tokenCount }} tk</span>
-              <span v-if="dcol.elapsed" class="lc-stat">{{ (dcol.elapsed/1000).toFixed(1) }}s</span>
+            <div class="lc-card-body">
+              <div v-if="col.status === 'error'" class="lc-error-text">{{ col.errorMsg }}</div>
+              <div v-else class="lc-text-content" v-html="renderText(col.text)" />
             </div>
           </div>
         </div>
@@ -263,24 +218,33 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 
-// ── 服务配置（前端仅连后端） ───────────────────────────────
 const serverUrl = ref('')
 
-// ── 题库 ──────────────────────────────────────────────────
-const questions     = ref([])
-const totalQs       = ref(0)
-const page          = ref(1)
-const pageSize      = ref(10)
-const loadingQs     = ref(false)
+const dswPresetMeta = ref({
+  exists: false,
+  count: 0,
+  generated_at: '',
+  items: [],
+  path: '',
+})
+const loadingDswPreset = ref(false)
+const selectedPresetIdx = ref(null)
+
+const questions = ref([])
+const totalQs = ref(0)
+const page = ref(1)
+const pageSize = ref(30)
+const loadingQs = ref(false)
 const questionSearch = ref('')
-const filterType    = ref('')
+const filterType = ref('')
 const questionTypes = ref([])
-const selectedQ     = ref(null)
+const selectedQ = ref(null)
 const customQuestion = ref('')
+const questionDetail = ref(null)
 
 let searchTimer = null
 const debounceSearch = () => {
@@ -299,7 +263,7 @@ const loadQuestions = async () => {
     const r = await fetch(`/api/questions?${p}`)
     const data = await r.json()
     questions.value = data.items || data.questions || []
-    totalQs.value   = data.total || 0
+    totalQs.value = data.total || 0
   } catch (e) {
     ElMessage.error('加载题目失败：' + e.message)
   } finally {
@@ -315,27 +279,56 @@ const loadMeta = async () => {
   } catch { /* ignore */ }
 }
 
-const selectQuestion = (q) => {
+const loadQuestionDetail = async (qId) => {
+  if (!qId) {
+    questionDetail.value = null
+    return
+  }
+  try {
+    const r = await fetch(`/api/questions/${encodeURIComponent(qId)}`)
+    if (!r.ok) {
+      questionDetail.value = null
+      return
+    }
+    questionDetail.value = await r.json()
+  } catch {
+    questionDetail.value = null
+  }
+}
+
+const selectQuestion = async (q) => {
   selectedQ.value = q
   customQuestion.value = ''
+  await loadQuestionDetail(q.q_id)
 }
+
+watch(customQuestion, (v) => {
+  if ((v || '').trim()) questionDetail.value = null
+})
 
 const diffColor = (d) => ({ easy: 'success', medium: 'warning', hard: 'danger' }[d] || 'info')
 
-// ── 当前题目 ──────────────────────────────────────────────
 const activeQuestion = computed(() => {
   if (customQuestion.value.trim()) return customQuestion.value.trim()
   return selectedQ.value?.question_text || ''
 })
 
-const canRun = computed(() =>
-  !!activeQuestion.value
-)
+const postContentForDisplay = computed(() => {
+  const s = (questionDetail.value?.post_raw_content || '').trim()
+  return s
+})
 
-// ── 四列结果 ──────────────────────────────────────────────
-const MODEL_IDS    = ['base', 'seq2048', 'seq4096', 'seq8192']
+const doubaoAnswerDisplay = computed(() => {
+  const s = (questionDetail.value?.answer_text || '').trim()
+  if (s) return s
+  return '（无）从题库选题、加载 DSW 预跑 JSON、或题目本身无豆包答案时此处为空。'
+})
+
+const canRun = computed(() => !!activeQuestion.value)
+
+const MODEL_IDS = ['base', 'seq2048', 'seq4096', 'seq8192']
 const MODEL_LABELS = {
-  base:    '原始模型（无 LoRA）',
+  base: '原始模型（无 LoRA）',
   seq2048: '微调 seq=2048',
   seq4096: '微调 seq=4096',
   seq8192: '微调 seq=8192',
@@ -343,18 +336,18 @@ const MODEL_LABELS = {
 
 const columns = ref(MODEL_IDS.map(id => ({
   id,
-  label:      MODEL_LABELS[id],
-  status:     'waiting',   // waiting | running | done | error
-  text:       '',
+  label: MODEL_LABELS[id],
+  status: 'waiting',
+  text: '',
   tokenCount: 0,
-  elapsed:    0,
-  startAt:    0,
-  errorMsg:   '',
+  elapsed: 0,
+  startAt: 0,
+  errorMsg: '',
 })))
 
 const showResults = ref(false)
-const running     = ref(false)
-let   _es         = null   // EventSource
+const running = ref(false)
+let _es = null
 
 const resetColumns = () => {
   columns.value.forEach(c => Object.assign(c, {
@@ -364,9 +357,140 @@ const resetColumns = () => {
 
 const renderText = (text) => {
   if (!text) return ''
-  return text
+  return String(text)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/\n/g, '<br/>')
+}
+
+const buildExportPayload = () => ({
+  exported_at: new Date().toISOString(),
+  q_id: selectedQ.value?.q_id || null,
+  question_text: activeQuestion.value,
+  post_raw_content: postContentForDisplay.value || '',
+  doubao_answer: (questionDetail.value?.answer_text || '').trim(),
+  model_outputs: Object.fromEntries(columns.value.map(c => [c.id, c.text])),
+  model_status: Object.fromEntries(columns.value.map(c => [c.id, c.status])),
+})
+
+const exportCompareJson = () => {
+  const payload = buildExportPayload()
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = `lora-bench-${payload.q_id || 'custom'}-${Date.now()}.json`
+  a.click()
+  URL.revokeObjectURL(a.href)
+  ElMessage.success('已下载 JSON')
+}
+
+const loadDswPresetMeta = async () => {
+  loadingDswPreset.value = true
+  try {
+    const r = await fetch('/api/model-bench/dsw-preset/meta')
+    const d = await r.json()
+    dswPresetMeta.value = {
+      exists: !!d.exists,
+      count: d.count || 0,
+      generated_at: d.generated_at || '',
+      items: d.items || [],
+      path: d.path || '',
+    }
+  } catch {
+    dswPresetMeta.value = { exists: false, count: 0, generated_at: '', items: [], path: '' }
+  } finally {
+    loadingDswPreset.value = false
+  }
+}
+
+const presetOptionLabel = (it) => {
+  const cat = it.category || ''
+  const prev = it.question_preview || (it.question_text || '').slice(0, 80)
+  return `#${it.idx} ${cat ? `[${cat}] ` : ''}${prev}`
+}
+
+const applyDswPreset = async () => {
+  if (!selectedPresetIdx.value) return
+  if (_es) {
+    _es.close()
+    _es = null
+  }
+  running.value = false
+  try {
+    const r = await fetch(
+      `/api/model-bench/dsw-preset/item?idx=${encodeURIComponent(selectedPresetIdx.value)}`,
+    )
+    if (!r.ok) {
+      ElMessage.error('加载预跑条目失败')
+      return
+    }
+    const d = await r.json()
+    const item = d.item
+    if (!item) {
+      ElMessage.error('条目为空')
+      return
+    }
+    customQuestion.value = ''
+    selectedQ.value = item.q_id
+      ? { q_id: item.q_id, question_text: item.question_text || '' }
+      : null
+    questionDetail.value = {
+      answer_text: item.doubao_answer || '',
+      post_raw_content: item.post_raw_content || '',
+      topic_tags: [],
+    }
+    MODEL_IDS.forEach((id) => {
+      const col = columns.value.find((c) => c.id === id)
+      if (!col) return
+      const m = item.models?.[id]
+      if (!m) {
+        Object.assign(col, {
+          status: 'waiting',
+          text: '',
+          tokenCount: 0,
+          elapsed: 0,
+          errorMsg: '',
+        })
+        return
+      }
+      const err = (m.error || '').trim()
+      const txt = m.text || ''
+      Object.assign(col, {
+        text: txt,
+        errorMsg: err,
+        status: err ? 'error' : 'done',
+        elapsed: Number(m.elapsed_ms || 0),
+        tokenCount: Math.max(1, Math.floor(txt.length / 3)),
+        startAt: 0,
+      })
+    })
+    showResults.value = true
+    ElMessage.success('已加载 DSW 预跑四模型输出 + 豆包答案')
+  } catch (e) {
+    ElMessage.error('加载失败：' + (e.message || String(e)))
+  }
+}
+
+const copyCompareText = async () => {
+  const p = buildExportPayload()
+  const lines = [
+    '=== question_text ===',
+    p.question_text,
+    '',
+    '=== post_raw_content ===',
+    p.post_raw_content || '(空)',
+    '',
+    '=== doubao answer_text ===',
+    p.doubao_answer || '(空)',
+    '',
+    ...MODEL_IDS.map(id => [`=== model ${id} ===`, p.model_outputs[id] || '']).flat(),
+  ]
+  const text = lines.join('\n')
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage.success('已复制到剪贴板')
+  } catch {
+    ElMessage.error('复制失败，请改用导出 JSON')
+  }
 }
 
 const stopCompare = () => {
@@ -384,10 +508,10 @@ const runCompare = () => {
   const params = new URLSearchParams()
   params.set('question', activeQuestion.value)
   params.set('models', MODEL_IDS.join(','))
-  if (serverUrl.value.trim()) {
-    // 兼容开发调试：可在代码里设置 serverUrl 指向远端推理服务
-    params.set('server_url', serverUrl.value.trim())
+  if (selectedQ.value?.q_id && !customQuestion.value.trim()) {
+    params.set('question_id', selectedQ.value.q_id)
   }
+  if (serverUrl.value.trim()) params.set('server_url', serverUrl.value.trim())
   const url = `/api/model-bench/stream?${params.toString()}`
 
   if (_es) _es.close()
@@ -396,202 +520,281 @@ const runCompare = () => {
   _es.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data)
-      const col = columns.value.find(c => c.id === msg.model)
+      if (msg.type === 'keepalive') return
 
+      if (msg.type === 'all_done') {
+        running.value = false
+        if (_es) { _es.close(); _es = null }
+        ElMessage.success('四模型推理完成')
+        return
+      }
+
+      if (msg.model === 'all' && msg.type === 'error') {
+        running.value = false
+        if (_es) { _es.close(); _es = null }
+        ElMessage.error(msg.text || '推理失败')
+        return
+      }
+
+      const col = columns.value.find(c => c.id === msg.model)
       if (msg.type === 'start') {
         if (col) { col.status = 'running'; col.startAt = Date.now() }
       } else if (msg.type === 'token') {
-        if (col) { col.text += msg.text; col.tokenCount++ }
+        if (col) { col.text += msg.text || ''; col.tokenCount++ }
       } else if (msg.type === 'done') {
         if (col) {
-          col.status  = 'done'
+          col.status = 'done'
           col.elapsed = Number(msg.elapsed_ms || 0) || (Date.now() - col.startAt)
         }
       } else if (msg.type === 'error') {
-        if (col) { col.status = 'error'; col.errorMsg = msg.text }
-      } else if (msg.type === 'all_done') {
-        running.value = false
-        _es.close(); _es = null
-        ElMessage.success('四模型推理完成')
+        if (col) { col.status = 'error'; col.errorMsg = msg.text || 'error' }
       }
-    } catch { /* ignore parse err */ }
+    } catch { /* ignore */ }
   }
 
-  _es.onerror = (e) => {
+  _es.onerror = () => {
     running.value = false
     if (_es) { _es.close(); _es = null }
     ElMessage.error('SSE 连接断开，请检查推理服务是否正常运行')
   }
 }
 
-onMounted(() => { loadMeta(); loadQuestions(); loadDemoCases() })
-onUnmounted(() => { if (_es) _es.close(); if (_demoEs) _demoEs.close() })
-
-// ══════════════════════════════════════════════════════════
-// Demo Cases 第二排逻辑
-// ══════════════════════════════════════════════════════════
-const demoCases        = ref([])
-const loadingCases     = ref(false)
-const selectedCase     = ref(null)
-const showContent      = ref(false)
-const fullCaseContent  = ref('')
-const loadingFullContent = ref(false)
-
-const DEMO_MODEL_IDS    = ['base', 'seq2048', 'seq4096', 'seq8192']
-const DEMO_MODEL_LABELS = {
-  base:    '基座（无 LoRA）',
-  seq2048: '微调 seq=2048',
-  seq4096: '微调 seq=4096',
-  seq8192: '微调 seq=8192',
-}
-
-const demoCols = ref(DEMO_MODEL_IDS.map(id => ({
-  id,
-  label:      DEMO_MODEL_LABELS[id],
-  status:     'waiting',
-  text:       '',
-  tokenCount: 0,
-  elapsed:    0,
-  startAt:    0,
-  errorMsg:   '',
-})))
-
-const demoRunning = ref(false)
-let _demoEs = null
-
-const categorySlug = (cat) => (cat || '').replace(/[^a-z0-9\u4e00-\u9fa5]/gi, '-').toLowerCase()
-
-const loadDemoCases = async () => {
-  loadingCases.value = true
-  try {
-    const r = await fetch('/api/demo-cases')
-    const d = await r.json()
-    demoCases.value = d.items || []
-    if (demoCases.value.length && !selectedCase.value) {
-      selectCase(demoCases.value[0])
-    }
-  } catch (e) {
-    ElMessage.warning('加载预置案例失败：' + e.message)
-  } finally {
-    loadingCases.value = false
-  }
-}
-
-const selectCase = (c) => {
-  selectedCase.value = c
-  showContent.value = false
-  fullCaseContent.value = ''
-  resetDemoCols()
-}
-
-const loadFullContent = async () => {
-  if (!selectedCase.value) return
-  loadingFullContent.value = true
-  try {
-    const r = await fetch(`/api/demo-cases/${selectedCase.value.case_index}`)
-    const d = await r.json()
-    fullCaseContent.value = d.content || ''
-  } catch (e) {
-    ElMessage.error('加载完整正文失败：' + e.message)
-  } finally {
-    loadingFullContent.value = false
-  }
-}
-
-const resetDemoCols = () => {
-  demoCols.value.forEach(c => Object.assign(c, {
-    status: 'waiting', text: '', tokenCount: 0, elapsed: 0, startAt: 0, errorMsg: '',
-  }))
-}
-
-const stopDemoCompare = () => {
-  if (_demoEs) { _demoEs.close(); _demoEs = null }
-  demoRunning.value = false
-  demoCols.value.forEach(c => { if (c.status === 'running') c.status = 'done' })
-}
-
-const renderJson = (text) => {
-  if (!text) return ''
-  // 尝试美化 JSON
-  try {
-    const m = text.match(/\[.*\]/s)
-    if (m) {
-      const parsed = JSON.parse(m[0])
-      const pretty = JSON.stringify(parsed, null, 2)
-      return '<pre class="dc-json">' + pretty.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>'
-    }
-  } catch {}
-  return '<pre class="dc-json">' + text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>'
-}
-
-const runDemoCompare = () => {
-  if (!selectedCase.value) return
-  resetDemoCols()
-  demoRunning.value = true
-
-  // 优先用完整 content，其次 content_preview
-  const question = fullCaseContent.value || selectedCase.value.content || selectedCase.value.content_preview || selectedCase.value.title
-
-  const params = new URLSearchParams()
-  params.set('question', question)
-  params.set('models', DEMO_MODEL_IDS.join(','))
-  if (serverUrl.value.trim()) params.set('server_url', serverUrl.value.trim())
-  const url = `/api/model-bench/stream?${params.toString()}`
-
-  if (_demoEs) _demoEs.close()
-  _demoEs = new EventSource(url)
-
-  _demoEs.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data)
-      const col = demoCols.value.find(c => c.id === msg.model)
-      if (msg.type === 'start') {
-        if (col) { col.status = 'running'; col.startAt = Date.now() }
-      } else if (msg.type === 'token') {
-        if (col) { col.text += msg.text; col.tokenCount++ }
-      } else if (msg.type === 'done') {
-        if (col) {
-          col.status  = 'done'
-          col.elapsed = Number(msg.elapsed_ms || 0) || (Date.now() - col.startAt)
-        }
-      } else if (msg.type === 'error') {
-        if (col) { col.status = 'error'; col.errorMsg = msg.text }
-      } else if (msg.type === 'all_done') {
-        demoRunning.value = false
-        _demoEs.close(); _demoEs = null
-        ElMessage.success('案例四模型推理完成')
-      }
-    } catch {}
-  }
-  _demoEs.onerror = () => {
-    if (!demoRunning.value) return
-    demoRunning.value = false
-    if (_demoEs) { _demoEs.close(); _demoEs = null }
-    ElMessage.error('Demo SSE 连接断开')
-  }
-}
+onMounted(() => {
+  loadMeta()
+  loadQuestions()
+  loadDswPresetMeta()
+})
+onUnmounted(() => { if (_es) _es.close() })
 </script>
 
 <style scoped>
 .lc-wrap {
-  --lc-a: #64748b;
   --lc-b: #3b6ff5;
   --lc-c: #0d9f6e;
   --lc-d: #c026d3;
-  --lc-primary: #5b6ef5;
   --lc-slate: #0f172a;
   --lc-line: #e2e8f0;
   --lc-radius: 14px;
   min-height: 100vh;
   padding: 24px 28px 56px;
-  max-width: 1600px;
+  max-width: 1680px;
   margin: 0 auto;
   background: linear-gradient(180deg, #f7f8fc 0%, #eef1f8 100%);
   box-sizing: border-box;
+  color: var(--lc-slate);
 }
 
-/* hero */
 .lc-hero { margin-bottom: 20px; }
 .lc-hero-badge {
   display: inline-block;
-  font-size: 12px; 
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #e8ecff;
+  color: #4338ca;
+  margin-bottom: 8px;
+}
+.lc-title { font-size: 1.75rem; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.02em; }
+.lc-lead { margin: 0; font-size: 15px; line-height: 1.6; color: #475569; max-width: 900px; }
+
+.lc-panel {
+  background: #fff;
+  border: 1px solid var(--lc-line);
+  border-radius: var(--lc-radius);
+  padding: 18px 20px;
+  margin-bottom: 16px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+.lc-section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 15px;
+  margin-bottom: 12px;
+}
+.lc-server-hint { margin: 0; font-size: 13px; color: #64748b; line-height: 1.55; }
+.lc-server-hint code { font-size: 12px; background: #f1f5f9; padding: 2px 6px; border-radius: 6px; }
+
+.lc-preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.lc-preset-meta { font-size: 12px; color: #64748b; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lc-preset-select { min-width: 280px; flex: 1; max-width: 560px; }
+
+.lc-question-toolbar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; align-items: center; }
+.lc-q-search { flex: 1; min-width: 200px; max-width: 420px; }
+.lc-q-filter { width: 200px; }
+
+.lc-question-list {
+  max-height: 420px;
+  overflow-y: auto;
+  border: 1px solid var(--lc-line);
+  border-radius: 10px;
+}
+.lc-q-item {
+  padding: 12px 14px;
+  border-bottom: 1px solid #f1f5f9;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.lc-q-item:last-child { border-bottom: none; }
+.lc-q-item:hover { background: #f8fafc; }
+.lc-q-item.selected { background: #eef2ff; border-left: 3px solid var(--lc-b); padding-left: 11px; }
+.lc-q-text { font-size: 14px; line-height: 1.5; margin-bottom: 6px; word-break: break-word; }
+.lc-q-meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.lc-empty { padding: 24px; text-align: center; color: #94a3b8; font-size: 14px; }
+.lc-pagination { margin-top: 12px; justify-content: center; }
+
+.lc-custom-input :deep(.el-textarea__inner) { font-size: 14px; }
+
+.lc-run-panel { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.lc-current-q { flex: 1; min-width: 200px; }
+.lc-q-label { font-size: 13px; color: #64748b; }
+.lc-q-preview { font-size: 14px; font-weight: 500; display: block; margin-top: 4px; line-height: 1.45; word-break: break-word; }
+.lc-run-btn { min-width: 160px; }
+
+.lc-results { margin-top: 8px; }
+.lc-results-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+.lc-results-title { margin-top: 0; }
+
+.lc-grid {
+  display: grid;
+  gap: 12px;
+}
+.lc-grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.lc-grid-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+
+@media (max-width: 1200px) {
+  .lc-grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lc-grid-5 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 640px) {
+  .lc-grid-4, .lc-grid-5 { grid-template-columns: 1fr; }
+}
+
+.lc-card {
+  background: #fff;
+  border: 1px solid var(--lc-line);
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 220px;
+}
+.lc-card.lc-static { min-height: 180px; }
+.lc-card.tone-0 { border-top: 3px solid #64748b; }
+.lc-card.tone-1 { border-top: 3px solid var(--lc-b); }
+.lc-card.tone-2 { border-top: 3px solid var(--lc-c); }
+.lc-card.tone-3 { border-top: 3px solid var(--lc-d); }
+.lc-card.tone-ref { border-top: 3px solid #f59e0b; }
+
+.lc-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: #f8fafc;
+  border-bottom: 1px solid var(--lc-line);
+}
+.lc-card-tag {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: #e2e8f0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.lc-card-info { flex: 1; min-width: 0; }
+.lc-card-label { display: block; font-size: 13px; font-weight: 600; }
+.lc-card-id { font-size: 11px; color: #94a3b8; }
+.mono { font-family: ui-monospace, monospace; }
+
+.lc-card-status { flex-shrink: 0; }
+.lc-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #cbd5e1;
+}
+.lc-dot.running {
+  background: var(--lc-b);
+  animation: lc-pulse 1s ease-in-out infinite;
+}
+.lc-dot.waiting { background: #e2e8f0; }
+
+@keyframes lc-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.lc-card-body {
+  flex: 1;
+  padding: 12px;
+  font-size: 13px;
+  line-height: 1.55;
+  overflow: auto;
+  max-height: 480px;
+}
+.lc-card.lc-static .lc-card-body { max-height: 360px; }
+
+.lc-placeholder { color: #94a3b8; }
+.lc-blink { animation: lc-pulse 1.2s ease-in-out infinite; }
+.lc-error-text { color: #dc2626; font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+.lc-text-content { word-break: break-word; }
+
+.lc-card-foot {
+  padding: 8px 12px;
+  border-top: 1px solid var(--lc-line);
+  font-size: 11px;
+  color: #64748b;
+  display: flex;
+  gap: 12px;
+}
+
+.lc-compare-summary {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px dashed var(--lc-line);
+}
+.lc-post-box {
+  margin-bottom: 16px;
+  border: 1px solid var(--lc-line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #fafafa;
+}
+.lc-subtitle {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 8px 12px;
+  background: #f1f5f9;
+  border-bottom: 1px solid var(--lc-line);
+}
+.lc-pre {
+  margin: 0;
+  padding: 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow: auto;
+}
+.lc-muted {
+  font-size: 13px;
+  color: #64748b;
+  line-height: 1.5;
+  margin: 0 0 14px;
+}
+.lc-muted code { font-size: 12px; background: #f1f5f9; padding: 2px 6px; border-radius: 6px; }
+</style>

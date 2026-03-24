@@ -427,12 +427,10 @@ if _POST_IMAGES_DIR.exists():
 from backend.api.scheduler_api import router as scheduler_router
 from backend.api.reasoning_api import router as reasoning_router
 from backend.api.model_bench_api import router as model_bench_router
-from backend.api.demo_cases_api import router as demo_cases_router
 
 app.include_router(scheduler_router)
 app.include_router(reasoning_router)
 app.include_router(model_bench_router)
-app.include_router(demo_cases_router)
 
 
 
@@ -1300,37 +1298,32 @@ def get_questions_meta():
 
 
 @app.get("/api/questions/{q_id}")
-
 def get_question_detail(q_id: str):
-
-    """获取单题详情"""
-
+    """获取单题详情；LEFT JOIN crawl_tasks 带上原帖 raw_content，供 LoRA 对比页展示 content。"""
     import json
-
-    results = sqlite_service.filter_questions(limit=1)  # fallback
-
-    # 直接查 sqlite
-
     import sqlite3
 
     with sqlite3.connect(sqlite_service.db_path) as conn:
-
         conn.row_factory = sqlite3.Row
-
-        row = conn.execute("SELECT * FROM questions WHERE q_id = ?", (q_id,)).fetchone()
+        row = conn.execute(
+            """
+            SELECT q.*,
+                   ct.raw_content AS post_raw_content,
+                   ct.post_title AS post_title
+            FROM questions q
+            LEFT JOIN crawl_tasks ct ON q.crawl_task_id = ct.id
+            WHERE q.q_id = ?
+            """,
+            (q_id,),
+        ).fetchone()
 
     if not row:
-
         raise HTTPException(status_code=404, detail="题目不存在")
 
     q = dict(row)
-
     try:
-
         q["topic_tags"] = json.loads(q.get("topic_tags") or "[]")
-
     except Exception:
-
         q["topic_tags"] = []
 
     return q

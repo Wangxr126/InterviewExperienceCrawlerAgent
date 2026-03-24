@@ -2,11 +2,17 @@
 Model Bench API
 从 DSW 推理服务并行拉取多个模型的流式回答，通过 SSE 推给前端。
 
-GET/POST /api/model-bench/stream
+GET /api/model-bench/stream
   question      : 题目文本
   question_id   : （可选）题目 ID，用于展示
   models        : 逗号分隔的模型 ID，如 base,seq2048,seq4096,seq8192
   server_url    : DSW 推理服务根 URL，如 http://localhost:8899
+
+GET /api/model-bench/dsw-preset/meta
+  读取 微调/dsw/compare_results_10.json（或 MODEL_BENCH_DSW_COMPARE_JSON）条目列表
+
+GET /api/model-bench/dsw-preset/item?idx=
+  返回单条完整预跑结果（含 doubao_answer、各模型输出）
 
 SSE 消息格式（JSON）：
   {"type":"start",   "model":"base"}
@@ -20,11 +26,12 @@ import json
 import time
 import os
 import logging
+from pathlib import Path
 from urllib.parse import urlparse
 from typing import List, Optional
 
 import httpx
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 router = APIRouter(prefix="/api/model-bench", tags=["model-bench"])
@@ -260,6 +267,86 @@ async def model_bench_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _wxr_project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _dsw_compare_results_path() -> Path:
+    """默认：仓库 微调/dsw/compare_results_10.json；可用 MODEL_BENCH_DSW_COMPARE_JSON 覆盖（支持相对项目根的路径）。"""
+    raw = os.getenv("MODEL_BENCH_DSW_COMPARE_JSON", "").strip()
+    root = _wxr_project_root()
+    if raw:
+        p = Path(raw)
+        return p if p.is_absolute() else (root / p)
+    return root / "微调" / "dsw" / "compare_results_10.json"
+
+
+@router.get("/dsw-preset/meta")
+def model_bench_dsw_preset_meta():
+    """列出 微调/dsw/compare_results_10.json 中的条目摘要，供前端下拉选择。"""
+    path = _dsw_compare_results_path()
+    if not path.is_file():
+        return {
+            "ok": False,
+            "exists": False,
+            "path": str(path),
+            "generated_at": None,
+            "count": 0,
+            "items": [],
+        }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.exception("[model-bench] dsw-preset 读取 JSON 失败 path=%s", path)
+        raise HTTPException(status_code=500, detail=f"JSON 读取失败: {e}") from e
+    items = data.get("items") or []
+    summary = []
+    for it in items:
+        qfull = it.get("question_text") or ""
+        summary.append({
+            "idx": it.get("idx"),
+            "q_id": it.get("q_id"),
+            "category": it.get("category"),
+            "question_text": qfull,
+            "question_preview": (qfull[:120] + "…") if len(qfull) > 120 else qfull,
+        })
+    return {
+        "ok": True,
+        "exists": True,
+        "path": str(path),
+        "generated_at": data.get("generated_at"),
+        "service": data.get("service"),
+        "models": data.get("models"),
+        "count": len(summary),
+        "items": summary,
+    }
+
+
+@router.get("/dsw-preset/item")
+def model_bench_dsw_preset_item(
+    idx: Optional[int] = Query(None, ge=1, description="compare_results 中的 idx"),
+    q_id: Optional[str] = Query(None, description="题目 q_id"),
+):
+    """返回单条完整记录（含 doubao_answer、各模型 text）。"""
+    path = _dsw_compare_results_path()
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="预设文件不存在")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    items = data.get("items") or []
+    if idx is not None:
+        for it in items:
+            if it.get("idx") == idx:
+                return {"ok": True, "item": it}
+    if q_id:
+        for it in items:
+            if it.get("q_id") == q_id:
+                return {"ok": True, "item": it}
+    raise HTTPException(status_code=404, detail="未找到对应条目")
 
 
 async def _self_test() -> None:
