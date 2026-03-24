@@ -11,6 +11,8 @@ import os
 import sys
 import json
 import time
+import re
+import traceback
 import asyncio
 import threading
 from pathlib import Path
@@ -26,6 +28,9 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
 # 读取项目根目录 .env，便于在前端/后端之外直接运行此脚本时也能吃到配置。
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    # 允许从 `微调/` 目录直接运行时也能 import `backend.*`
+    sys.path.insert(0, str(_PROJECT_ROOT))
 load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
 import torch
@@ -40,7 +45,10 @@ BASE_MODEL     = "unsloth/Qwen3-4B"
 LOAD_IN_4BIT   = True
 PORT           = int(os.environ.get("INFER_PORT", 8899))
 MAX_NEW_TOKENS = int(os.environ.get("INFER_MAX_NEW_TOKENS", os.environ.get("MAX_NEW_TOKENS", 2048)))
-MAX_INPUT_TOKENS = int(os.environ.get("INFER_MAX_INPUT_TOKENS", "2048"))
+MAX_INPUT_TOKENS = int(os.environ.get("INFER_MAX_INPUT_TOKENS", "8192"))
+PROMPT_LOG_PREVIEW_CHARS = int(os.environ.get("INFER_PROMPT_LOG_PREVIEW_CHARS", "2000"))
+STRICT_MINER_PROMPT = os.environ.get("INFER_STRICT_MINER_PROMPT", "1").strip().lower() in ("1", "true", "yes")
+JSON_ONLY_STREAM = os.environ.get("INFER_JSON_ONLY_STREAM", "1").strip().lower() in ("1", "true", "yes")
 
 # adapter 路径（None = 基础模型不加载 adapter）
 ADAPTERS: dict[str, Optional[str]] = {
@@ -100,6 +108,8 @@ def _load_models():
             bnb_4bit_quant_type="nf4",
         ) if LOAD_IN_4BIT else None
         _tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
+        # 长输入场景优先保留末尾（用户正文 + assistant 起始标记），避免前部模板占满窗口。
+        _tokenizer.truncation_side = "left"
         _base_model = AutoModelForCausalLM.from_pretrained(
             BASE_MODEL,
             quantization_config=bnb_cfg,
@@ -113,6 +123,12 @@ def _load_models():
             f"device={gpu_info['device_name']} "
             f"allocated={gpu_info['memory_allocated_mb']}MB "
             f"reserved={gpu_info['memory_reserved_mb']}MB",
+            flush=True,
+        )
+        print(
+            f"[startup] INFER_MAX_INPUT_TOKENS={MAX_INPUT_TOKENS} "
+            f"INFER_MAX_NEW_TOKENS={MAX_NEW_TOKENS} "
+            f"INFER_JSON_ONLY_STREAM={JSON_ONLY_STREAM}",
             flush=True,
         )
         print("[startup] 基础模型加载完成", flush=True)
@@ -178,8 +194,13 @@ def _build_prompt(question: str) -> str:
             f"<|im_start|>user\n{miner_user}<|im_end|>\n"
             f"<|im_start|>assistant\n"
         )
-    except Exception:
-        # 回退：避免 prompt 模块异常导致服务不可用
+    except Exception as e:
+        # 严格模式：不允许 silently fallback，直接报错，保证一定走 miner_prompt
+        if STRICT_MINER_PROMPT:
+            raise RuntimeError(f"miner_prompt 加载失败（严格模式开启）: {e}") from e
+        # 非严格模式：回退并打印原因
+        print(f"[infer][prompt] 加载 miner_prompt 失败，使用回退模板: {e}", flush=True)
+        traceback.print_exc()
         return (
             f"<|im_start|>system\n你是一名专业的面经分析助手，请提取结构化面试题并输出 JSON。<|im_end|>\n"
             f"<|im_start|>user\n{question}<|im_end|>\n"
@@ -215,6 +236,68 @@ def _build_prompt_from_payload(payload: dict) -> str:
     return _build_prompt("请输出空结果：[]")
 
 
+def _preview_text(text: str, max_chars: int = PROMPT_LOG_PREVIEW_CHARS) -> str:
+    if text is None:
+        return ""
+    s = str(text)
+    if max_chars <= 0 or len(s) <= max_chars:
+        return s
+    return s[:max_chars] + f"\n...[truncated {len(s) - max_chars} chars]"
+
+
+def _print_prompt_and_content(tag: str, payload: dict, final_prompt: str) -> None:
+    """打印请求里的 prompt/content 与完整模型输入，便于排查输入问题。"""
+    try:
+        prompt = payload.get("prompt", "")
+        system_prompt = payload.get("system_prompt", "")
+        question = payload.get("question", "")
+        content = payload.get("content", "")
+        print(f"[infer][{tag}] ===== request input =====", flush=True)
+        print(
+            f"[infer][{tag}] lens "
+            f"prompt={len(str(prompt))} "
+            f"system_prompt={len(str(system_prompt))} "
+            f"question={len(str(question))} "
+            f"content={len(str(content))} "
+            f"final_prompt={len(str(final_prompt))}",
+            flush=True,
+        )
+        print(f"[infer][{tag}] prompt:\n{_preview_text(prompt)}", flush=True)
+        print(f"[infer][{tag}] content:\n{_preview_text(content)}", flush=True)
+        print(f"[infer][{tag}] final_prompt(full):\n{final_prompt}", flush=True)
+        print(f"[infer][{tag}] ===== end input =====", flush=True)
+    except Exception as e:
+        print(f"[infer][{tag}] 打印 prompt/content 失败: {e}", flush=True)
+
+
+def _strip_think_blocks(text: str) -> str:
+    """移除 <think>...</think> 思维链；若未闭合，移除从 <think> 到文本末尾。"""
+    if not text:
+        return ""
+    s = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    s = re.sub(r"<think>.*$", "", s, flags=re.DOTALL | re.IGNORECASE)
+    s = s.replace("<think>", "").replace("</think>", "")
+    return s
+
+
+def _extract_json_delta(raw_accum: str, sent_cleaned: str) -> tuple[str, str]:
+    """
+    仅输出从首个 JSON 起始符（{ 或 [）开始的增量文本，避免把提示词示例/回吐内容推给前端。
+    返回：(delta, new_cleaned_sent)
+    """
+    if not raw_accum:
+        return "", sent_cleaned
+    idx_obj = raw_accum.find("{")
+    idx_arr = raw_accum.find("[")
+    starts = [i for i in (idx_obj, idx_arr) if i >= 0]
+    if not starts:
+        return "", sent_cleaned
+    start = min(starts)
+    cleaned = raw_accum[start:]
+    delta = cleaned[len(sent_cleaned):]
+    return delta, cleaned
+
+
 def _infer_stream_sync(model, final_prompt: str, infer_params: dict, queue: asyncio.Queue, loop):
     """在普通线程里做 generate，把 token 塞到 asyncio Queue。"""
     try:
@@ -239,7 +322,7 @@ def _infer_stream_sync(model, final_prompt: str, infer_params: dict, queue: asyn
         first_token_sent = False
         gen_kwargs = dict(
             **inputs,
-            max_new_tokens=int(infer_params.get("max_new_tokens") or min(MAX_NEW_TOKENS, 512)),
+            max_new_tokens=int(infer_params.get("max_new_tokens") or MAX_NEW_TOKENS),
             temperature=float(infer_params.get("temperature") or 0.7),
             top_p=float(infer_params.get("top_p") or 0.9),
             do_sample=bool(infer_params.get("do_sample", True)),
@@ -248,12 +331,33 @@ def _infer_stream_sync(model, final_prompt: str, infer_params: dict, queue: asyn
         )
         gen_thread = threading.Thread(target=model.generate, kwargs=gen_kwargs)
         gen_thread.start()
+        suppress_think = bool(infer_params.get("suppress_think", False))
+        json_only_stream = bool(infer_params.get("json_only_stream", JSON_ONLY_STREAM))
+        raw_accum = ""
+        cleaned_sent = ""
         for token in streamer:
             if not first_token_sent:
                 first_token_sent = True
                 first_token_ms = int((time.time() - t0) * 1000)
                 asyncio.run_coroutine_threadsafe(queue.put(("meta", {"first_token_ms": first_token_ms})), loop)
-            asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
+            if suppress_think:
+                raw_accum += token
+                cleaned = _strip_think_blocks(raw_accum)
+                if json_only_stream:
+                    delta, cleaned_sent = _extract_json_delta(cleaned, cleaned_sent)
+                else:
+                    delta = cleaned[len(cleaned_sent):]
+                    cleaned_sent = cleaned
+                if delta:
+                    asyncio.run_coroutine_threadsafe(queue.put(("token", delta)), loop)
+            else:
+                if json_only_stream:
+                    raw_accum += token
+                    delta, cleaned_sent = _extract_json_delta(raw_accum, cleaned_sent)
+                    if delta:
+                        asyncio.run_coroutine_threadsafe(queue.put(("token", delta)), loop)
+                else:
+                    asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
         gen_thread.join()
         total_ms = int((time.time() - t0) * 1000)
         asyncio.run_coroutine_threadsafe(queue.put(("meta", {"total_ms": total_ms})), loop)
@@ -311,7 +415,14 @@ async def infer_stream(payload: dict = Body(...)):
         return StreamingResponse(err_gen(), media_type="text/event-stream")
 
     model_id = (payload.get("model") or payload.get("model_id") or "base").strip()
-    final_prompt = _build_prompt_from_payload(payload)
+    try:
+        final_prompt = _build_prompt_from_payload(payload)
+    except Exception as e:
+        async def err_prompt_gen():
+            msg = json.dumps({"type": "error", "text": f"构造 prompt 失败: {e}"}, ensure_ascii=False)
+            yield f"data: {msg}\n\n"
+        return StreamingResponse(err_prompt_gen(), media_type="text/event-stream")
+    _print_prompt_and_content("single", payload, final_prompt)
     loop = asyncio.get_event_loop()
 
     async def generate():
@@ -327,7 +438,7 @@ async def infer_stream(payload: dict = Body(...)):
                 model, adapter_path = _resolve_model(model_id)
                 t = threading.Thread(
                     target=_infer_stream_sync,
-                    args=(model, final_prompt, payload, queue, loop),
+                    args=(model, final_prompt, {**payload, "suppress_think": model_id == "base"}, queue, loop),
                     daemon=True,
                 )
                 t.start()
@@ -426,11 +537,26 @@ async def compare_stream(
                         model = _base_model
 
                     # 异步推理
-                    final_prompt = _build_prompt(question)
+                    try:
+                        final_prompt = _build_prompt(question)
+                    except Exception as e:
+                        evt = json.dumps(
+                            {"type": "error", "model": model_id, "text": f"构造 prompt 失败: {e}"},
+                            ensure_ascii=False
+                        )
+                        yield f"data: {evt}\n\n"
+                        continue
+                    _print_prompt_and_content("compare", {"question": question, "content": question}, final_prompt)
                     queue: asyncio.Queue = asyncio.Queue()
                     t = threading.Thread(
                         target=_infer_stream_sync,
-                        args=(model, final_prompt, {"max_new_tokens": MAX_NEW_TOKENS}, queue, loop),
+                        args=(
+                            model,
+                            final_prompt,
+                            {"max_new_tokens": MAX_NEW_TOKENS, "suppress_think": model_id == "base"},
+                            queue,
+                            loop,
+                        ),
                         daemon=True,
                     )
                     t.start()

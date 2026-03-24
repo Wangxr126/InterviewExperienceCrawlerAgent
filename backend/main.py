@@ -427,10 +427,12 @@ if _POST_IMAGES_DIR.exists():
 from backend.api.scheduler_api import router as scheduler_router
 from backend.api.reasoning_api import router as reasoning_router
 from backend.api.model_bench_api import router as model_bench_router
+from backend.api.demo_cases_api import router as demo_cases_router
 
 app.include_router(scheduler_router)
 app.include_router(reasoning_router)
 app.include_router(model_bench_router)
+app.include_router(demo_cases_router)
 
 
 

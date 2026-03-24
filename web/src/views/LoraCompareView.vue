@@ -100,7 +100,7 @@
     </section>
 
     <!-- 四列结果 -->
-    <section v-if="showResults" class="lc-results">
+    <section v-if="showResults" class="lc-results" id="lc-infer-results">
       <div class="lc-grid">
         <div
           v-for="(col, idx) in columns"
@@ -132,6 +132,129 @@
           <div v-if="col.status === 'done' || col.status === 'running'" class="lc-card-foot">
             <span v-if="col.tokenCount" class="lc-stat">{{ col.tokenCount }} tokens</span>
             <span v-if="col.elapsed" class="lc-stat">耗时 {{ (col.elapsed / 1000).toFixed(1) }}s</span>
+          </div>
+        </div>
+      </div>
+    </section>
+    </section>
+
+    <!-- ════════════════════════════════════════════════════════
+         第二排：Demo Cases 预置案例对比展示区
+         ════════════════════════════════════════════════════════ -->
+    <section class="dc-section">
+      <div class="dc-section-header">
+        <div class="dc-section-title">
+          <span class="dc-icon">🗂️</span>
+          <span>预置案例对比演示</span>
+          <span class="dc-subtitle">豆包参考答案 · 基座模型 · 三组 LoRA 微调</span>
+        </div>
+        <el-button :icon="Refresh" size="small" :loading="loadingCases" @click="loadDemoCases" circle />
+      </div>
+
+      <!-- 案例选择 tabs -->
+      <div class="dc-case-tabs" v-if="demoCases.length">
+        <div
+          v-for="c in demoCases"
+          :key="c.case_index"
+          class="dc-case-tab"
+          :class="{ active: selectedCase?.case_index === c.case_index }"
+          @click="selectCase(c)"
+        >
+          <span class="dc-tab-num">{{ c.case_index }}</span>
+          <span class="dc-tab-cat">{{ c.category }}</span>
+          <span class="dc-tab-title">{{ c.title.slice(0, 12) }}</span>
+        </div>
+      </div>
+      <div v-else-if="!loadingCases" class="dc-empty">暂无预置案例，请先运行 scripts/extract_demo_cases.py</div>
+
+      <!-- 案例详情 -->
+      <div v-if="selectedCase" class="dc-case-detail">
+        <!-- 基本信息条 -->
+        <div class="dc-meta-bar">
+          <el-tag size="small" type="warning" effect="light">{{ selectedCase.category }}</el-tag>
+          <el-tag v-if="selectedCase.company" size="small" type="info" effect="plain">{{ selectedCase.company }}</el-tag>
+          <el-tag v-if="selectedCase.platform" size="small" effect="plain">{{ selectedCase.platform }}</el-tag>
+          <span class="dc-meta-title">{{ selectedCase.title }}</span>
+          <span class="dc-meta-qcount">📝 {{ selectedCase.questions_count }} 题</span>
+          <el-tag v-if="selectedCase.has_irregular_numbering" size="small" type="danger" effect="plain">非规则标号</el-tag>
+          <el-tag v-if="selectedCase.is_modified" size="small" type="success" effect="plain">人工修改</el-tag>
+        </div>
+
+        <!-- 原始 content 折叠展示 -->
+        <div class="dc-content-block">
+          <div class="dc-content-header" @click="showContent = !showContent">
+            <span>📄 原始帖子正文</span>
+            <span class="dc-content-len">（{{ (fullCaseContent || selectedCase.content || selectedCase.content_preview || '').length }} 字符）</span>
+            <span class="dc-toggle">{{ showContent ? '▲ 收起' : '▼ 展开查看' }}</span>
+          </div>
+          <div v-if="showContent" class="dc-content-body">
+            <pre class="dc-pre">{{ fullCaseContent || selectedCase.content_preview }}</pre>
+            <el-button
+              v-if="!fullCaseContent"
+              size="small" type="primary" plain
+              class="dc-load-full-btn"
+              :loading="loadingFullContent"
+              @click="loadFullContent"
+            >加载完整正文</el-button>
+          </div>
+        </div>
+
+        <!-- 操作栏 -->
+        <div class="dc-compare-toolbar">
+          <el-button type="primary" size="small" :loading="demoRunning" @click="runDemoCompare">
+            {{ demoRunning ? '推理中…' : '▶ 对此案例运行四模型推理' }}
+          </el-button>
+          <el-button v-if="demoRunning" type="danger" plain size="small" @click="stopDemoCompare">停止</el-button>
+          <span class="dc-toolbar-hint">将用帖子完整正文作为输入，在四个模型上做题目提取推理</span>
+        </div>
+
+        <!-- 五列卡片：豆包 + base + seq2048 + seq4096 + seq8192 -->
+        <div class="dc-grid">
+          <!-- 豆包参考答案 -->
+          <div class="dc-card dc-card-doubao">
+            <div class="dc-card-head">
+              <span class="dc-card-icon">🫘</span>
+              <div class="dc-card-info">
+                <span class="dc-card-label">豆包参考答案</span>
+                <el-tag size="small" type="warning" effect="light">标注基准</el-tag>
+              </div>
+            </div>
+            <div class="dc-card-body">
+              <div v-if="selectedCase.doubao_output" v-html="renderJson(selectedCase.doubao_output)" />
+              <div v-else class="dc-placeholder">（暂无标注输出）</div>
+            </div>
+          </div>
+
+          <!-- 四模型推理结果 -->
+          <div
+            v-for="(dcol, idx) in demoCols"
+            :key="dcol.id"
+            class="dc-card"
+            :class="[`dc-tone-${idx}`, dcol.status]"
+          >
+            <div class="dc-card-head">
+              <span class="dc-card-icon">{{ ['①','②','③','④'][idx] }}</span>
+              <div class="dc-card-info">
+                <span class="dc-card-label">{{ dcol.label }}</span>
+                <span class="dc-card-id">{{ dcol.id }}</span>
+              </div>
+              <div class="dc-status-area">
+                <span v-if="dcol.status === 'waiting'" class="lc-dot waiting" />
+                <span v-else-if="dcol.status === 'running'" class="lc-dot running" />
+                <el-tag v-else-if="dcol.status === 'done'" type="success" size="small" effect="light">完成</el-tag>
+                <el-tag v-else-if="dcol.status === 'error'" type="danger" size="small" effect="light">错误</el-tag>
+              </div>
+            </div>
+            <div class="dc-card-body">
+              <div v-if="dcol.status === 'waiting'" class="dc-placeholder">等待推理…</div>
+              <div v-else-if="dcol.status === 'running' && !dcol.text" class="dc-placeholder dc-blink">生成中…</div>
+              <div v-else-if="dcol.status === 'error'" class="dc-error">{{ dcol.errorMsg }}</div>
+              <div v-else v-html="renderJson(dcol.text)" />
+            </div>
+            <div v-if="dcol.status !== 'waiting'" class="dc-card-foot">
+              <span v-if="dcol.tokenCount" class="lc-stat">{{ dcol.tokenCount }} tk</span>
+              <span v-if="dcol.elapsed" class="lc-stat">{{ (dcol.elapsed/1000).toFixed(1) }}s</span>
+            </div>
           </div>
         </div>
       </div>
@@ -301,8 +424,152 @@ const runCompare = () => {
   }
 }
 
-onMounted(() => { loadMeta(); loadQuestions() })
-onUnmounted(() => { if (_es) _es.close() })
+onMounted(() => { loadMeta(); loadQuestions(); loadDemoCases() })
+onUnmounted(() => { if (_es) _es.close(); if (_demoEs) _demoEs.close() })
+
+// ══════════════════════════════════════════════════════════
+// Demo Cases 第二排逻辑
+// ══════════════════════════════════════════════════════════
+const demoCases        = ref([])
+const loadingCases     = ref(false)
+const selectedCase     = ref(null)
+const showContent      = ref(false)
+const fullCaseContent  = ref('')
+const loadingFullContent = ref(false)
+
+const DEMO_MODEL_IDS    = ['base', 'seq2048', 'seq4096', 'seq8192']
+const DEMO_MODEL_LABELS = {
+  base:    '基座（无 LoRA）',
+  seq2048: '微调 seq=2048',
+  seq4096: '微调 seq=4096',
+  seq8192: '微调 seq=8192',
+}
+
+const demoCols = ref(DEMO_MODEL_IDS.map(id => ({
+  id,
+  label:      DEMO_MODEL_LABELS[id],
+  status:     'waiting',
+  text:       '',
+  tokenCount: 0,
+  elapsed:    0,
+  startAt:    0,
+  errorMsg:   '',
+})))
+
+const demoRunning = ref(false)
+let _demoEs = null
+
+const categorySlug = (cat) => (cat || '').replace(/[^a-z0-9\u4e00-\u9fa5]/gi, '-').toLowerCase()
+
+const loadDemoCases = async () => {
+  loadingCases.value = true
+  try {
+    const r = await fetch('/api/demo-cases')
+    const d = await r.json()
+    demoCases.value = d.items || []
+    if (demoCases.value.length && !selectedCase.value) {
+      selectCase(demoCases.value[0])
+    }
+  } catch (e) {
+    ElMessage.warning('加载预置案例失败：' + e.message)
+  } finally {
+    loadingCases.value = false
+  }
+}
+
+const selectCase = (c) => {
+  selectedCase.value = c
+  showContent.value = false
+  fullCaseContent.value = ''
+  resetDemoCols()
+}
+
+const loadFullContent = async () => {
+  if (!selectedCase.value) return
+  loadingFullContent.value = true
+  try {
+    const r = await fetch(`/api/demo-cases/${selectedCase.value.case_index}`)
+    const d = await r.json()
+    fullCaseContent.value = d.content || ''
+  } catch (e) {
+    ElMessage.error('加载完整正文失败：' + e.message)
+  } finally {
+    loadingFullContent.value = false
+  }
+}
+
+const resetDemoCols = () => {
+  demoCols.value.forEach(c => Object.assign(c, {
+    status: 'waiting', text: '', tokenCount: 0, elapsed: 0, startAt: 0, errorMsg: '',
+  }))
+}
+
+const stopDemoCompare = () => {
+  if (_demoEs) { _demoEs.close(); _demoEs = null }
+  demoRunning.value = false
+  demoCols.value.forEach(c => { if (c.status === 'running') c.status = 'done' })
+}
+
+const renderJson = (text) => {
+  if (!text) return ''
+  // 尝试美化 JSON
+  try {
+    const m = text.match(/\[.*\]/s)
+    if (m) {
+      const parsed = JSON.parse(m[0])
+      const pretty = JSON.stringify(parsed, null, 2)
+      return '<pre class="dc-json">' + pretty.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>'
+    }
+  } catch {}
+  return '<pre class="dc-json">' + text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre>'
+}
+
+const runDemoCompare = () => {
+  if (!selectedCase.value) return
+  resetDemoCols()
+  demoRunning.value = true
+
+  // 优先用完整 content，其次 content_preview
+  const question = fullCaseContent.value || selectedCase.value.content || selectedCase.value.content_preview || selectedCase.value.title
+
+  const params = new URLSearchParams()
+  params.set('question', question)
+  params.set('models', DEMO_MODEL_IDS.join(','))
+  if (serverUrl.value.trim()) params.set('server_url', serverUrl.value.trim())
+  const url = `/api/model-bench/stream?${params.toString()}`
+
+  if (_demoEs) _demoEs.close()
+  _demoEs = new EventSource(url)
+
+  _demoEs.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data)
+      const col = demoCols.value.find(c => c.id === msg.model)
+      if (msg.type === 'start') {
+        if (col) { col.status = 'running'; col.startAt = Date.now() }
+      } else if (msg.type === 'token') {
+        if (col) { col.text += msg.text; col.tokenCount++ }
+      } else if (msg.type === 'done') {
+        if (col) {
+          col.status  = 'done'
+          col.elapsed = Number(msg.elapsed_ms || 0) || (Date.now() - col.startAt)
+        }
+      } else if (msg.type === 'error') {
+        if (col) { col.status = 'error'; col.errorMsg = msg.text }
+      } else if (msg.type === 'all_done') {
+        demoRunning.value = false
+        _demoEs.close(); _demoEs = null
+        ElMessage.success('案例四模型推理完成')
+      }
+    } catch {}
+  }
+  _demoEs.onerror = () => {
+    if (!demoRunning.value) return
+    demoRunning.value = false
+    if (_demoEs) { _demoEs.close(); _demoEs = null }
+    ElMessage.error('Demo SSE 连接断开')
+  }
+}
 </script>
 
 <style scoped>
