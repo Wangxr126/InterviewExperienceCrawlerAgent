@@ -206,23 +206,85 @@
       </div>
     </div>
 
-    <!-- ── 四列结果 ── -->
+    <!-- ── 输入上下文 + 单行五列：豆包 + 四模型（不重复第二排） ── -->
     <section v-if="showResults" class="mb-results">
       <div class="mb-results-title">
-        <span>📊</span><span>推理结果</span>
+        <span>📊</span><span>对比结果：豆包 · 四模型</span>
         <span v-if="allDone" class="mb-done-badge">全部完成</span>
       </div>
-      <div class="mb-grid">
+
+      <div v-if="showInputContextPanel" class="mb-context-panel">
+        <div class="mb-context-title"><span>📥</span><span>输入内容</span></div>
+        <div v-if="contextQuestionText.trim()" class="mb-context-block">
+          <div class="mb-context-label">题干（question_text，送入 Miner 的面试题）</div>
+          <pre class="mb-context-pre">{{ contextQuestionText }}</pre>
+        </div>
+        <div v-if="contextPostContent.trim()" class="mb-context-block">
+          <div class="mb-context-label">原帖正文（post_raw_content，题库关联帖）</div>
+          <pre class="mb-context-pre">{{ contextPostContent }}</pre>
+        </div>
+        <div
+          v-if="!contextQuestionText.trim() && customQ.trim()"
+          class="mb-context-block"
+        >
+          <div class="mb-context-label">本次送入模型的完整文本（帖子/自定义输入）</div>
+          <pre class="mb-context-pre">{{ customQ }}</pre>
+        </div>
+      </div>
+
+      <div class="mb-grid mb-grid-5">
+        <div class="mb-card mb-card-doubao">
+          <div class="mb-card-head">
+            <div class="mb-card-title-row">
+              <span class="mb-card-num">豆</span>
+              <span class="mb-card-label">豆包（题库）</span>
+              <span class="mb-card-id">精答 / 原始</span>
+            </div>
+          </div>
+          <div class="mb-card-body mb-card-body-doubao">
+            <template v-if="doubaoRefinedText.trim() || doubaoRawText.trim()">
+              <el-tabs
+                v-if="doubaoRefinedText.trim() && doubaoRawText.trim()"
+                v-model="doubaoTab"
+                class="mb-doubao-tabs"
+              >
+                <el-tab-pane label="精答 (answer_text)" name="refined">
+                  <div class="mb-text" v-html="renderText(doubaoRefinedText)" />
+                </el-tab-pane>
+                <el-tab-pane label="原始 (raw_answer)" name="raw">
+                  <div class="mb-text" v-html="renderText(doubaoRawText)" />
+                </el-tab-pane>
+              </el-tabs>
+              <div
+                v-else-if="doubaoRefinedText.trim()"
+                class="mb-text"
+                v-html="renderText(doubaoRefinedText)"
+              />
+              <div v-else class="mb-text" v-html="renderText(doubaoRawText)" />
+              <p
+                v-if="doubaoRefinedText.trim() && !doubaoRawText.trim()"
+                class="mb-doubao-hint"
+              >
+                本题 JSON 中无 <code>raw_answer</code>。请重新跑
+                <code>export_lora_bench_cases.py</code> 生成含 <code>raw_answer</code> 的
+                <code>bench_cases.json</code>，再执行 <code>export_infer_compare_results.py</code> 导出。
+              </p>
+            </template>
+            <div v-else class="mb-placeholder">
+              加载 <code>微调/dsw/compare_results_10.json</code> 后显示豆包列；仅实时推理时此处为空（模型输出在右侧四列）。
+            </div>
+          </div>
+        </div>
+
         <div
           v-for="(col, i) in columns"
           :key="col.modelId"
           class="mb-card"
           :class="[`tone-${i}`, col.status]"
         >
-          <!-- 卡片头 -->
           <div class="mb-card-head">
             <div class="mb-card-title-row">
-              <span class="mb-card-num">{{ ['①','②','③','④'][i] }}</span>
+              <span class="mb-card-num">{{ ['①', '②', '③', '④'][i] }}</span>
               <span class="mb-card-label">{{ col.label }}</span>
               <span class="mb-card-id">{{ col.modelId }}</span>
             </div>
@@ -235,57 +297,11 @@
               <span v-if="col.elapsed" class="mb-stat">{{ (col.elapsed / 1000).toFixed(1) }}s</span>
             </div>
           </div>
-          <!-- 卡片体 -->
           <div class="mb-card-body">
             <div v-if="col.status === 'waiting'" class="mb-placeholder">等待中…</div>
             <div v-else-if="col.status === 'running' && !col.text" class="mb-placeholder blink">生成中…</div>
             <div v-else-if="col.status === 'error'" class="mb-error-text">{{ col.errorMsg }}</div>
             <div v-else class="mb-text" v-html="renderText(col.text)" />
-          </div>
-        </div>
-      </div>
-
-      <!-- 豆包 + 四模型对照（预跑 JSON 含 doubao_answer；实时推理时豆包列为提示） -->
-      <div class="mb-summary-block">
-        <div class="mb-results-title">
-          <span>📋</span><span>对照：豆包答案 · 四模型输出</span>
-        </div>
-        <div class="mb-grid mb-grid-5">
-          <div class="mb-card mb-card-doubao">
-            <div class="mb-card-head">
-              <div class="mb-card-title-row">
-                <span class="mb-card-num">豆</span>
-                <span class="mb-card-label">豆包 / 题库参考答案</span>
-                <span class="mb-card-id">doubao_answer</span>
-              </div>
-            </div>
-            <div class="mb-card-body">
-              <div
-                v-if="!doubaoPresetText.trim()"
-                class="mb-placeholder"
-              >
-                加载 <code>微调/dsw/compare_results_10.json</code> 中的条目后显示；实时四模型推理不带题库精答。
-              </div>
-              <div v-else class="mb-text" v-html="renderText(doubaoPresetText)" />
-            </div>
-          </div>
-          <div
-            v-for="(col, i) in columns"
-            :key="'sum-' + col.modelId"
-            class="mb-card"
-            :class="[`tone-${i}`, col.status]"
-          >
-            <div class="mb-card-head">
-              <div class="mb-card-title-row">
-                <span class="mb-card-num">{{ ['①', '②', '③', '④'][i] }}</span>
-                <span class="mb-card-label">{{ col.label }}</span>
-                <span class="mb-card-id">{{ col.modelId }}</span>
-              </div>
-            </div>
-            <div class="mb-card-body">
-              <div v-if="col.status === 'error'" class="mb-error-text">{{ col.errorMsg }}</div>
-              <div v-else class="mb-text" v-html="renderText(col.text)" />
-            </div>
           </div>
         </div>
       </div>
@@ -316,7 +332,11 @@ const dswPresetMeta = ref({
 })
 const loadingDswPreset = ref(false)
 const selectedPresetIdx = ref(null)
-const doubaoPresetText = ref('')
+const doubaoRefinedText = ref('')
+const doubaoRawText = ref('')
+const contextQuestionText = ref('')
+const contextPostContent = ref('')
+const doubaoTab = ref('refined')
 
 const saveServer = () => localStorage.setItem('mb_server_url', serverUrl.value)
 
@@ -417,6 +437,15 @@ const activeQ = computed(() => {
 
 const canRun = computed(() => !!activeQ.value && !!serverUrl.value)
 
+const showInputContextPanel = computed(() => {
+  if (!showResults.value) return false
+  return !!(
+    contextQuestionText.value.trim()
+    || contextPostContent.value.trim()
+    || customQ.value.trim()
+  )
+})
+
 // ── 结果列 ───────────────────────────────────────────────
 const showResults = ref(false)
 const running     = ref(false)
@@ -439,7 +468,11 @@ const columns = ref(makeColumns())
 const resetColumns = () => {
   columns.value = makeColumns()
   allDone.value = false
-  doubaoPresetText.value = ''
+  doubaoRefinedText.value = ''
+  doubaoRawText.value = ''
+  contextQuestionText.value = ''
+  contextPostContent.value = ''
+  doubaoTab.value = 'refined'
 }
 
 const loadDswPresetMeta = async () => {
@@ -485,7 +518,11 @@ const applyDswPreset = async () => {
     }
     selectedQ.value = null
     customQ.value = item.question_text || ''
-    doubaoPresetText.value = item.doubao_answer || ''
+    contextQuestionText.value = item.question_text || ''
+    contextPostContent.value = item.post_raw_content || ''
+    doubaoRefinedText.value = item.doubao_answer || ''
+    doubaoRawText.value = (item.raw_answer || '').trim()
+    doubaoTab.value = doubaoRefinedText.value.trim() ? 'refined' : 'raw'
     columns.value = makeColumns()
     slots.value.forEach((slot) => {
       const col = columns.value.find((c) => c.modelId === slot.modelId)
@@ -917,14 +954,55 @@ watch(
   .mb-grid-5 { grid-template-columns: 1fr; }
 }
 
-.mb-summary-block {
-  margin-top: 28px;
-  padding-top: 20px;
-  border-top: 1px dashed var(--line);
+.mb-context-panel {
+  margin-bottom: 18px;
+  padding: 14px 16px;
+  background: #fafbfd;
+  border: 1px solid var(--line);
+  border-radius: 12px;
 }
+.mb-context-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--slate);
+  margin-bottom: 12px;
+}
+.mb-context-block { margin-bottom: 12px; }
+.mb-context-block:last-child { margin-bottom: 0; }
+.mb-context-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #64748b;
+  margin-bottom: 6px;
+}
+.mb-context-pre {
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow: auto;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
 .mb-card-doubao {
   border-top: 4px solid #f59e0b;
   min-height: 200px;
+}
+.mb-card-body-doubao { max-height: 58vh; overflow: auto; }
+.mb-doubao-tabs :deep(.el-tabs__header) { margin-bottom: 8px; }
+.mb-doubao-hint {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: #64748b;
+  line-height: 1.45;
 }
 .mb-card-doubao .mb-card-body :deep(code) {
   font-size: 11px;

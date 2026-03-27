@@ -52,7 +52,7 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
         (
             "超长题干（一帖多题）",
             """
-            SELECT q.q_id, q.question_text, q.answer_text, q.question_type, q.difficulty,
+            SELECT q.q_id, q.question_text, q.answer_text, q.raw_answer, q.question_type, q.difficulty,
                    q.extraction_source, q.source_platform, q.crawl_task_id,
                    ct.raw_content AS post_raw_content
             FROM questions q
@@ -65,7 +65,7 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
         (
             "非规整编号（含 1. 2. 但无 Q: 格式）",
             """
-            SELECT q.q_id, q.question_text, q.answer_text, q.question_type, q.difficulty,
+            SELECT q.q_id, q.question_text, q.answer_text, q.raw_answer, q.question_type, q.difficulty,
                    q.extraction_source, q.source_platform, q.crawl_task_id,
                    ct.raw_content AS post_raw_content
             FROM questions q
@@ -80,7 +80,7 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
         (
             "图片抽取来源",
             """
-            SELECT q.q_id, q.question_text, q.answer_text, q.question_type, q.difficulty,
+            SELECT q.q_id, q.question_text, q.answer_text, q.raw_answer, q.question_type, q.difficulty,
                    q.extraction_source, q.source_platform, q.crawl_task_id,
                    ct.raw_content AS post_raw_content
             FROM questions q
@@ -93,7 +93,7 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
         (
             "有关联原帖正文",
             """
-            SELECT q.q_id, q.question_text, q.answer_text, q.question_type, q.difficulty,
+            SELECT q.q_id, q.question_text, q.answer_text, q.raw_answer, q.question_type, q.difficulty,
                    q.extraction_source, q.source_platform, q.crawl_task_id,
                    ct.raw_content AS post_raw_content
             FROM questions q
@@ -106,7 +106,7 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
         (
             "题干较短（边界/噪声）",
             """
-            SELECT q.q_id, q.question_text, q.answer_text, q.question_type, q.difficulty,
+            SELECT q.q_id, q.question_text, q.answer_text, q.raw_answer, q.question_type, q.difficulty,
                    q.extraction_source, q.source_platform, q.crawl_task_id,
                    ct.raw_content AS post_raw_content
             FROM questions q
@@ -119,7 +119,7 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
         (
             "豆包长答案",
             """
-            SELECT q.q_id, q.question_text, q.answer_text, q.question_type, q.difficulty,
+            SELECT q.q_id, q.question_text, q.answer_text, q.raw_answer, q.question_type, q.difficulty,
                    q.extraction_source, q.source_platform, q.crawl_task_id,
                    ct.raw_content AS post_raw_content
             FROM questions q
@@ -132,7 +132,7 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
         (
             "算法类",
             """
-            SELECT q.q_id, q.question_text, q.answer_text, q.question_type, q.difficulty,
+            SELECT q.q_id, q.question_text, q.answer_text, q.raw_answer, q.question_type, q.difficulty,
                    q.extraction_source, q.source_platform, q.crawl_task_id,
                    ct.raw_content AS post_raw_content
             FROM questions q
@@ -145,7 +145,7 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
         (
             "工程类",
             """
-            SELECT q.q_id, q.question_text, q.answer_text, q.question_type, q.difficulty,
+            SELECT q.q_id, q.question_text, q.answer_text, q.raw_answer, q.question_type, q.difficulty,
                    q.extraction_source, q.source_platform, q.crawl_task_id,
                    ct.raw_content AS post_raw_content
             FROM questions q
@@ -158,7 +158,7 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
         (
             "基础类",
             """
-            SELECT q.q_id, q.question_text, q.answer_text, q.question_type, q.difficulty,
+            SELECT q.q_id, q.question_text, q.answer_text, q.raw_answer, q.question_type, q.difficulty,
                    q.extraction_source, q.source_platform, q.crawl_task_id,
                    ct.raw_content AS post_raw_content
             FROM questions q
@@ -171,7 +171,7 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
         (
             "软技能 / 行为面",
             """
-            SELECT q.q_id, q.question_text, q.answer_text, q.question_type, q.difficulty,
+            SELECT q.q_id, q.question_text, q.answer_text, q.raw_answer, q.question_type, q.difficulty,
                    q.extraction_source, q.source_platform, q.crawl_task_id,
                    ct.raw_content AS post_raw_content
             FROM questions q
@@ -191,12 +191,14 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
             continue
         qid = row["q_id"]
         used.add(qid)
+        rd = dict(row)
         cases.append(
             {
                 "category": label,
                 "q_id": qid,
                 "question_text": row["question_text"],
                 "answer_text": row["answer_text"] or "",
+                "raw_answer": rd.get("raw_answer") or "",
                 "question_type": row["question_type"] or "",
                 "difficulty": row["difficulty"] or "",
                 "extraction_source": row["extraction_source"] or "",
@@ -209,7 +211,7 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
     # 不足则随机补齐
     if len(cases) < limit:
         sql_fill = """
-            SELECT q.q_id, q.question_text, q.answer_text, q.question_type, q.difficulty,
+            SELECT q.q_id, q.question_text, q.answer_text, q.raw_answer, q.question_type, q.difficulty,
                    q.extraction_source, q.source_platform, q.crawl_task_id,
                    ct.raw_content AS post_raw_content
             FROM questions q
@@ -230,6 +232,7 @@ def export_cases(db_path: str, limit: int = 10) -> dict:
                     "q_id": qid,
                     "question_text": d["question_text"],
                     "answer_text": d["answer_text"] or "",
+                    "raw_answer": d.get("raw_answer") or "",
                     "question_type": d["question_type"] or "",
                     "difficulty": d["difficulty"] or "",
                     "extraction_source": d["extraction_source"] or "",

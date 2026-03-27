@@ -98,6 +98,7 @@ def main() -> int:
             "category": c.get("category"),
             "question_text": q,
             "doubao_answer": c.get("answer_text") or "",
+            "raw_answer": (c.get("raw_answer") or "").strip(),
             "post_raw_content": c.get("post_raw_content") or "",
             "models": {},
         }
