@@ -1,0 +1,3 @@
+agentscope==1.0.19.post1
+llama-index-core==0.14.21
+llama-index-retrievers-bm25==0.7.1
